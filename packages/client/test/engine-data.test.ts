@@ -58,6 +58,8 @@ describe("engine data transport", () => {
       id: "msg_client",
       sessionID: "session-submit",
       request: {
+        id: undefined,
+        sessionID: undefined,
         text: "hello",
         files: [{ uri: "file:///tmp/example.txt", name: "example.txt" }],
         delivery: "queue",

@@ -38,7 +38,7 @@ export function createEngineTransport(api: () => SessionApi): Engine.SessionTran
     },
     async submit(input) {
       try {
-        await api().prompt({ sessionID: input.sessionID, id: input.id, ...input.request })
+        await api().prompt({ ...input.request, sessionID: input.sessionID, id: input.id })
       } catch (error) {
         if (isTypedError(error)) throw new Engine.SubmitRejected(error.message)
         throw error
