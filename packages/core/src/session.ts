@@ -51,7 +51,6 @@ import { Global } from "@opencode-ai/util/global"
 import { Shell as ShellSchema } from "@opencode-ai/schema/shell"
 import { KeyedMutex } from "./effect/keyed-mutex.js"
 import { fileURLToPath } from "url"
-import { EventSequenceTable } from "./event/sql.js"
 
 // get project -> project.locations
 //
@@ -210,10 +209,12 @@ export interface Interface {
   readonly cancelInbox: (input: InboxItemRef) => Effect.Effect<void, NotFoundError | InboxConflictError>
   readonly steerInbox: (input: InboxItemRef) => Effect.Effect<void, NotFoundError | InboxConflictError>
   readonly queueInbox: (input: InboxItemRef) => Effect.Effect<void, NotFoundError | InboxConflictError>
-  readonly validateLog: (input: {
+  readonly openLog: (input: {
     sessionID: SessionSchema.ID
     after?: number
-  }) => Effect.Effect<void, NotFoundError | SeqUnavailableError>
+    follow?: boolean
+    ephemeral?: boolean
+  }) => Effect.Effect<Stream.Stream<SessionEvent.Event | EventLog.Synced>, NotFoundError | SeqUnavailableError>
   /**
    * Ordered session log read. Replays durable session events after the
    * exclusive `after` cursor, emits a `Synced` marker at the captured replay
@@ -597,19 +598,14 @@ const layer = Layer.effect(
                 .limit(input.recent ?? 200)
                 .all()
                 .pipe(Effect.orDie)
-              const sequence = yield* db
-                .select({ seq: EventSequenceTable.seq })
-                .from(EventSequenceTable)
-                .where(eq(EventSequenceTable.aggregate_id, input.sessionID))
-                .get()
-                .pipe(Effect.orDie)
-              if (!sequence) return yield* Effect.die(new Error(`Session ${input.sessionID} has no event sequence`))
+              const seq = yield* Bus.latestSequence(db, input.sessionID)
+              if (seq < 0) return yield* Effect.die(new Error(`Session ${input.sessionID} has no event sequence`))
               return {
                 session: fromRow(row),
                 children: children.map(fromRow),
                 inbox,
                 messages: yield* Effect.forEach(messages.toReversed(), decode),
-                seq: Event.Seq.make(sequence.seq),
+                seq: Event.Seq.make(seq),
               }
             }),
           )
@@ -618,35 +614,34 @@ const layer = Layer.effect(
       cancelInbox: Effect.fn("Session.cancelInbox")((input) => mutatePending(input, SessionInbox.cancel)),
       steerInbox: Effect.fn("Session.steerInbox")((input) => mutatePending(input, SessionInbox.steer, true)),
       queueInbox: Effect.fn("Session.queueInbox")((input) => mutatePending(input, SessionInbox.queue)),
-      validateLog: Effect.fn("Session.validateLog")(function* (input) {
+      openLog: Effect.fn("Session.openLog")(function* (input) {
         yield* result.get(input.sessionID)
-        const head = yield* Bus.latestSequence(db, input.sessionID)
-        if (input.after === undefined || input.after <= head) return
-        return yield* new SeqUnavailableError({
-          sessionID: input.sessionID,
-          after: Event.Seq.make(input.after),
-          head: head >= 0 ? Event.Seq.make(head) : undefined,
-        })
-      }),
-      log: (input) =>
-        Stream.unwrap(
-          Effect.gen(function* () {
-            yield* result.validateLog(input)
-            return bus.log({
-              aggregateID: input.sessionID,
-              after: input.after,
-              follow: input.follow,
-              includeLive: input.ephemeral
-                ? (event) => isSessionEvent(event) && event.data.sessionID === input.sessionID
-                : undefined,
+        if (input.after !== undefined) {
+          const head = yield* Bus.latestSequence(db, input.sessionID)
+          if (input.after > head)
+            return yield* new SeqUnavailableError({
+              sessionID: input.sessionID,
+              after: Event.Seq.make(input.after),
+              head: head >= 0 ? Event.Seq.make(head) : undefined,
             })
-          }),
-        ).pipe(
-          Stream.filter(
-            (item): item is SessionEvent.Event | EventLog.Synced =>
-              Bus.isSynced(item) || (input.ephemeral ? isSessionEvent(item) : isDurableSessionEvent(item)),
-          ),
-        ),
+        }
+        return bus
+          .log({
+            aggregateID: input.sessionID,
+            after: input.after,
+            follow: input.follow,
+            includeLive: input.ephemeral
+              ? (event) => isSessionEvent(event) && event.data.sessionID === input.sessionID
+              : undefined,
+          })
+          .pipe(
+            Stream.filter(
+              (item): item is SessionEvent.Event | EventLog.Synced =>
+                Bus.isSynced(item) || (input.ephemeral ? isSessionEvent(item) : isDurableSessionEvent(item)),
+            ),
+          )
+      }),
+      log: (input) => Stream.unwrap(result.openLog(input)),
       prompt: Effect.fn("Session.prompt")((input) =>
         Effect.uninterruptible(
           Effect.gen(function* () {
