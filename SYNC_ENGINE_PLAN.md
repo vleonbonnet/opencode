@@ -208,15 +208,23 @@ GET /session/:id/log?after=seq&follow=true one ordered stream:
   list for unopened sessions (created/deleted/renamed/moved, usage, execution
   status). Exact param shape TBD.
 
-## 5. Migration (each step ships alone)
+## 5. Delivery: parallel build in this worktree, compare locally
 
-1. S1 (inert until consumed)
-2. S2
-3. TUI hydrate+tail behind a flag, same store shape
-4. Outbox replaces optimistic ledger; delete guards
-5. Reconnect = hydrate+resend+tail; delete refetch machinery
+Not a staged production migration — this branch carries a complete alternate
+data layer next to the existing one, so both versions can be run and compared
+before any adoption decision.
 
-TODO: flag mechanics, rollout, kill criteria per step.
+1. Server additions S1–S4 (additive; existing clients unaffected).
+2. Engine as a new module in `packages/client` (`solid/engine.ts` or similar)
+   beside `solid/data.ts` — same store shape and consumer-facing API, fed by
+   snapshot + session stream + outbox instead of fetch + bus + ledger.
+   `data.ts` is not modified.
+3. TUI in this worktree wired to the engine layer.
+4. Compare: run this worktree's full stack (`bun run dev`) against stock v2
+   side by side — submit latency, kill/reconnect behavior, streaming, revert,
+   forks. Port the six-laws + chaos tests as the regression net.
+5. If it wins: adoption (swap the wiring, delete `data.ts` + PR #42807/#42808
+   guards) is its own decision with two working implementations to diff.
 
 ## 6. Validation
 
