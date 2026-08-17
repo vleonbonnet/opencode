@@ -66,7 +66,19 @@ export class FakeSessionServer implements Engine.SessionTransport {
       created: this.time,
       type: "session.inbox.enqueued",
       durable: { aggregateID: this.sessionID, seq: this.folded.seq + 1, version: 1 },
-      data: { sessionID: this.sessionID, inboxID: input.id, item: input.item },
+      data: {
+        sessionID: this.sessionID,
+        inboxID: input.id,
+        item: {
+          type: "user",
+          delivery: input.request.delivery ?? "steer",
+          payload: {
+            text: input.request.text,
+            agents: input.request.agents?.map((agent) => ({ ...agent })),
+            metadata: input.request.metadata,
+          },
+        },
+      },
     })
     if (this.faults.loseResponses > 0) {
       this.faults.loseResponses--

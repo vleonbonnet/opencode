@@ -4,6 +4,7 @@ import type {
   SessionInboxInfo,
   SessionInboxItem,
   SessionMessageInfo,
+  SessionPromptInput,
   SessionReasoningDelta,
   SessionTextDelta,
   SessionToolInputDelta,
@@ -26,13 +27,14 @@ export type SessionStreamItem = DurableSessionEvent | EphemeralSessionEvent | Ev
 export type Intent = {
   readonly id: string
   readonly item: Extract<SessionInboxItem, { readonly type: "user" | "synthetic" }>
+  readonly request: Omit<SessionPromptInput, "sessionID" | "id">
   readonly created: number
 }
 
 export type SubmitInput = {
   readonly id: string
   readonly sessionID: string
-  readonly item: Intent["item"]
+  readonly request: Intent["request"]
 }
 
 export type IntentFailure = {
@@ -54,7 +56,7 @@ export class SeqUnavailable extends Error {
 
 export interface SessionTransport {
   readonly snapshot: (sessionID: string) => Promise<SessionSnapshot>
-  readonly stream: (sessionID: string, after: number) => AsyncIterable<SessionStreamItem>
+  readonly stream: (sessionID: string, after: number, signal?: AbortSignal) => AsyncIterable<SessionStreamItem>
   readonly submit: (input: SubmitInput) => Promise<void>
 }
 
@@ -65,15 +67,7 @@ export type SessionView = SessionFoldState & {
 export interface SessionEngine {
   readonly sessionID: string
   readonly view: () => SessionView
-  readonly submit: (input: {
-    readonly text: string
-    readonly files?: Extract<Intent["item"], { readonly type: "user" }>["payload"]["files"]
-    readonly agents?: Extract<Intent["item"], { readonly type: "user" }>["payload"]["agents"]
-    readonly skills?: Extract<Intent["item"], { readonly type: "user" }>["payload"]["skills"]
-    readonly metadata?: Extract<Intent["item"], { readonly type: "user" }>["payload"]["metadata"]
-    readonly delivery?: Intent["item"]["delivery"]
-    readonly id?: string
-  }) => Intent
+  readonly submit: (input: Intent["request"] & { readonly id?: string }) => Intent
   readonly subscribe: (listener: (view: SessionView) => void) => () => void
   readonly subscribeFailures: (listener: (failure: IntentFailure) => void) => () => void
   readonly settled: () => Promise<void>
@@ -124,6 +118,7 @@ export async function createSessionEngine(
   let sent: string | undefined
   let stopped = false
   let sending = false
+  const abort = new AbortController()
 
   const publish = (next: EngineState) => {
     state = next
@@ -175,7 +170,7 @@ export async function createSessionEngine(
     sent = intent.id
     void (async () => {
       try {
-        await transport.submit({ id: intent.id, sessionID, item: intent.item })
+        await transport.submit({ id: intent.id, sessionID, request: intent.request })
       } catch (error) {
         if (!(error instanceof SubmitRejected)) return
         sent = undefined
@@ -190,7 +185,7 @@ export async function createSessionEngine(
   const sync = async () => {
     while (!stopped) {
       try {
-        for await (const item of transport.stream(sessionID, state.folded.seq)) {
+        for await (const item of transport.stream(sessionID, state.folded.seq, abort.signal)) {
           if (stopped) return
           if (item.type === "log.synced") {
             sent = undefined
@@ -229,14 +224,13 @@ export async function createSessionEngine(
       const intent: Intent = {
         id: input.id ?? makeID(),
         created: now(),
+        request: input,
         item: {
           type: "user",
           delivery: input.delivery ?? "steer",
           payload: {
             text: input.text,
-            files: input.files,
-            agents: input.agents,
-            skills: input.skills,
+            agents: input.agents?.map((agent) => ({ ...agent })),
             metadata: input.metadata,
           },
         },
@@ -259,6 +253,7 @@ export async function createSessionEngine(
     },
     stop() {
       stopped = true
+      abort.abort()
       publish({ ...state, synced: false })
     },
   }
