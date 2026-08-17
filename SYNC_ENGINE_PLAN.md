@@ -259,7 +259,13 @@ Status: Lane A done (`0af27771` snapshot core, `d611b39f` endpoint,
 `b21a3c7d` typed seq-unavailable, `74929dd7` ephemeral opt-in, `e6eac3a0`
 simplify — S4 pending shape decision). Lane B done through validation +
 simplify (`54a2ec54` fold, `0f8831b3` engine, `2c29a743` laws, `354ab6f9`
-chaos, `c9ec1385` simplify); wiring in progress.
+chaos, `c9ec1385` simplify). Wiring done: `5d70561f` engine-backed data
+layer, `48e237d9` TUI wiring, `90760fc6`/`5f63f252` regression fixes (5 of 6
+initial TUI failures were real engine-layer gaps — reconnect refresh, queued
+lifecycle, pending refresh, synced-gated sync, family-index pollution — all
+fixed; 1 obsolete assertion updated with justification). Suites: TUI 729/0,
+client green except 3 pre-existing generated-client failures (repro on stock
+v2). Remaining: live comparison pass (B7), S4 shape decision.
 
 Two lanes, disjoint packages, parallelizable. Worker sessions execute; the
 coordinating session reviews each commit and keeps this doc current. Every
