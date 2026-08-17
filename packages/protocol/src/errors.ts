@@ -1,5 +1,6 @@
 import { Schema } from "effect"
 import { Skill } from "@opencode-ai/schema/skill"
+import { Event } from "@opencode-ai/schema/event"
 
 export class InvalidRequestError extends Schema.TaggedErrorClass<InvalidRequestError>()(
   "InvalidRequestError",
@@ -30,6 +31,17 @@ export class SessionBusyError extends Schema.TaggedErrorClass<SessionBusyError>(
   "SessionBusyError",
   {
     sessionID: Schema.String,
+    message: Schema.String,
+  },
+  { httpApiStatus: 409 },
+) {}
+
+export class SeqUnavailableError extends Schema.TaggedErrorClass<SeqUnavailableError>()(
+  "SeqUnavailableError",
+  {
+    sessionID: Schema.String,
+    after: Event.Seq,
+    head: Schema.optional(Event.Seq),
     message: Schema.String,
   },
   { httpApiStatus: 409 },

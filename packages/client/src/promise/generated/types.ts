@@ -687,51 +687,6 @@ export type SessionUsageRecorded = {
   data: { sessionID: string; source: "title" | "compaction"; cost: MoneyUSD; tokens: TokenUsageInfo }
 }
 
-export type ModelsDevRefreshed = {
-  id: string
-  created: number
-  metadata?: { [x: string]: any }
-  type: "models-dev.refreshed"
-  location?: LocationRef
-  data: {}
-}
-
-export type IntegrationUpdated = {
-  id: string
-  created: number
-  metadata?: { [x: string]: any }
-  type: "integration.updated"
-  location?: LocationRef
-  data: {}
-}
-
-export type IntegrationConnectionUpdated = {
-  id: string
-  created: number
-  metadata?: { [x: string]: any }
-  type: "integration.connection.updated"
-  location?: LocationRef
-  data: { integrationID: string }
-}
-
-export type CatalogUpdated = {
-  id: string
-  created: number
-  metadata?: { [x: string]: any }
-  type: "catalog.updated"
-  location?: LocationRef
-  data: {}
-}
-
-export type AgentUpdated = {
-  id: string
-  created: number
-  metadata?: { [x: string]: any }
-  type: "agent.updated"
-  location?: LocationRef
-  data: {}
-}
-
 export type SessionUsageUpdated = {
   id: string
   created: number
@@ -784,6 +739,51 @@ export type SessionCompactionDelta = {
   type: "session.compaction.delta"
   location?: LocationRef
   data: { sessionID: string; text: string }
+}
+
+export type ModelsDevRefreshed = {
+  id: string
+  created: number
+  metadata?: { [x: string]: any }
+  type: "models-dev.refreshed"
+  location?: LocationRef
+  data: {}
+}
+
+export type IntegrationUpdated = {
+  id: string
+  created: number
+  metadata?: { [x: string]: any }
+  type: "integration.updated"
+  location?: LocationRef
+  data: {}
+}
+
+export type IntegrationConnectionUpdated = {
+  id: string
+  created: number
+  metadata?: { [x: string]: any }
+  type: "integration.connection.updated"
+  location?: LocationRef
+  data: { integrationID: string }
+}
+
+export type CatalogUpdated = {
+  id: string
+  created: number
+  metadata?: { [x: string]: any }
+  type: "catalog.updated"
+  location?: LocationRef
+  data: {}
+}
+
+export type AgentUpdated = {
+  id: string
+  created: number
+  metadata?: { [x: string]: any }
+  type: "agent.updated"
+  location?: LocationRef
+  data: {}
 }
 
 export type FilesystemChanged = {
@@ -1986,7 +1986,15 @@ export type FormCreated = {
   data: { form: FormInfo1 }
 }
 
-export type SessionLogItem = SessionEventDurable | EventLogSynced
+export type SessionLogItem =
+  | SessionEventDurable
+  | SessionUsageUpdated
+  | SessionTextDelta
+  | SessionReasoningDelta
+  | SessionToolInputDelta
+  | SessionToolProgress
+  | SessionCompactionDelta
+  | EventLogSynced
 
 export type SessionTransferData = { info: SessionInfo; messages: Array<SessionMessageInfo> }
 
@@ -2207,6 +2215,16 @@ export const isInstructionEntryValueTooLargeError = (value: unknown): value is I
   value !== null &&
   "_tag" in value &&
   value["_tag"] === "InstructionEntryValueTooLargeError"
+
+export type SeqUnavailableError = {
+  readonly _tag: "SeqUnavailableError"
+  readonly sessionID: string
+  readonly after: number
+  readonly head?: number | undefined
+  readonly message: string
+}
+export const isSeqUnavailableError = (value: unknown): value is SeqUnavailableError =>
+  typeof value === "object" && value !== null && "_tag" in value && value["_tag"] === "SeqUnavailableError"
 
 export type ProviderNotFoundError = {
   readonly _tag: "ProviderNotFoundError"
@@ -3929,8 +3947,21 @@ export type SessionGenerateOutput = SessionGenerateResponse["data"]
 
 export type SessionLogInput = {
   readonly sessionID: { readonly sessionID: string }["sessionID"]
-  readonly after?: { readonly after?: number | undefined; readonly follow?: boolean | undefined }["after"]
-  readonly follow?: { readonly after?: number | undefined; readonly follow?: boolean | undefined }["follow"]
+  readonly after?: {
+    readonly after?: number | undefined
+    readonly follow?: boolean | undefined
+    readonly ephemeral?: boolean | undefined
+  }["after"]
+  readonly follow?: {
+    readonly after?: number | undefined
+    readonly follow?: boolean | undefined
+    readonly ephemeral?: boolean | undefined
+  }["follow"]
+  readonly ephemeral?: {
+    readonly after?: number | undefined
+    readonly follow?: boolean | undefined
+    readonly ephemeral?: boolean | undefined
+  }["ephemeral"]
 }
 
 export type SessionLogOutput = SessionLogItem

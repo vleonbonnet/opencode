@@ -210,10 +210,15 @@ export interface Interface {
   readonly cancelInbox: (input: InboxItemRef) => Effect.Effect<void, NotFoundError | InboxConflictError>
   readonly steerInbox: (input: InboxItemRef) => Effect.Effect<void, NotFoundError | InboxConflictError>
   readonly queueInbox: (input: InboxItemRef) => Effect.Effect<void, NotFoundError | InboxConflictError>
+  readonly validateLog: (input: {
+    sessionID: SessionSchema.ID
+    after?: number
+  }) => Effect.Effect<void, NotFoundError | SeqUnavailableError>
   /**
-   * Durable, ordered session log read. Replays durable session bus after
-   * the exclusive `after` cursor, emits a `Synced` marker at the captured
-   * replay watermark, then continues live when `follow` is set.
+   * Ordered session log read. Replays durable session events after the
+   * exclusive `after` cursor, emits a `Synced` marker at the captured replay
+   * watermark, then continues live when `follow` is set. Ephemeral events are
+   * included only in the live phase when explicitly requested.
    * The marker's seq may exceed the last emitted event because other durable
    * bus share the aggregate's sequence space.
    */
@@ -221,7 +226,8 @@ export interface Interface {
     sessionID: SessionSchema.ID
     after?: number
     follow?: boolean
-  }) => Stream.Stream<SessionEvent.DurableEvent | EventLog.Synced, NotFoundError | SeqUnavailableError>
+    ephemeral?: boolean
+  }) => Stream.Stream<SessionEvent.Event | EventLog.Synced, NotFoundError | SeqUnavailableError>
   readonly switchAgent: (input: { sessionID: SessionSchema.ID; agent: Agent.ID }) => Effect.Effect<void, NotFoundError>
   readonly switchModel: (input: { sessionID: SessionSchema.ID; model: Model.Ref }) => Effect.Effect<void, NotFoundError>
   readonly rename: (input: { sessionID: SessionSchema.ID; title: string }) => Effect.Effect<void, NotFoundError>
@@ -338,6 +344,7 @@ const layer = Layer.effect(
     })
     const decodeMessage = Schema.decodeUnknownEffect(SessionMessage.Info)
     const isDurableSessionEvent = Schema.is(SessionEvent.Durable)
+    const isSessionEvent = Schema.is(SessionEvent.All)
     const persistProject = (project: Project.Resolved) => upsertProject(db, project).pipe(Effect.orDie)
     const decode = (row: typeof SessionMessageTable.$inferSelect) =>
       decodeMessage({ ...row.data, id: row.id, type: row.type }).pipe(
@@ -611,23 +618,33 @@ const layer = Layer.effect(
       cancelInbox: Effect.fn("Session.cancelInbox")((input) => mutatePending(input, SessionInbox.cancel)),
       steerInbox: Effect.fn("Session.steerInbox")((input) => mutatePending(input, SessionInbox.steer, true)),
       queueInbox: Effect.fn("Session.queueInbox")((input) => mutatePending(input, SessionInbox.queue)),
+      validateLog: Effect.fn("Session.validateLog")(function* (input) {
+        yield* result.get(input.sessionID)
+        const head = yield* Bus.latestSequence(db, input.sessionID)
+        if (input.after === undefined || input.after <= head) return
+        return yield* new SeqUnavailableError({
+          sessionID: input.sessionID,
+          after: Event.Seq.make(input.after),
+          head: head >= 0 ? Event.Seq.make(head) : undefined,
+        })
+      }),
       log: (input) =>
         Stream.unwrap(
           Effect.gen(function* () {
-            yield* result.get(input.sessionID)
-            const head = yield* Bus.latestSequence(db, input.sessionID)
-            if (input.after !== undefined && input.after > head)
-              return yield* new SeqUnavailableError({
-                sessionID: input.sessionID,
-                after: Event.Seq.make(input.after),
-                head: head >= 0 ? Event.Seq.make(head) : undefined,
-              })
-            return bus.log({ aggregateID: input.sessionID, after: input.after, follow: input.follow })
+            yield* result.validateLog(input)
+            return bus.log({
+              aggregateID: input.sessionID,
+              after: input.after,
+              follow: input.follow,
+              includeLive: input.ephemeral
+                ? (event) => isSessionEvent(event) && event.data.sessionID === input.sessionID
+                : undefined,
+            })
           }),
         ).pipe(
           Stream.filter(
-            (item): item is SessionEvent.DurableEvent | EventLog.Synced =>
-              Bus.isSynced(item) || isDurableSessionEvent(item),
+            (item): item is SessionEvent.Event | EventLog.Synced =>
+              Bus.isSynced(item) || (input.ephemeral ? isSessionEvent(item) : isDurableSessionEvent(item)),
           ),
         ),
       prompt: Effect.fn("Session.prompt")((input) =>

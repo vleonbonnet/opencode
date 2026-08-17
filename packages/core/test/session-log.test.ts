@@ -15,6 +15,8 @@ import { SessionProjector } from "@opencode-ai/core/session/projector"
 import { SessionExecution } from "@opencode-ai/core/session/execution"
 import { SessionStore } from "@opencode-ai/core/session/store"
 import { SessionTable } from "@opencode-ai/core/session/sql"
+import { SessionEvent } from "@opencode-ai/core/session/event"
+import { SessionMessage } from "@opencode-ai/core/session/message"
 import { testEffect } from "./lib/effect"
 import { globalProjectLayer } from "./lib/project"
 
@@ -105,6 +107,109 @@ describe("Session.log", () => {
     }),
   )
 
+  it.effect("orders live ephemeral deltas after their durable start", () =>
+    Effect.gen(function* () {
+      const session = yield* Session.Service
+      const bus = yield* Bus.Service
+      const created = yield* session.create({ location })
+      const assistantMessageID = SessionMessage.ID.create()
+      const fiber = yield* session
+        .log({ sessionID: created.id, after: Event.Seq.make(0), follow: true, ephemeral: true })
+        .pipe(Stream.take(3), Stream.runCollect, Effect.forkScoped)
+      yield* Effect.yieldNow
+
+      yield* bus.publish(SessionEvent.Text.Started, {
+        sessionID: created.id,
+        assistantMessageID,
+        ordinal: 0,
+      })
+      yield* bus.publish(SessionEvent.Text.Delta, {
+        sessionID: created.id,
+        assistantMessageID,
+        ordinal: 0,
+        delta: "hello",
+      })
+
+      expect(Array.from(yield* Fiber.join(fiber)).map((item) => item.type)).toEqual([
+        "log.synced",
+        "session.text.started",
+        "session.text.delta",
+      ])
+    }),
+  )
+
+  it.effect("never includes ephemeral events in replay", () =>
+    Effect.gen(function* () {
+      const session = yield* Session.Service
+      const bus = yield* Bus.Service
+      const created = yield* session.create({ location })
+      const assistantMessageID = SessionMessage.ID.create()
+      yield* bus.publish(SessionEvent.Text.Started, {
+        sessionID: created.id,
+        assistantMessageID,
+        ordinal: 0,
+      })
+      yield* bus.publish(SessionEvent.Text.Delta, {
+        sessionID: created.id,
+        assistantMessageID,
+        ordinal: 0,
+        delta: "not retained",
+      })
+      yield* bus.publish(SessionEvent.Text.Ended, {
+        sessionID: created.id,
+        assistantMessageID,
+        ordinal: 0,
+        text: "complete",
+      })
+
+      const items = Array.from(yield* Stream.runCollect(session.log({ sessionID: created.id, ephemeral: true })))
+
+      expect(items.map((item) => item.type)).toEqual([
+        "session.created",
+        "session.text.started",
+        "session.text.ended",
+        "log.synced",
+      ])
+    }),
+  )
+
+  it.effect("keeps the default follow stream durable-only", () =>
+    Effect.gen(function* () {
+      const session = yield* Session.Service
+      const bus = yield* Bus.Service
+      const created = yield* session.create({ location })
+      const assistantMessageID = SessionMessage.ID.create()
+      const fiber = yield* session
+        .log({ sessionID: created.id, after: Event.Seq.make(0), follow: true })
+        .pipe(Stream.take(3), Stream.runCollect, Effect.forkScoped)
+      yield* Effect.yieldNow
+
+      yield* bus.publish(SessionEvent.Text.Started, {
+        sessionID: created.id,
+        assistantMessageID,
+        ordinal: 0,
+      })
+      yield* bus.publish(SessionEvent.Text.Delta, {
+        sessionID: created.id,
+        assistantMessageID,
+        ordinal: 0,
+        delta: "filtered",
+      })
+      yield* bus.publish(SessionEvent.Text.Ended, {
+        sessionID: created.id,
+        assistantMessageID,
+        ordinal: 0,
+        text: "complete",
+      })
+
+      expect(Array.from(yield* Fiber.join(fiber)).map((item) => item.type)).toEqual([
+        "log.synced",
+        "session.text.started",
+        "session.text.ended",
+      ])
+    }),
+  )
+
   it.effect("reads across undecodable gaps in aggregate order and marks the true log position", () =>
     Effect.gen(function* () {
       const GapEvent = Bus.durable({
@@ -124,7 +229,9 @@ describe("Session.log", () => {
       const items = Array.from(yield* Stream.runCollect(session.log({ sessionID: created.id, after: 1 })))
 
       expect(
-        items.map((item): number | string | undefined => (Bus.isSynced(item) ? item.type : item.durable?.seq)),
+        items.map((item): number | string | undefined =>
+          Bus.isSynced(item) ? item.type : "durable" in item ? item.durable.seq : undefined,
+        ),
       ).toEqual([3, 4, "log.synced"])
       expect(items.at(-1)).toEqual({ type: "log.synced", aggregateID: created.id, seq: Event.Seq.make(4) })
     }),

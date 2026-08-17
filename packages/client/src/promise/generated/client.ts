@@ -869,9 +869,9 @@ export function make(options: ClientOptions) {
           {
             method: "GET",
             path: `/api/experimental/session/${encodeURIComponent(input.sessionID)}/log`,
-            query: { after: input["after"], follow: input["follow"] },
+            query: { after: input["after"], follow: input["follow"], ephemeral: input["ephemeral"] },
             successStatus: 200,
-            declaredStatuses: [404, 401, 400],
+            declaredStatuses: [404, 409, 401, 400],
             empty: false,
           },
           requestOptions,

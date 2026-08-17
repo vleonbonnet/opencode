@@ -18,6 +18,7 @@ import {
   InvalidRequestError,
   MessageNotFoundError,
   ServiceUnavailableError,
+  SeqUnavailableError,
   SessionBusyError,
   SessionNotFoundError,
   SkillNotFoundError,
@@ -657,17 +658,18 @@ export const makeSessionGroup = <I extends HttpApiMiddleware.AnyId, S>(sessionLo
         query: {
           after: Schema.NumberFromString.pipe(Schema.decodeTo(Event.Seq), Schema.optional),
           follow: BooleanFromString.pipe(Schema.optional),
+          ephemeral: BooleanFromString.pipe(Schema.optional),
         },
         success: HttpApiSchema.StreamSse({
-          data: Schema.Union([SessionEvent.Durable, EventLog.Synced]).annotate({ identifier: "SessionLogItem" }),
+          data: Schema.Union([SessionEvent.All, EventLog.Synced]).annotate({ identifier: "SessionLogItem" }),
         }),
-        error: SessionNotFoundError,
+        error: [SessionNotFoundError, SeqUnavailableError],
       }).annotateMerge(
         OpenApi.annotations({
           identifier: "v2.session.log",
           summary: "Read the session log",
           description:
-            "Experimental durable session event log. Reads events after an exclusive aggregate sequence and continues with live events when follow=true.",
+            "Experimental session event log. Replay is durable-only; follow mode can opt into live ephemeral events.",
         }),
       ),
     )

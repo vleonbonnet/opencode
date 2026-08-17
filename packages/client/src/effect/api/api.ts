@@ -320,6 +320,7 @@ export type Endpoint5_32Input = {
   readonly sessionID: Session.ID
   readonly after?: Event.Seq | undefined
   readonly follow?: boolean | undefined
+  readonly ephemeral?: boolean | undefined
 }
 export type Endpoint5_32Output =
   | (
@@ -909,6 +910,83 @@ export type Endpoint5_32Output =
           }
         }
     )
+  | {
+      readonly id: Event.ID
+      readonly created: number
+      readonly metadata?: { readonly [x: string]: unknown } | undefined
+      readonly type: "session.usage.updated"
+      readonly location?: Location.Ref | undefined
+      readonly data: {
+        readonly sessionID: Session.ID
+        readonly cost: number & Brand.Brand<"Money.USD">
+        readonly tokens: {
+          readonly input: number
+          readonly output: number
+          readonly reasoning: number
+          readonly cache: { readonly read: number; readonly write: number }
+        }
+      }
+    }
+  | {
+      readonly id: Event.ID
+      readonly created: number
+      readonly metadata?: { readonly [x: string]: unknown } | undefined
+      readonly type: "session.text.delta"
+      readonly location?: Location.Ref | undefined
+      readonly data: {
+        readonly sessionID: Session.ID
+        readonly assistantMessageID: SessionMessage.ID
+        readonly ordinal: number
+        readonly delta: string
+      }
+    }
+  | {
+      readonly id: Event.ID
+      readonly created: number
+      readonly metadata?: { readonly [x: string]: unknown } | undefined
+      readonly type: "session.reasoning.delta"
+      readonly location?: Location.Ref | undefined
+      readonly data: {
+        readonly sessionID: Session.ID
+        readonly assistantMessageID: SessionMessage.ID
+        readonly ordinal: number
+        readonly delta: string
+      }
+    }
+  | {
+      readonly id: Event.ID
+      readonly created: number
+      readonly metadata?: { readonly [x: string]: unknown } | undefined
+      readonly type: "session.tool.input.delta"
+      readonly location?: Location.Ref | undefined
+      readonly data: {
+        readonly sessionID: Session.ID
+        readonly assistantMessageID: SessionMessage.ID
+        readonly id: string
+        readonly delta: string
+      }
+    }
+  | {
+      readonly id: Event.ID
+      readonly created: number
+      readonly metadata?: { readonly [x: string]: unknown } | undefined
+      readonly type: "session.tool.progress"
+      readonly location?: Location.Ref | undefined
+      readonly data: {
+        readonly sessionID: Session.ID
+        readonly assistantMessageID: SessionMessage.ID
+        readonly id: string
+        readonly metadata: { readonly [x: string]: Schema.Json }
+      }
+    }
+  | {
+      readonly id: Event.ID
+      readonly created: number
+      readonly metadata?: { readonly [x: string]: unknown } | undefined
+      readonly type: "session.compaction.delta"
+      readonly location?: Location.Ref | undefined
+      readonly data: { readonly sessionID: Session.ID; readonly text: string }
+    }
   | EventLog.Synced
 export type SessionLogOperation<E = never> = (input: Endpoint5_32Input) => Stream.Stream<Endpoint5_32Output, E>
 

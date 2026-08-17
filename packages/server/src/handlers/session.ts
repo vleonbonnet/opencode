@@ -13,6 +13,7 @@ import {
   InvalidCursorError,
   MessageNotFoundError,
   ServiceUnavailableError,
+  SeqUnavailableError,
   SessionBusyError,
   SessionNotFoundError,
   SkillNotFoundError,
@@ -787,18 +788,28 @@ export const SessionHandler = HttpApiBuilder.group(Api, "server.session", (handl
       .handle(
         "session.log",
         Effect.fn(function* (ctx) {
-          yield* session.get(ctx.params.sessionID).pipe(
-            Effect.catchTag(
-              "Session.NotFoundError",
-              (error) =>
-                new SessionNotFoundError({
-                  sessionID: error.sessionID,
-                  message: `Session not found: ${error.sessionID}`,
-                }),
+          yield* session.validateLog({ sessionID: ctx.params.sessionID, after: ctx.query.after }).pipe(
+            Effect.mapError((error) =>
+              error._tag === "Session.NotFoundError"
+                ? new SessionNotFoundError({
+                    sessionID: error.sessionID,
+                    message: `Session not found: ${error.sessionID}`,
+                  })
+                : new SeqUnavailableError({
+                    sessionID: error.sessionID,
+                    after: error.after,
+                    head: error.head,
+                    message: `Session sequence ${error.after} is beyond the current head`,
+                  }),
             ),
           )
           return session
-            .log({ sessionID: ctx.params.sessionID, after: ctx.query.after, follow: ctx.query.follow })
+            .log({
+              sessionID: ctx.params.sessionID,
+              after: ctx.query.after,
+              follow: ctx.query.follow,
+              ephemeral: ctx.query.ephemeral,
+            })
             .pipe(Stream.orDie)
         }),
       )

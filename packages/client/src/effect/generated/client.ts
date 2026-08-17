@@ -591,7 +591,7 @@ const Endpoint5_32 = (raw: RawClient["server.session"]) => (input: Endpoint5_32I
     Stream.unwrap(
       raw["session.log"]({
         params: { sessionID: input["sessionID"] },
-        query: { after: input["after"], follow: input["follow"] },
+        query: { after: input["after"], follow: input["follow"], ephemeral: input["ephemeral"] },
       }).pipe(
         Effect.mapError(mapClientError),
         Effect.map((stream) => stream.pipe(Stream.mapError(mapClientError))),
