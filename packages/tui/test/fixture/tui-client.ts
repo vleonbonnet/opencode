@@ -88,6 +88,9 @@ export function createEventStream() {
         ],
       )
     },
+    seq(sessionID: string) {
+      return logSeq.get(sessionID) ?? 0
+    },
     disconnect() {
       for (const controller of v2) controller.close()
       v2.clear()
@@ -104,6 +107,7 @@ export type FetchHandler = (url: URL, request: Request) => Response | undefined 
 export function createFetch(override?: FetchHandler, events?: ReturnType<typeof createEventStream>) {
   const session = [] as URL[]
   const sessionEvents = events ?? createEventStream()
+  const snapshots = new Map<string, number>()
   async function fetch(input: RequestInfo | URL, init?: RequestInit) {
     const request = input instanceof Request ? input : new Request(input, init)
     const url = new URL(request.url)
@@ -114,6 +118,8 @@ export function createFetch(override?: FetchHandler, events?: ReturnType<typeof 
     const snapshot = url.pathname.match(/^\/api\/session\/([^/]+)\/snapshot$/)
     if (snapshot) {
       const sessionID = decodeURIComponent(snapshot[1])
+      const count = snapshots.get(sessionID) ?? 0
+      snapshots.set(sessionID, count + 1)
       const read = async (path: string, fallback: unknown) => {
         const response = await override?.(new URL(path, url), new Request(new URL(path, url)))
         if (!response) return fallback
@@ -141,7 +147,7 @@ export function createFetch(override?: FetchHandler, events?: ReturnType<typeof 
             : [],
           inbox: await read(`/api/session/${encodeURIComponent(sessionID)}/inbox`, []),
           messages: Array.isArray(messages) ? messages.toReversed() : [],
-          seq: 0,
+          seq: count === 0 ? 0 : sessionEvents.seq(sessionID),
         },
       })
     }
