@@ -10,6 +10,7 @@ export class FakeSessionServer implements Engine.SessionTransport {
     loseRequests: 0,
     loseResponses: 0,
     reject: 0,
+    latency: 0,
   }
 
   private folded: SessionFoldState
@@ -30,11 +31,13 @@ export class FakeSessionServer implements Engine.SessionTransport {
   }
 
   async snapshot(sessionID: string) {
+    await this.pause()
     this.assertSession(sessionID)
     return this.snapshotValue()
   }
 
   async *stream(sessionID: string, after: number): AsyncIterable<Engine.SessionStreamItem> {
+    await this.pause()
     this.assertSession(sessionID)
     if (after > this.folded.seq) throw new Engine.SeqUnavailable()
     const queue = new AsyncQueue<Engine.SessionStreamItem>()
@@ -49,6 +52,7 @@ export class FakeSessionServer implements Engine.SessionTransport {
   }
 
   async submit(input: Engine.SubmitInput) {
+    await this.pause()
     this.assertSession(input.sessionID)
     const existing = this.events.find(
       (event) => event.type === "session.inbox.enqueued" && event.data.inboxID === input.id,
@@ -103,6 +107,10 @@ export class FakeSessionServer implements Engine.SessionTransport {
 
   private assertSession(sessionID: string) {
     if (sessionID !== this.sessionID) throw new Error(`unknown session: ${sessionID}`)
+  }
+
+  private async pause() {
+    for (let step = 0; step < this.faults.latency; step++) await Promise.resolve()
   }
 }
 

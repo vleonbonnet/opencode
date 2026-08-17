@@ -155,6 +155,7 @@ export async function createSessionEngine(
   }
 
   const applyDurable = (event: DurableSessionEvent) => {
+    if (event.type === "session.inbox.enqueued") sent.delete(event.data.inboxID)
     publish({
       folded: SessionFold.apply(state.folded, event),
       outbox:
@@ -164,6 +165,7 @@ export async function createSessionEngine(
       overlay: clearOverlay(state.overlay, event),
       synced: state.synced,
     })
+    send()
   }
 
   const reject = (intent: Intent, reason: string) => {
@@ -173,26 +175,21 @@ export async function createSessionEngine(
 
   const send = () => {
     if (!state.synced || sending || stopped) return
+    const intent = state.outbox[0]
+    if (!intent || sent.has(intent.id)) return
     sending = true
+    sent.add(intent.id)
     void (async () => {
-      while (!stopped && state.synced) {
-        const intent = state.outbox.find((item) => !sent.has(item.id))
-        if (!intent) return
-        sent.add(intent.id)
-        try {
-          await transport.submit({ id: intent.id, sessionID, item: intent.item })
-        } catch (error) {
-          if (error instanceof SubmitRejected) {
-            sent.delete(intent.id)
-            reject(intent, error.reason)
-            continue
-          }
-          return
-        }
+      try {
+        await transport.submit({ id: intent.id, sessionID, item: intent.item })
+      } catch (error) {
+        if (!(error instanceof SubmitRejected)) return
+        sent.delete(intent.id)
+        reject(intent, error.reason)
       }
     })().finally(() => {
       sending = false
-      if (state.outbox.some((intent) => !sent.has(intent.id))) send()
+      send()
     })
   }
 
