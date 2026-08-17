@@ -143,6 +143,15 @@ GET /session/:id/log?after=seq&follow=true one ordered stream:
 - Overlay entries render only once their base part exists in folded state
   (covers the one degenerate case: a live delta arriving during the replay
   window).
+- **Outbox ack contract: the echo is the only ack.** Intents carry a
+  client-minted message ID. The HTTP 2xx is a latency hint, never trusted;
+  the intent leaves the outbox only when the durable event carrying its ID
+  folds in (same atomic store update — no flicker), or on a typed rejection
+  (drop + surface). Timeout/disconnect = unknown fate = intent just stays.
+  On reconnect: tail first, wait for `log.synced` (replay acks anything that
+  landed), then resend unacked serially — adopt-on-same-ID (`inbox.ts:137`)
+  makes resend duplicate-free. Lost request and lost response collapse into
+  the same case ("no echo yet"), which is why no guard machinery survives.
 - **Contract: the snapshot is the only entry point.** The engine never replays
   a session from genesis; fold's domain is "snapshot + events after its seq."
   Forced by `session.forked` — the event carries only `{ parentID, boundary }`
@@ -206,8 +215,11 @@ GET /session/:id/log?after=seq&follow=true one ordered stream:
 - ~~S2: adopt strictness~~ — dropped. The engine only needs adopt-on-same-ID,
   which exists (`inbox.ts:137` + AGENTS.md reconciliation rules). Conflict on
   same-ID/different-payload defends against a client bug we never create.
-- S3: widen `session.log` follow phase to interleave ephemeral session events
-  (union `Durable | Synced` → session events + `Synced`), and add the typed
+- S3: widen `session.log` follow phase to interleave ephemeral session events,
+  **opt-in via `?ephemeral=true`** — default stays durable-only, so existing
+  log consumers (devtools) are untouched. The response union widens either way
+  (extra variants simply never appear unless requested); replay is durable-only
+  in both modes since ephemeral events aren't retained. Also add the typed
   seq-unavailable error. Later: promote out of experimental.
 - S4: filter param on `event.subscribe` (`/api/event` today sends everything
   to everyone and fails slow consumers by contract). The ambient stream slims
@@ -241,43 +253,52 @@ commit typechecks and passes its package tests before landing.
 
 **Lane A — server** (`packages/core`, `packages/protocol`, generated client):
 
-- A1 `feat(core): Session.snapshot` — service method, one read transaction:
-  `{ session, children, inbox, messages: last(recent), seq }`. Core tests:
-  seq consistency under concurrent publish (write a message between the
-  transaction's reads must be impossible), empty session, recent windowing.
-- A2 `feat(protocol): session.snapshot endpoint` — route + handler + `bun run
-  generate` from packages/client.
-- A3 `feat(core): typed seq-unavailable on session.log` — `after > head` (or
-  below retention, future) fails typed instead of silently serving. Test the
-  `after == head` boundary explicitly (Zero's fence-post bug).
-- A4 `feat(core): session.log follow includes ephemeral events` — widen union
-  (`Durable | Synced` → session events + `Synced`), interleave live ephemeral
-  session events in publish order + generate. Test: delta never precedes its
-  Started on one stream; replay phase stays durable-only.
-- A5 `feat(protocol): event.subscribe filter` — S4, ambient scope. Can trail
-  the other commits; nothing in Lane B blocks on it.
+- **Snapshot** (S1)
+  - `feat(core): Session.snapshot` — service method, one read transaction:
+    `{ session, children, inbox, messages: last(recent), seq }`. Core tests:
+    seq consistency under concurrent publish (a write landing between the
+    transaction's reads must be impossible), empty session, recent windowing.
+  - `feat(protocol): session.snapshot endpoint` — route + handler + `bun run
+    generate` from packages/client.
+- **Session stream** (S3)
+  - `feat(core): typed seq-unavailable on session.log` — `after > head` (or
+    below retention, future) fails typed instead of silently serving. Test
+    the `after == head` boundary explicitly (Zero's fence-post bug).
+  - `feat(core): session.log follow includes ephemeral events` — opt-in
+    `?ephemeral=true` (default durable-only, existing consumers untouched);
+    widen union (`Durable | Synced` → session events + `Synced`), interleave
+    live ephemeral session events in publish order + generate. Test: delta
+    never precedes its Started on one stream; replay phase stays durable-only
+    in both modes; default mode carries no ephemeral events.
+- **Ambient filter** (S4, can trail; nothing in Lane B blocks on it)
+  - `feat(protocol): event.subscribe filter` — ambient scope.
 
 **Lane B — engine** (`packages/client/src/solid`, `packages/client/test`):
 
-- B1 `feat(client): session fold` — pure module: durable session events →
-  session state (messages, inbox, markers). No transport, no store. The
-  ~60-case switch in `data.ts` is the reference for event semantics.
-- B2 `feat(client): engine core` — outbox (intents, serial resend, ack-on-
-  fold-in-same-update), overlay (ephemeral fragments, superseded-and-cleared
-  by durable facts), view derivation, reconnect loop against a transport
-  interface.
-- B3 `test(client): six laws` — idempotency, echo determinism, sync opacity,
-  ordering, convergence, failure atomicity — against a fake in-process
-  transport, TestClock, no server.
-- B4 `test(client): seeded chaos sim` — two clients, lost requests/responses,
-  rejections, cuts, latency shifts; convergence + no-flicker invariants.
-- B5 `feat(client): engine-backed data layer` — `data.ts`-compatible surface
-  over the engine (needs A2's generated client for the real transport).
-- B6 `feat(tui): wire TUI to engine layer` — this worktree only.
-- B7 verification pass: termctrl live comparison vs stock v2; record demo.
+- **Fold**
+  - `feat(client): session fold` — pure module: durable session events →
+    session state (messages, inbox, markers). No transport, no store. The
+    ~60-case switch in `data.ts` is the reference for event semantics.
+- **Engine core**
+  - `feat(client): engine core` — outbox (intents, serial resend, ack-on-
+    fold-in-same-update), overlay (ephemeral fragments, superseded-and-
+    cleared by durable facts), view derivation, reconnect loop against a
+    transport interface.
+- **Validation**
+  - `test(client): six laws` — idempotency, echo determinism, sync opacity,
+    ordering, convergence, failure atomicity — fake in-process transport,
+    TestClock, no server.
+  - `test(client): seeded chaos sim` — two clients, lost requests/responses,
+    rejections, cuts, latency shifts; convergence + no-flicker invariants.
+- **Wiring** (waits on Snapshot's generated client)
+  - `feat(client): engine-backed data layer` — `data.ts`-compatible surface
+    over the engine, real transport.
+  - `feat(tui): wire TUI to engine layer` — this worktree only.
+  - Verification pass: termctrl live comparison vs stock v2; record demo.
 
-Order: A1–A4 and B1–B4 run in parallel; B5 waits on A2; B6 on B5; B7 on
-A4+B6.
+Order: Lane A (Snapshot → Session stream → Ambient filter) and Lane B
+(Fold → Engine core → Validation) run in parallel; Wiring waits on Snapshot,
+then the verification pass waits on Session stream + Wiring.
 
 ## 6. Validation
 
@@ -288,7 +309,6 @@ A4+B6.
 
 ## 7. Open questions (to resolve together)
 - Web app / desktop adoption order after TUI.
-- What does the devtools log consumer need to stay happy?
 - S4 filter shape: type list vs a named "ambient" scope.
 
 ## 8. Non-goals
