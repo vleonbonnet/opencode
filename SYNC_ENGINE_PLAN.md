@@ -255,6 +255,12 @@ before any adoption decision.
 
 ### Commit-by-commit
 
+Status: Lane A done (`0af27771` snapshot core, `d611b39f` endpoint,
+`b21a3c7d` typed seq-unavailable, `74929dd7` ephemeral opt-in, `e6eac3a0`
+simplify — S4 pending shape decision). Lane B done through validation +
+simplify (`54a2ec54` fold, `0f8831b3` engine, `2c29a743` laws, `354ab6f9`
+chaos, `c9ec1385` simplify); wiring in progress.
+
 Two lanes, disjoint packages, parallelizable. Worker sessions execute; the
 coordinating session reviews each commit and keeps this doc current. Every
 commit typechecks and passes its package tests before landing.
