@@ -41,10 +41,16 @@ Facts established by code audit and prototyping, with locations.
 
 ### The client ignores all of it
 
-- `packages/tui/src/context/data.tsx` (~1,640 lines): three racing write paths
-  into one Solid store — a 63-case bus-event switch, fetch handlers doing
-  wholesale `reconcile()`, and (in PR #42807) an optimistic ledger both must
-  consult. `sync.complete(key)` markers dedupe fetches but are not watermarks.
+- The client data layer is `packages/client/src/solid/data.ts` (~1,530 lines;
+  `packages/tui/src/context/data.tsx` is now a 22-line wrapper) — shared by
+  TUI/desktop/web, so the engine lands once for all clients. Three racing
+  write paths into one Solid store: a ~60-case bus-event switch, fetch
+  handlers doing wholesale `reconcile()`, and (in PR #42807) an optimistic
+  ledger both must consult. `sync.complete(key)` markers dedupe fetches but
+  are not watermarks.
+- Opening a session today = four separate fetches: `session.get`,
+  `session.list({parentID})` (children), `session.inbox.list`, messages
+  (`data.ts:1084-1140`) — four sync keys, no shared consistent point.
 - Reconnect = `sync.reset()` + refetch everything; no gap proof.
 
 ### Prior art
@@ -117,8 +123,29 @@ view   = render(state ⊕ outbox)           derived; ephemeral deltas overlay
 
 ## 4. Server changes (small)
 
-- S1: watermarked hydration — one read transaction returning
-  `{ session, inbox, messages window, seq }`. TODO: exact endpoint shape.
+- S1: watermarked hydration — **decided (tentative, pending prior-art review):**
+  one new endpoint, `GET /api/session/:id/snapshot`, one read transaction:
+
+  ```
+  { session, children, inbox, messages: last(N), seq }
+  ```
+
+  - Named `snapshot`, not `state`: point-in-time consistency is the contract,
+    and `state` collides with the engine's `state = fold(...)`.
+  - One transaction → one watermark. Rejected alternative: adding `seq` to
+    each existing read — three watermarks force per-slice replay guards in
+    the engine, and the session row's accumulators (usage sums) double-count
+    on overlap replay. Server savings reappear as engine complexity, worse.
+  - `children` are info rows only; child sessions are separate aggregates and
+    hydrate their own messages/inbox when opened.
+  - Older history stays on the existing seq-cursored `messages` endpoint,
+    folded in as inert backfill (IDs dedupe; revert/compaction arrive on the
+    log).
+  - Prior art for snapshot+watermark+tail: Discord (`seq`/RESUME), Telegram
+    (`pts`/`getDifference`), Linear (`lastSyncId`), Postgres logical
+    replication (exported snapshot + LSN), Kafka/EventStore catch-up
+    subscriptions, Replicache (cookie). Slack's deprecated `rtm.start` is the
+    cautionary tale for unbounded snapshots. Details: `notes/hydration-prior-art.md`.
 - S2: adopt strictness — `admit` conflicts on same-ID/different-payload.
 - S3 (later): promote `session.log` out of experimental.
 
@@ -139,8 +166,8 @@ TODO: flag mechanics, rollout, kill criteria per step.
 
 ## 7. Open questions (to resolve together)
 
-- Endpoint shape: enrich existing reads with `seq` vs one `state` endpoint?
-- Recent-window size / older-history pagination interaction with the fold.
+- Recent-window size for the snapshot (~200? Slack's unbounded-snapshot
+  mistake says: bound it from day one).
 - Ephemeral delta overlay: exact merge semantics with folded state.
 - Compaction / revert / fork: replay interactions worth spelling out?
 - Web app / desktop adoption order after TUI.
