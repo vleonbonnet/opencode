@@ -143,6 +143,17 @@ GET /session/:id/log?after=seq&follow=true one ordered stream:
 - Overlay entries render only once their base part exists in folded state
   (covers the one degenerate case: a live delta arriving during the replay
   window).
+- **Contract: the snapshot is the only entry point.** The engine never replays
+  a session from genesis; fold's domain is "snapshot + events after its seq."
+  Forced by `session.forked` — the event carries only `{ parentID, boundary }`
+  and the projector copies parent rows, which no client fold could reproduce.
+  Bonus: licenses future log truncation (serve back to the oldest live
+  snapshot, not seq 0).
+- Compaction/revert/fork all fold cleanly under that contract: compaction only
+  adds (summary message + epoch marker); revert folds exactly what the
+  projector does (drop messages/inbox at-or-after boundary, clear marker —
+  `projector.ts:660-690`); fork needs no fold case at all (a forked session's
+  snapshot already contains the copied messages).
 - Reconnect: tail from last seq first; on typed seq-unavailable → snapshot →
   resend unacknowledged → tail. Gapless by construction.
 - Scope boundary: session aggregate only. Ambient state (catalog, agents,
@@ -191,6 +202,11 @@ GET /session/:id/log?after=seq&follow=true one ordered stream:
 - S3: widen `session.log` follow phase to interleave ephemeral session events
   (union `Durable | Synced` → session events + `Synced`), and add the typed
   seq-unavailable error. Later: promote out of experimental.
+- S4: filter param on `event.subscribe` (`/api/event` today sends everything
+  to everyone and fails slow consumers by contract). The ambient stream slims
+  to: non-session events + session-lifecycle events needed by the session
+  list for unopened sessions (created/deleted/renamed/moved, usage, execution
+  status). Exact param shape TBD.
 
 ## 5. Migration (each step ships alone)
 
@@ -213,9 +229,9 @@ TODO: flag mechanics, rollout, kill criteria per step.
 
 - Recent-window size for the snapshot (~200? Slack's unbounded-snapshot
   mistake says: bound it from day one).
-- Compaction / revert / fork: replay interactions worth spelling out?
 - Web app / desktop adoption order after TUI.
 - What does the devtools log consumer need to stay happy?
+- S4 filter shape: type list vs a named "ambient" scope.
 
 ## 8. Non-goals
 
