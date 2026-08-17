@@ -276,6 +276,7 @@ export function render(state: Pick<EngineState, "folded" | "outbox" | "overlay">
     [
       ...state.folded.messages,
       ...pending.flatMap((item): ReadonlyArray<SessionMessageInfo> => {
+        if (item.type !== "compaction" && item.delivery === "queue") return []
         if (messageIDs.has(item.id)) return []
         const message = SessionFold.messageFromInbox(item)
         return message ? [message] : []

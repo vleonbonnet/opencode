@@ -72,9 +72,12 @@ export function createEngineData(config: CreateDataInput) {
 
   const update = (sessionID: string, view: Engine.SessionView) => {
     batch(() => {
-      setViews(sessionID, reconcile(view))
-      legacy.session.remember(view.session)
-      view.children.forEach(legacy.session.remember)
+      setViews(sessionID, reconcile(structuredClone(view)))
+      const current = legacy.session.get(sessionID)
+      if (!current || current.time.updated <= view.session.time.updated) {
+        legacy.session.remember(structuredClone(view.session))
+      }
+      view.children.forEach((child) => legacy.session.remember(structuredClone(child)))
     })
   }
 
@@ -101,40 +104,50 @@ export function createEngineData(config: CreateDataInput) {
     ...legacy,
     session: {
       ...legacy.session,
-      sync(sessionID: string) {
+      sync(sessionID: string, _options?: { readonly children?: boolean }) {
         return ensure(sessionID).then(() => undefined)
       },
       status(sessionID: string) {
-        return views[sessionID]?.active ?? legacy.session.status(sessionID)
+        if (views[sessionID]?.active === "running") return "running"
+        return legacy.session.status(sessionID)
       },
       input: {
         list(sessionID: string) {
-          return views[sessionID]?.pending.filter((item) => item.type !== "compaction").map((item) => item.id) ?? []
+          return (
+            views[sessionID]?.pending.filter((item) => item.type !== "compaction").map((item) => item.id) ??
+            legacy.session.input.list(sessionID)
+          )
         },
         has(sessionID: string, inboxID: string) {
-          return views[sessionID]?.pending.some((item) => item.type !== "compaction" && item.id === inboxID) ?? false
+          return (
+            views[sessionID]?.pending.some((item) => item.type !== "compaction" && item.id === inboxID) ??
+            legacy.session.input.has(sessionID, inboxID)
+          )
         },
       },
       pending: {
         list(sessionID: string) {
-          return views[sessionID]?.pending ?? []
+          void ensure(sessionID)
+          return [...(views[sessionID]?.pending ?? [])]
         },
         sync(sessionID: string) {
           return ensure(sessionID).then(() => undefined)
         },
-        invalidate() {},
+        invalidate(_sessionID: string) {},
       },
       message: {
         list(sessionID: string) {
-          return views[sessionID]?.messages ?? []
+          void ensure(sessionID)
+          return [...(views[sessionID]?.messages ?? [])]
         },
         get(sessionID: string, messageID: string) {
+          void ensure(sessionID)
           return views[sessionID]?.messages.find((message) => message.id === messageID)
         },
         sync(sessionID: string) {
           return ensure(sessionID).then(() => undefined)
         },
-        invalidate() {},
+        invalidate(_sessionID: string) {},
       },
       async prompt(input: SessionPromptInput) {
         return (await ensure(input.sessionID)).submit({
