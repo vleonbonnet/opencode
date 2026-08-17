@@ -245,6 +245,14 @@ before any adoption decision.
 5. If it wins: adoption (swap the wiring, delete `data.ts` + PR #42807/#42808
    guards) is its own decision with two working implementations to diff.
 
+   Deletion inventory at adoption: `data.ts` (~1,530 lines — the 64-case bus
+   switch becomes the pure fold; 4-fetch session open → one snapshot; all
+   refetch-on-reconnect machinery → nothing), PRs #42807/#42808 never merge
+   (stopgap ledger avoided entirely), TUI `util/single-flight.ts` + call
+   sites (submit is idempotent by minted ID), per-callsite await-then-toast
+   action plumbing → one generic outbox-rejection path. Rendering components
+   unchanged by design (same store shape).
+
 ### Commit-by-commit
 
 Two lanes, disjoint packages, parallelizable. Worker sessions execute; the
