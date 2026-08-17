@@ -166,8 +166,13 @@ GET /session/:id/log?after=seq&follow=true one ordered stream:
   one new endpoint, `GET /api/session/:id/snapshot`, one read transaction:
 
   ```
-  { session, children, inbox, messages: last(N), seq }
+  GET /api/session/:id/snapshot?recent=N
+  → { session, children, inbox, messages: last(N), seq }
   ```
+
+  `recent` defaults to 200 — today's first page exactly (`data.ts:1136`,
+  `limit: 200`). Tuning it smaller later is a parameter change, not a design
+  change.
 
   - Named `snapshot`, not `state`: point-in-time consistency is the contract,
     and `state` collides with the engine's `state = fold(...)`.
@@ -199,6 +204,9 @@ GET /session/:id/log?after=seq&follow=true one ordered stream:
       signal (EventStoreDB added `CaughtUp` after pain; suppress notifications
       during replay).
 - S2: adopt strictness — `admit` conflicts on same-ID/different-payload.
+  **Verify first**: AGENTS.md session-core rules say this already exists
+  ("reconciles only when Session, type, complete payload, metadata, and
+  delivery match; conflicting reuse fails") — may reduce to a test.
 - S3: widen `session.log` follow phase to interleave ephemeral session events
   (union `Durable | Synced` → session events + `Synced`), and add the typed
   seq-unavailable error. Later: promote out of experimental.
@@ -226,6 +234,54 @@ before any adoption decision.
 5. If it wins: adoption (swap the wiring, delete `data.ts` + PR #42807/#42808
    guards) is its own decision with two working implementations to diff.
 
+### Commit-by-commit
+
+Two lanes, disjoint packages, parallelizable. Worker sessions execute; the
+coordinating session reviews each commit and keeps this doc current. Every
+commit typechecks and passes its package tests before landing.
+
+**Lane A — server** (`packages/core`, `packages/protocol`, generated client):
+
+- A1 `test(core): verify inbox adopt strictness` — S2; conflict on same-ID/
+  different-payload. Test-only if AGENTS.md is right; small fix if not.
+- A2 `feat(core): Session.snapshot` — service method, one read transaction:
+  `{ session, children, inbox, messages: last(recent), seq }`. Core tests:
+  seq consistency under concurrent publish (write a message between the
+  transaction's reads must be impossible), empty session, recent windowing.
+- A3 `feat(protocol): session.snapshot endpoint` — route + handler + `bun run
+  generate` from packages/client.
+- A4 `feat(core): typed seq-unavailable on session.log` — `after > head` (or
+  below retention, future) fails typed instead of silently serving. Test the
+  `after == head` boundary explicitly (Zero's fence-post bug).
+- A5 `feat(core): session.log follow includes ephemeral events` — widen union
+  (`Durable | Synced` → session events + `Synced`), interleave live ephemeral
+  session events in publish order + generate. Test: delta never precedes its
+  Started on one stream; replay phase stays durable-only.
+- A6 `feat(protocol): event.subscribe filter` — S4, ambient scope. Can trail
+  the other commits; nothing in Lane B blocks on it.
+
+**Lane B — engine** (`packages/client/src/solid`, `packages/client/test`):
+
+- B1 `feat(client): session fold` — pure module: durable session events →
+  session state (messages, inbox, markers). No transport, no store. The
+  ~60-case switch in `data.ts` is the reference for event semantics.
+- B2 `feat(client): engine core` — outbox (intents, serial resend, ack-on-
+  fold-in-same-update), overlay (ephemeral fragments, superseded-and-cleared
+  by durable facts), view derivation, reconnect loop against a transport
+  interface.
+- B3 `test(client): six laws` — idempotency, echo determinism, sync opacity,
+  ordering, convergence, failure atomicity — against a fake in-process
+  transport, TestClock, no server.
+- B4 `test(client): seeded chaos sim` — two clients, lost requests/responses,
+  rejections, cuts, latency shifts; convergence + no-flicker invariants.
+- B5 `feat(client): engine-backed data layer` — `data.ts`-compatible surface
+  over the engine (needs A3's generated client for the real transport).
+- B6 `feat(tui): wire TUI to engine layer` — this worktree only.
+- B7 verification pass: termctrl live comparison vs stock v2; record demo.
+
+Order: A1–A5 and B1–B4 run in parallel; B5 waits on A3; B6 on B5; B7 on
+A5+B6.
+
 ## 6. Validation
 
 - Port sync-proto's six laws + seeded chaos sim to run against the real engine
@@ -234,9 +290,6 @@ before any adoption decision.
   Zero shipped a fence-post bug at exactly this boundary (rocicorp/mono#5589).
 
 ## 7. Open questions (to resolve together)
-
-- Recent-window size for the snapshot (~200? Slack's unbounded-snapshot
-  mistake says: bound it from day one).
 - Web app / desktop adoption order after TUI.
 - What does the devtools log consumer need to stay happy?
 - S4 filter shape: type list vs a named "ambient" scope.
