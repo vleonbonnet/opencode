@@ -140,6 +140,11 @@ export class InboxConflictError extends Schema.TaggedErrorClass<InboxConflictErr
   sessionID: SessionSchema.ID,
   inboxID: SessionMessage.ID,
 }) {}
+export class SeqUnavailableError extends Schema.TaggedErrorClass<SeqUnavailableError>()("Session.SeqUnavailableError", {
+  sessionID: SessionSchema.ID,
+  after: Event.Seq,
+  head: Schema.optional(Event.Seq),
+}) {}
 type InboxItemRef = { readonly sessionID: SessionSchema.ID; readonly inboxID: SessionMessage.ID }
 export class SkillNotFoundError extends Schema.TaggedErrorClass<SkillNotFoundError>()("Session.SkillNotFoundError", {
   skill: Skill.ID,
@@ -216,7 +221,7 @@ export interface Interface {
     sessionID: SessionSchema.ID
     after?: number
     follow?: boolean
-  }) => Stream.Stream<SessionEvent.DurableEvent | EventLog.Synced, NotFoundError>
+  }) => Stream.Stream<SessionEvent.DurableEvent | EventLog.Synced, NotFoundError | SeqUnavailableError>
   readonly switchAgent: (input: { sessionID: SessionSchema.ID; agent: Agent.ID }) => Effect.Effect<void, NotFoundError>
   readonly switchModel: (input: { sessionID: SessionSchema.ID; model: Model.Ref }) => Effect.Effect<void, NotFoundError>
   readonly rename: (input: { sessionID: SessionSchema.ID; title: string }) => Effect.Effect<void, NotFoundError>
@@ -608,9 +613,17 @@ const layer = Layer.effect(
       queueInbox: Effect.fn("Session.queueInbox")((input) => mutatePending(input, SessionInbox.queue)),
       log: (input) =>
         Stream.unwrap(
-          result
-            .get(input.sessionID)
-            .pipe(Effect.as(bus.log({ aggregateID: input.sessionID, after: input.after, follow: input.follow }))),
+          Effect.gen(function* () {
+            yield* result.get(input.sessionID)
+            const head = yield* Bus.latestSequence(db, input.sessionID)
+            if (input.after !== undefined && input.after > head)
+              return yield* new SeqUnavailableError({
+                sessionID: input.sessionID,
+                after: Event.Seq.make(input.after),
+                head: head >= 0 ? Event.Seq.make(head) : undefined,
+              })
+            return bus.log({ aggregateID: input.sessionID, after: input.after, follow: input.follow })
+          }),
         ).pipe(
           Stream.filter(
             (item): item is SessionEvent.DurableEvent | EventLog.Synced =>

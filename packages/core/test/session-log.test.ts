@@ -60,6 +60,43 @@ describe("Session.log", () => {
     }),
   )
 
+  it.effect("accepts a cursor exactly at the aggregate head", () =>
+    Effect.gen(function* () {
+      const session = yield* Session.Service
+      const created = yield* session.create({ location })
+
+      const items = Array.from(
+        yield* Stream.runCollect(session.log({ sessionID: created.id, after: Event.Seq.make(0) })),
+      )
+
+      expect(items).toEqual([{ type: "log.synced", aggregateID: created.id, seq: Event.Seq.make(0) }])
+    }),
+  )
+
+  it.effect("fails with SeqUnavailable when the cursor is beyond the aggregate head", () =>
+    Effect.gen(function* () {
+      const session = yield* Session.Service
+      const created = yield* session.create({ location })
+
+      const errors = yield* Effect.forEach([1, 10], (after) =>
+        Effect.flip(Stream.runCollect(session.log({ sessionID: created.id, after: Event.Seq.make(after) }))),
+      )
+
+      expect(errors.map((error) => error._tag)).toEqual([
+        "Session.SeqUnavailableError",
+        "Session.SeqUnavailableError",
+      ])
+      expect(errors.map((error) => (error._tag === "Session.SeqUnavailableError" ? error.after : undefined))).toEqual([
+        Event.Seq.make(1),
+        Event.Seq.make(10),
+      ])
+      expect(errors.map((error) => (error._tag === "Session.SeqUnavailableError" ? error.head : undefined))).toEqual([
+        Event.Seq.make(0),
+        Event.Seq.make(0),
+      ])
+    }),
+  )
+
   it.effect("fails with NotFound for an unknown session", () =>
     Effect.gen(function* () {
       const session = yield* Session.Service
