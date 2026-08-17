@@ -1990,6 +1990,16 @@ export type SessionLogItem = SessionEventDurable | EventLogSynced
 
 export type SessionTransferData = { info: SessionInfo; messages: Array<SessionMessageInfo> }
 
+export type SessionSnapshotResponse = {
+  data: {
+    session: SessionInfo
+    children: Array<SessionInfo>
+    inbox: Array<SessionInboxInfo>
+    messages: Array<SessionMessageInfo>
+    seq: number
+  }
+}
+
 export type SessionMessagesResponse = {
   data: Array<SessionMessageInfo>
   cursor: { previous?: string | null; next?: string | null }
@@ -3273,6 +3283,13 @@ export type SessionActiveOutput = { data: { [x: string]: SessionActive } }["data
 export type SessionGetInput = { readonly sessionID: { readonly sessionID: string }["sessionID"] }
 
 export type SessionGetOutput = { data: SessionInfo }["data"]
+
+export type SessionSnapshotInput = {
+  readonly sessionID: { readonly sessionID: string }["sessionID"]
+  readonly recent?: { readonly recent?: number | undefined }["recent"]
+}
+
+export type SessionSnapshotOutput = SessionSnapshotResponse["data"]
 
 export type SessionRemoveInput = { readonly sessionID: { readonly sessionID: string }["sessionID"] }
 

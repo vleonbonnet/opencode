@@ -220,6 +220,30 @@ export const makeSessionGroup = <I extends HttpApiMiddleware.AnyId, S>(sessionLo
       ),
     )
     .add(
+      HttpApiEndpoint.get("session.snapshot", "/api/session/:sessionID/snapshot", {
+        params: { sessionID: Session.ID },
+        query: {
+          recent: Schema.NumberFromString.pipe(Schema.decodeTo(PositiveInt), Schema.optional),
+        },
+        success: Schema.Struct({
+          data: Schema.Struct({
+            session: Session.Info,
+            children: Schema.Array(Session.Info),
+            inbox: Schema.Array(SessionInbox.Info),
+            messages: Schema.Array(SessionMessage.Info),
+            seq: Event.Seq,
+          }),
+        }).annotate({ identifier: "SessionSnapshotResponse" }),
+        error: [SessionNotFoundError, UnknownError],
+      }).annotateMerge(
+        OpenApi.annotations({
+          identifier: "v2.session.snapshot",
+          summary: "Snapshot session state",
+          description: "Retrieve projected session state and its aggregate sequence from one consistent read.",
+        }),
+      ),
+    )
+    .add(
       HttpApiEndpoint.delete("session.remove", "/api/session/:sessionID", {
         params: { sessionID: Session.ID },
         success: HttpApiSchema.NoContent,

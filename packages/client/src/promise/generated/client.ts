@@ -22,6 +22,8 @@ import type {
   SessionActiveOutput,
   SessionGetInput,
   SessionGetOutput,
+  SessionSnapshotInput,
+  SessionSnapshotOutput,
   SessionRemoveInput,
   SessionRemoveOutput,
   SessionForkInput,
@@ -522,6 +524,18 @@ export function make(options: ClientOptions) {
             path: `/api/session/${encodeURIComponent(input.sessionID)}`,
             successStatus: 200,
             declaredStatuses: [404, 401, 400],
+            empty: false,
+          },
+          requestOptions,
+        ).then((value) => value.data),
+      snapshot: (input: SessionSnapshotInput, requestOptions?: RequestOptions) =>
+        request<{ readonly data: SessionSnapshotOutput }>(
+          {
+            method: "GET",
+            path: `/api/session/${encodeURIComponent(input.sessionID)}/snapshot`,
+            query: { recent: input["recent"] },
+            successStatus: 200,
+            declaredStatuses: [404, 500, 401, 400],
             empty: false,
           },
           requestOptions,
