@@ -144,8 +144,21 @@ view   = render(state ⊕ outbox)           derived; ephemeral deltas overlay
   - Prior art for snapshot+watermark+tail: Discord (`seq`/RESUME), Telegram
     (`pts`/`getDifference`), Linear (`lastSyncId`), Postgres logical
     replication (exported snapshot + LSN), Kafka/EventStore catch-up
-    subscriptions, Replicache (cookie). Slack's deprecated `rtm.start` is the
-    cautionary tale for unbounded snapshots. Details: `notes/hydration-prior-art.md`.
+    subscriptions, Replicache (cookie — whose launch checklist requires the
+    watermark "read in the same transaction as the client view data").
+    Slack's deprecated `rtm.start` is the cautionary tale for unbounded
+    snapshots (their edge cache cut boot payloads 7–44×; 42-message pages).
+    Details: `notes/hydration-prior-art.md`.
+  - Adopted from prior art:
+    - `log?after=seq` returns a typed **seq-unavailable error** when the seq
+      is not servable → client full-rehydrates. Never silently clamp to the
+      oldest retained event (Discord op 9 / Telegram `differenceTooLong` /
+      Postgres explicitly warns against clamping).
+    - Resume-first discipline: reconnect tries the tail from the last seq
+      before re-snapshotting (Discord meters full rehydrates, not resumes).
+    - Keep the existing `log.synced` caught-up marker as a first-class engine
+      signal (EventStoreDB added `CaughtUp` after pain; suppress notifications
+      during replay).
 - S2: adopt strictness — `admit` conflicts on same-ID/different-payload.
 - S3 (later): promote `session.log` out of experimental.
 
@@ -163,6 +176,8 @@ TODO: flag mechanics, rollout, kill criteria per step.
 
 - Port sync-proto's six laws + seeded chaos sim to run against the real engine
   with a faked transport. TODO: where these tests live, CI story.
+- Explicit boundary test at `seq == snapshot.seq` (empty tail vs purged log) —
+  Zero shipped a fence-post bug at exactly this boundary (rocicorp/mono#5589).
 
 ## 7. Open questions (to resolve together)
 
