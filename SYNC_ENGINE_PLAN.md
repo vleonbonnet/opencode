@@ -203,10 +203,9 @@ GET /session/:id/log?after=seq&follow=true one ordered stream:
     - Keep the existing `log.synced` caught-up marker as a first-class engine
       signal (EventStoreDB added `CaughtUp` after pain; suppress notifications
       during replay).
-- S2: adopt strictness — `admit` conflicts on same-ID/different-payload.
-  **Verify first**: AGENTS.md session-core rules say this already exists
-  ("reconciles only when Session, type, complete payload, metadata, and
-  delivery match; conflicting reuse fails") — may reduce to a test.
+- ~~S2: adopt strictness~~ — dropped. The engine only needs adopt-on-same-ID,
+  which exists (`inbox.ts:137` + AGENTS.md reconciliation rules). Conflict on
+  same-ID/different-payload defends against a client bug we never create.
 - S3: widen `session.log` follow phase to interleave ephemeral session events
   (union `Durable | Synced` → session events + `Synced`), and add the typed
   seq-unavailable error. Later: promote out of experimental.
@@ -242,22 +241,20 @@ commit typechecks and passes its package tests before landing.
 
 **Lane A — server** (`packages/core`, `packages/protocol`, generated client):
 
-- A1 `test(core): verify inbox adopt strictness` — S2; conflict on same-ID/
-  different-payload. Test-only if AGENTS.md is right; small fix if not.
-- A2 `feat(core): Session.snapshot` — service method, one read transaction:
+- A1 `feat(core): Session.snapshot` — service method, one read transaction:
   `{ session, children, inbox, messages: last(recent), seq }`. Core tests:
   seq consistency under concurrent publish (write a message between the
   transaction's reads must be impossible), empty session, recent windowing.
-- A3 `feat(protocol): session.snapshot endpoint` — route + handler + `bun run
+- A2 `feat(protocol): session.snapshot endpoint` — route + handler + `bun run
   generate` from packages/client.
-- A4 `feat(core): typed seq-unavailable on session.log` — `after > head` (or
+- A3 `feat(core): typed seq-unavailable on session.log` — `after > head` (or
   below retention, future) fails typed instead of silently serving. Test the
   `after == head` boundary explicitly (Zero's fence-post bug).
-- A5 `feat(core): session.log follow includes ephemeral events` — widen union
+- A4 `feat(core): session.log follow includes ephemeral events` — widen union
   (`Durable | Synced` → session events + `Synced`), interleave live ephemeral
   session events in publish order + generate. Test: delta never precedes its
   Started on one stream; replay phase stays durable-only.
-- A6 `feat(protocol): event.subscribe filter` — S4, ambient scope. Can trail
+- A5 `feat(protocol): event.subscribe filter` — S4, ambient scope. Can trail
   the other commits; nothing in Lane B blocks on it.
 
 **Lane B — engine** (`packages/client/src/solid`, `packages/client/test`):
@@ -275,12 +272,12 @@ commit typechecks and passes its package tests before landing.
 - B4 `test(client): seeded chaos sim` — two clients, lost requests/responses,
   rejections, cuts, latency shifts; convergence + no-flicker invariants.
 - B5 `feat(client): engine-backed data layer` — `data.ts`-compatible surface
-  over the engine (needs A3's generated client for the real transport).
+  over the engine (needs A2's generated client for the real transport).
 - B6 `feat(tui): wire TUI to engine layer` — this worktree only.
 - B7 verification pass: termctrl live comparison vs stock v2; record demo.
 
-Order: A1–A5 and B1–B4 run in parallel; B5 waits on A3; B6 on B5; B7 on
-A5+B6.
+Order: A1–A4 and B1–B4 run in parallel; B5 waits on A2; B6 on B5; B7 on
+A4+B6.
 
 ## 6. Validation
 
