@@ -90,4 +90,26 @@ describe("session sync engine laws", () => {
     expect(failures).toEqual([{ intent, reason: "rejected" }])
     engine.stop()
   })
+
+  test("snapshot refresh cannot move the fold behind the live log", async () => {
+    const server = new FakeSessionServer("session-refresh-race")
+    const stale = server.snapshotValue()
+    let refresh = false
+    const transport: Engine.SessionTransport = {
+      snapshot: (sessionID) => (refresh ? Promise.resolve(stale) : server.snapshot(sessionID)),
+      stream: (sessionID, after) => server.stream(sessionID, after),
+      submit: (input) => server.submit(input),
+    }
+    const engine = await Engine.createSessionEngine(server.sessionID, transport)
+    await engine.ready()
+
+    engine.submit({ id: "msg_1", text: "newer than snapshot" })
+    await until(() => engine.view().seq === 1)
+    refresh = true
+    await engine.refresh()
+
+    expect(engine.view().seq).toBe(1)
+    expect(engine.view().pending.map((item) => item.id)).toEqual(["msg_1"])
+    engine.stop()
+  })
 })

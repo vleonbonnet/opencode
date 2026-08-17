@@ -70,6 +70,8 @@ export interface SessionEngine {
   readonly submit: (input: Intent["request"] & { readonly id?: string }) => Intent
   readonly subscribe: (listener: (view: SessionView) => void) => () => void
   readonly subscribeFailures: (listener: (failure: IntentFailure) => void) => () => void
+  readonly ready: () => Promise<void>
+  readonly refresh: () => Promise<void>
   readonly settled: () => Promise<void>
   readonly stop: () => void
 }
@@ -115,9 +117,11 @@ export async function createSessionEngine(
   const listeners = new Set<(view: SessionView) => void>()
   const failureListeners = new Set<(failure: IntentFailure) => void>()
   const settled = new Set<() => void>()
+  const ready = Promise.withResolvers<void>()
   let sent: string | undefined
   let stopped = false
   let sending = false
+  let refreshing: Promise<void> | undefined
   const abort = new AbortController()
 
   const publish = (next: EngineState) => {
@@ -129,7 +133,7 @@ export async function createSessionEngine(
     settled.clear()
   }
 
-  const applySnapshot = (snapshot: SessionSnapshot) => {
+  const applySnapshot = (snapshot: SessionSnapshot, synced = false) => {
     const folded = SessionFold.fromSnapshot(snapshot)
     const acknowledged = new Set([
       ...folded.messages.map((message) => message.id),
@@ -139,7 +143,7 @@ export async function createSessionEngine(
       folded,
       outbox: state.outbox.filter((intent) => !acknowledged.has(intent.id)),
       overlay: new Map(),
-      synced: false,
+      synced,
     })
   }
 
@@ -190,6 +194,7 @@ export async function createSessionEngine(
           if (item.type === "log.synced") {
             sent = undefined
             publish({ ...state, synced: true })
+            ready.resolve()
             send()
             continue
           }
@@ -246,6 +251,21 @@ export async function createSessionEngine(
     subscribeFailures(listener) {
       failureListeners.add(listener)
       return () => failureListeners.delete(listener)
+    },
+    ready: () => ready.promise,
+    refresh() {
+      if (refreshing) return refreshing
+      refreshing = transport
+        .snapshot(sessionID)
+        .then((snapshot) => {
+          if (snapshot.seq < state.folded.seq) return
+          applySnapshot(snapshot, state.synced)
+          send()
+        })
+        .finally(() => {
+          refreshing = undefined
+        })
+      return refreshing
     },
     settled() {
       if (state.outbox.length === 0) return Promise.resolve()
