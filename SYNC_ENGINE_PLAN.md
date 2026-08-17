@@ -106,19 +106,47 @@ TODO — expand together. Sketch:
 
 ## 3. Design
 
-TODO — expand together. Sketch:
+```
+state   = fold(snapshot, durable events)   server truth only
+outbox  = ordered pending intents          client IDs, idempotent, serial resend
+overlay = live ephemeral fragments         deltas/progress, superseded by durable facts
+view    = render(state ⊕ outbox ⊕ overlay) derived
+```
+
+The entire client surface for one session — two calls, one stream:
 
 ```
-state  = fold(snapshot, durable events)   server truth only
-outbox = ordered pending intents          client IDs, idempotent, serial resend
-view   = render(state ⊕ outbox)           derived; ephemeral deltas overlay
+GET /session/:id/snapshot                  fetch → { session, children, inbox,
+                                                     messages: last(N), seq }
+GET /session/:id/log?after=seq&follow=true one ordered stream:
+    replay:  durable events seq+1..head    (deltas are live-only, absent here)
+    marker:  log.synced                    "caught up" — first-class engine signal
+    live:    durable + ephemeral session events interleaved, publish order
 ```
 
-- Hydrate: `state?recent=N` (snapshot + watermark, one transaction).
-- Tail: existing log endpoint after watermark; fold + ack in one store update.
-- Reconnect: hydrate → resend unacknowledged → tail. Gapless by construction.
+- **Decided:** the log endpoint's follow phase carries ephemeral session
+  events too (widen its union from `Durable | Synced`). One server-merged
+  stream per session; the client never merges two event feeds for one
+  aggregate, so a delta can never precede its own `Started`.
+- **Overlay semantics:** `Map<(messageID, ordinal), accumulated>` — never
+  enters the fold. The durable full-value boundary (`text.ended`, carries
+  complete text) supersedes and clears the overlay entry in the same atomic
+  update that folds it — same no-seam trick as an intent leaving the outbox
+  on ack. Dropped deltas are self-healing by construction. Same mechanism for
+  all 6 ephemeral types (`tool.progress`/`usage.updated` superseded by
+  `tool.success|failed`/`step.ended`).
+- **Decided (mid-stream reconnect):** accept today's behavior — after
+  re-hydrate, overlay accumulates from now, so in-flight text may render with
+  a missing prefix until its `Ended` supersedes. Simplest code, self-healing,
+  no protocol change. (Optional later polish: if `Started` wasn't observed
+  live, show a streaming indicator instead of partial text.)
+- Overlay entries render only once their base part exists in folded state
+  (covers the one degenerate case: a live delta arriving during the replay
+  window).
+- Reconnect: tail from last seq first; on typed seq-unavailable → snapshot →
+  resend unacknowledged → tail. Gapless by construction.
 - Scope boundary: session aggregate only. Ambient state (catalog, agents,
-  projects, vcs, worktrees) stays on the existing bus as-is.
+  projects, vcs, worktrees) stays on the existing global bus as-is.
 - Render target: existing Solid store shape, so components don't change.
 
 ## 4. Server changes (small)
@@ -160,7 +188,9 @@ view   = render(state ⊕ outbox)           derived; ephemeral deltas overlay
       signal (EventStoreDB added `CaughtUp` after pain; suppress notifications
       during replay).
 - S2: adopt strictness — `admit` conflicts on same-ID/different-payload.
-- S3 (later): promote `session.log` out of experimental.
+- S3: widen `session.log` follow phase to interleave ephemeral session events
+  (union `Durable | Synced` → session events + `Synced`), and add the typed
+  seq-unavailable error. Later: promote out of experimental.
 
 ## 5. Migration (each step ships alone)
 
@@ -183,7 +213,6 @@ TODO: flag mechanics, rollout, kill criteria per step.
 
 - Recent-window size for the snapshot (~200? Slack's unbounded-snapshot
   mistake says: bound it from day one).
-- Ephemeral delta overlay: exact merge semantics with folded state.
 - Compaction / revert / fork: replay interactions worth spelling out?
 - Web app / desktop adoption order after TUI.
 - What does the devtools log consumer need to stay happy?
