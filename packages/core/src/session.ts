@@ -51,6 +51,7 @@ import { Global } from "@opencode-ai/util/global"
 import { Shell as ShellSchema } from "@opencode-ai/schema/shell"
 import { KeyedMutex } from "./effect/keyed-mutex.js"
 import { fileURLToPath } from "url"
+import { EventSequenceTable } from "./event/sql.js"
 
 // get project -> project.locations
 //
@@ -188,6 +189,19 @@ export interface Interface {
    * unhandled compaction barriers.
    */
   readonly inbox: (sessionID: SessionSchema.ID) => Effect.Effect<SessionInbox.Info[], NotFoundError>
+  readonly snapshot: (input: {
+    sessionID: SessionSchema.ID
+    recent?: number
+  }) => Effect.Effect<
+    {
+      readonly session: SessionSchema.Info
+      readonly children: SessionSchema.Info[]
+      readonly inbox: SessionInbox.Info[]
+      readonly messages: SessionMessage.Info[]
+      readonly seq: Event.Seq
+    },
+    NotFoundError | MessageDecodeError
+  >
   readonly cancelInbox: (input: InboxItemRef) => Effect.Effect<void, NotFoundError | InboxConflictError>
   readonly steerInbox: (input: InboxItemRef) => Effect.Effect<void, NotFoundError | InboxConflictError>
   readonly queueInbox: (input: InboxItemRef) => Effect.Effect<void, NotFoundError | InboxConflictError>
@@ -543,6 +557,51 @@ const layer = Layer.effect(
       inbox: Effect.fn("Session.inbox")(function* (sessionID) {
         yield* result.get(sessionID)
         return yield* SessionInbox.list(db, sessionID)
+      }),
+      snapshot: Effect.fn("Session.snapshot")(function* (input) {
+        return yield* db
+          .transaction(() =>
+            Effect.gen(function* () {
+              const row = yield* db
+                .select()
+                .from(SessionTable)
+                .where(eq(SessionTable.id, input.sessionID))
+                .get()
+                .pipe(Effect.orDie)
+              if (!row) return yield* new NotFoundError({ sessionID: input.sessionID })
+              const children = yield* db
+                .select()
+                .from(SessionTable)
+                .where(eq(SessionTable.parent_id, input.sessionID))
+                .orderBy(desc(SessionTable.time_updated), desc(SessionTable.id))
+                .all()
+                .pipe(Effect.orDie)
+              const inbox = yield* SessionInbox.list(db, input.sessionID)
+              const messages = yield* db
+                .select()
+                .from(SessionMessageTable)
+                .where(eq(SessionMessageTable.session_id, input.sessionID))
+                .orderBy(desc(SessionMessageTable.seq))
+                .limit(input.recent ?? 200)
+                .all()
+                .pipe(Effect.orDie)
+              const sequence = yield* db
+                .select({ seq: EventSequenceTable.seq })
+                .from(EventSequenceTable)
+                .where(eq(EventSequenceTable.aggregate_id, input.sessionID))
+                .get()
+                .pipe(Effect.orDie)
+              if (!sequence) return yield* Effect.die(new Error(`Session ${input.sessionID} has no event sequence`))
+              return {
+                session: fromRow(row),
+                children: children.map(fromRow),
+                inbox,
+                messages: yield* Effect.forEach(messages.toReversed(), decode),
+                seq: Event.Seq.make(sequence.seq),
+              }
+            }),
+          )
+          .pipe(Effect.catchTag("SqlError", Effect.die))
       }),
       cancelInbox: Effect.fn("Session.cancelInbox")((input) => mutatePending(input, SessionInbox.cancel)),
       steerInbox: Effect.fn("Session.steerInbox")((input) => mutatePending(input, SessionInbox.steer, true)),
