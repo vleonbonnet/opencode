@@ -25,7 +25,6 @@ export type SessionStreamItem = DurableSessionEvent | EphemeralSessionEvent | Ev
 
 export type Intent = {
   readonly id: string
-  readonly sessionID: string
   readonly item: Extract<SessionInboxItem, { readonly type: "user" | "synthetic" }>
   readonly created: number
 }
@@ -90,15 +89,10 @@ export type SessionEngineOptions = {
 type Overlay = ReadonlyMap<string, OverlayEntry>
 
 type OverlayEntry =
-  | { readonly type: "text"; readonly messageID: string; readonly ordinal: number; readonly value: string }
-  | { readonly type: "reasoning"; readonly messageID: string; readonly ordinal: number; readonly value: string }
-  | { readonly type: "tool-input"; readonly messageID: string; readonly toolID: string; readonly value: string }
-  | {
-      readonly type: "tool-progress"
-      readonly messageID: string
-      readonly toolID: string
-      readonly metadata: SessionToolProgress["data"]["metadata"]
-    }
+  | { readonly type: "text"; readonly value: string }
+  | { readonly type: "reasoning"; readonly value: string }
+  | { readonly type: "tool-input"; readonly value: string }
+  | { readonly type: "tool-progress"; readonly metadata: SessionToolProgress["data"]["metadata"] }
   | { readonly type: "compaction"; readonly value: string }
   | { readonly type: "usage"; readonly value: SessionUsageUpdated["data"] }
 
@@ -127,7 +121,7 @@ export async function createSessionEngine(
   const listeners = new Set<(view: SessionView) => void>()
   const failureListeners = new Set<(failure: IntentFailure) => void>()
   const settled = new Set<() => void>()
-  const sent = new Set<string>()
+  let sent: string | undefined
   let stopped = false
   let sending = false
 
@@ -155,7 +149,7 @@ export async function createSessionEngine(
   }
 
   const applyDurable = (event: DurableSessionEvent) => {
-    if (event.type === "session.inbox.enqueued") sent.delete(event.data.inboxID)
+    if (event.type === "session.inbox.enqueued" && sent === event.data.inboxID) sent = undefined
     publish({
       folded: SessionFold.apply(state.folded, event),
       outbox:
@@ -176,15 +170,15 @@ export async function createSessionEngine(
   const send = () => {
     if (!state.synced || sending || stopped) return
     const intent = state.outbox[0]
-    if (!intent || sent.has(intent.id)) return
+    if (!intent || sent === intent.id) return
     sending = true
-    sent.add(intent.id)
+    sent = intent.id
     void (async () => {
       try {
         await transport.submit({ id: intent.id, sessionID, item: intent.item })
       } catch (error) {
         if (!(error instanceof SubmitRejected)) return
-        sent.delete(intent.id)
+        sent = undefined
         reject(intent, error.reason)
       }
     })().finally(() => {
@@ -199,7 +193,7 @@ export async function createSessionEngine(
         for await (const item of transport.stream(sessionID, state.folded.seq)) {
           if (stopped) return
           if (item.type === "log.synced") {
-            sent.clear()
+            sent = undefined
             publish({ ...state, synced: true })
             send()
             continue
@@ -234,7 +228,6 @@ export async function createSessionEngine(
     submit(input) {
       const intent: Intent = {
         id: input.id ?? makeID(),
-        sessionID,
         created: now(),
         item: {
           type: "user",
@@ -272,12 +265,13 @@ export async function createSessionEngine(
 }
 
 export function render(state: Pick<EngineState, "folded" | "outbox" | "overlay">): SessionView {
+  const messageIDs = new Set(state.folded.messages.map((message) => message.id))
   const pending = [
     ...state.folded.inbox,
     ...state.outbox.map(
       (intent): SessionInboxInfo => ({
         id: intent.id,
-        sessionID: intent.sessionID,
+        sessionID: state.folded.session.id,
         timeCreated: intent.created,
         ...intent.item,
       }),
@@ -287,12 +281,9 @@ export function render(state: Pick<EngineState, "folded" | "outbox" | "overlay">
     [
       ...state.folded.messages,
       ...pending.flatMap((item): ReadonlyArray<SessionMessageInfo> => {
-        if (state.folded.messages.some((message) => message.id === item.id)) return []
-        if (item.type === "user")
-          return [{ id: item.id, type: "user", ...item.payload, time: { created: item.timeCreated } }]
-        if (item.type === "synthetic")
-          return [{ id: item.id, type: "synthetic", ...item.payload, time: { created: item.timeCreated } }]
-        return []
+        if (messageIDs.has(item.id)) return []
+        const message = SessionFold.messageFromInbox(item)
+        return message ? [message] : []
       }),
     ],
     state.overlay,
@@ -317,8 +308,6 @@ function applyOverlay(overlay: Overlay, event: EphemeralSessionEvent): Overlay {
       const current = next.get(key)
       next.set(key, {
         type: "text",
-        messageID: event.data.assistantMessageID,
-        ordinal: event.data.ordinal,
         value: (current?.type === "text" ? current.value : "") + event.data.delta,
       })
       return next
@@ -328,8 +317,6 @@ function applyOverlay(overlay: Overlay, event: EphemeralSessionEvent): Overlay {
       const current = next.get(key)
       next.set(key, {
         type: "reasoning",
-        messageID: event.data.assistantMessageID,
-        ordinal: event.data.ordinal,
         value: (current?.type === "reasoning" ? current.value : "") + event.data.delta,
       })
       return next
@@ -339,8 +326,6 @@ function applyOverlay(overlay: Overlay, event: EphemeralSessionEvent): Overlay {
       const current = next.get(key)
       next.set(key, {
         type: "tool-input",
-        messageID: event.data.assistantMessageID,
-        toolID: event.data.id,
         value: (current?.type === "tool-input" ? current.value : "") + event.data.delta,
       })
       return next
@@ -348,8 +333,6 @@ function applyOverlay(overlay: Overlay, event: EphemeralSessionEvent): Overlay {
     case "session.tool.progress":
       next.set(toolKey("tool-progress", event.data.assistantMessageID, event.data.id), {
         type: "tool-progress",
-        messageID: event.data.assistantMessageID,
-        toolID: event.data.id,
         metadata: event.data.metadata,
       })
       return next
@@ -368,34 +351,34 @@ function applyOverlay(overlay: Overlay, event: EphemeralSessionEvent): Overlay {
 }
 
 function clearOverlay(overlay: Overlay, event: DurableSessionEvent): Overlay {
-  const next = new Map(overlay)
   switch (event.type) {
     case "session.text.ended":
-      next.delete(partKey("text", event.data.assistantMessageID, event.data.ordinal))
-      return next
+      return removeOverlay(overlay, partKey("text", event.data.assistantMessageID, event.data.ordinal))
     case "session.reasoning.ended":
-      next.delete(partKey("reasoning", event.data.assistantMessageID, event.data.ordinal))
-      return next
+      return removeOverlay(overlay, partKey("reasoning", event.data.assistantMessageID, event.data.ordinal))
     case "session.tool.input.ended":
     case "session.tool.called":
-      next.delete(toolKey("tool-input", event.data.assistantMessageID, event.data.id))
-      return next
+      return removeOverlay(overlay, toolKey("tool-input", event.data.assistantMessageID, event.data.id))
     case "session.tool.success":
     case "session.tool.failed":
-      next.delete(toolKey("tool-progress", event.data.assistantMessageID, event.data.id))
-      return next
+      return removeOverlay(overlay, toolKey("tool-progress", event.data.assistantMessageID, event.data.id))
     case "session.compaction.ended":
     case "session.compaction.failed":
-      next.delete("compaction")
-      return next
+      return removeOverlay(overlay, "compaction")
     case "session.step.ended":
     case "session.step.failed":
     case "session.usage.recorded":
-      next.delete("usage")
-      return next
+      return removeOverlay(overlay, "usage")
     default:
-      return next
+      return overlay
   }
+}
+
+function removeOverlay(overlay: Overlay, key: string): Overlay {
+  if (!overlay.has(key)) return overlay
+  const next = new Map(overlay)
+  next.delete(key)
+  return next
 }
 
 function applyOverlayToMessages(messages: ReadonlyArray<SessionMessageInfo>, overlay: Overlay) {
@@ -405,13 +388,14 @@ function applyOverlayToMessages(messages: ReadonlyArray<SessionMessageInfo>, ove
       return entry?.type === "compaction" ? { ...message, summary: message.summary + entry.value } : message
     }
     if (message.type !== "assistant") return message
-    const content = message.content.map((part, ordinal) => {
+    const ordinals = { text: 0, reasoning: 0 }
+    const content = message.content.map((part) => {
       if (part.type === "text") {
-        const entry = overlay.get(partKey("text", message.id, ordinal))
+        const entry = overlay.get(partKey("text", message.id, ordinals.text++))
         return entry?.type === "text" ? { ...part, text: part.text + entry.value } : part
       }
       if (part.type === "reasoning") {
-        const entry = overlay.get(partKey("reasoning", message.id, ordinal))
+        const entry = overlay.get(partKey("reasoning", message.id, ordinals.reasoning++))
         return entry?.type === "reasoning" ? { ...part, text: part.text + entry.value } : part
       }
       const input = overlay.get(toolKey("tool-input", message.id, part.id))

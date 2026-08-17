@@ -1,7 +1,6 @@
 import { describe, expect, test } from "bun:test"
 import { Engine } from "../src/solid/engine/engine"
-import type { SessionMessageInfo } from "../src/promise"
-import { FakeSessionServer, until } from "./fixture/sync-engine"
+import { FakeSessionServer, until, userMessages } from "./fixture/sync-engine"
 
 type Client = {
   readonly name: string
@@ -72,7 +71,7 @@ describe("session sync engine simulation", () => {
 
 async function makeClient(name: string, server: FakeSessionServer): Promise<Client> {
   let counter = 0
-  const engine = await Engine.createSessionEngine(server.sessionID, server.transport, {
+  const engine = await Engine.createSessionEngine(server.sessionID, server, {
     makeID: () => `msg_${name}${String(++counter).padStart(4, "0")}`,
     now: () => server.time,
     reconnect: async () => {},
@@ -85,19 +84,13 @@ async function makeClient(name: string, server: FakeSessionServer): Promise<Clie
 
 function assertNoFlicker(views: ReadonlyArray<Engine.SessionView>, admitted: ReadonlyArray<string>, label: string) {
   for (const id of admitted) {
-    const first = views.findIndex((view) => userRows(view.messages).some((message) => message.id === id))
+    const first = views.findIndex((view) => userMessages(view.messages).some((message) => message.id === id))
     expect(first, `${label}: ${id} never rendered`).toBeGreaterThanOrEqual(0)
     for (const view of views.slice(first)) {
-      const rows = userRows(view.messages).filter((message) => message.id === id)
+      const rows = userMessages(view.messages).filter((message) => message.id === id)
       expect(rows, `${label}: ${id} disappeared or duplicated`).toHaveLength(1)
     }
   }
-}
-
-function userRows(messages: ReadonlyArray<SessionMessageInfo>) {
-  return messages.filter(
-    (message): message is Extract<SessionMessageInfo, { readonly type: "user" }> => message.type === "user",
-  )
 }
 
 async function advance(steps: number) {

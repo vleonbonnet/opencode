@@ -1,4 +1,4 @@
-import type { SessionEventDurable, SessionInfo } from "../../src/promise"
+import type { SessionInfo, SessionMessageInfo } from "../../src/promise"
 import { Engine } from "../../src/solid/engine/engine"
 import type { DurableSessionEvent, SessionFoldState, SessionSnapshot } from "../../src/solid/engine/fold"
 import { SessionFold } from "../../src/solid/engine/fold"
@@ -22,12 +22,6 @@ export class FakeSessionServer implements Engine.SessionTransport {
     readonly time = 1_717_171_717_000,
   ) {
     this.folded = SessionFold.fromSnapshot(emptySnapshot(sessionID))
-  }
-
-  readonly transport: Engine.SessionTransport = {
-    snapshot: (sessionID) => this.snapshot(sessionID),
-    stream: (sessionID, after) => this.stream(sessionID, after),
-    submit: (input) => this.submit(input),
   }
 
   async snapshot(sessionID: string) {
@@ -122,8 +116,10 @@ export async function until(check: () => boolean, message = "condition did not b
   throw new Error(message)
 }
 
-export function userMessages(messages: ReadonlyArray<{ readonly id: string; readonly type: string }>) {
-  return messages.filter((message) => message.type === "user")
+export function userMessages(messages: ReadonlyArray<SessionMessageInfo>) {
+  return messages.filter(
+    (message): message is Extract<SessionMessageInfo, { readonly type: "user" }> => message.type === "user",
+  )
 }
 
 function emptySnapshot(sessionID: string): SessionSnapshot {
@@ -166,8 +162,4 @@ class AsyncQueue<Value> {
     if (this.error) return Promise.reject(this.error)
     return new Promise<Value>((resolve, reject) => this.waiting.push({ resolve, reject }))
   }
-}
-
-export function durableEvents(events: ReadonlyArray<SessionEventDurable>) {
-  return events.filter((event): event is DurableSessionEvent => event.type !== "session.forked")
 }

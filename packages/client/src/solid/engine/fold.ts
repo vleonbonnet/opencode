@@ -3,8 +3,6 @@ import type {
   SessionInboxInfo,
   SessionInfo,
   SessionMessageAssistant,
-  SessionMessageAssistantReasoning,
-  SessionMessageAssistantText,
   SessionMessageAssistantTool,
   SessionMessageInfo,
   TokenUsageInfo,
@@ -42,7 +40,14 @@ export function apply(state: SessionFoldState, event: DurableSessionEvent): Sess
       return { ...current, session: addUsage(state.session, event.data.cost, event.data.tokens, event.created) }
     case "session.agent.selected":
       return append(
-        current,
+        {
+          ...current,
+          session: {
+            ...state.session,
+            agent: event.data.agent,
+            time: { ...state.session.time, updated: event.created },
+          },
+        },
         {
           id: messageID(event.id),
           type: "agent-switched",
@@ -51,11 +56,17 @@ export function apply(state: SessionFoldState, event: DurableSessionEvent): Sess
           metadata: event.metadata,
           time: { created: event.created },
         },
-        { ...state.session, agent: event.data.agent, time: { ...state.session.time, updated: event.created } },
       )
     case "session.model.selected":
       return append(
-        current,
+        {
+          ...current,
+          session: {
+            ...state.session,
+            model: event.data.model,
+            time: { ...state.session.time, updated: event.created },
+          },
+        },
         {
           id: messageID(event.id),
           type: "model-switched",
@@ -64,11 +75,19 @@ export function apply(state: SessionFoldState, event: DurableSessionEvent): Sess
           metadata: event.metadata,
           time: { created: event.created },
         },
-        { ...state.session, model: event.data.model, time: { ...state.session.time, updated: event.created } },
       )
     case "session.moved":
       return append(
-        current,
+        {
+          ...current,
+          session: {
+            ...state.session,
+            location: event.data.location,
+            projectID: event.data.projectID,
+            subpath: event.data.subpath,
+            time: { ...state.session.time, updated: event.created },
+          },
+        },
         {
           id: messageID(event.id),
           type: "location-switched",
@@ -82,13 +101,6 @@ export function apply(state: SessionFoldState, event: DurableSessionEvent): Sess
           },
           metadata: event.metadata,
           time: { created: event.created },
-        },
-        {
-          ...state.session,
-          location: event.data.location,
-          projectID: event.data.projectID,
-          subpath: event.data.subpath,
-          time: { ...state.session.time, updated: event.created },
         },
       )
     case "session.renamed":
@@ -114,14 +126,10 @@ export function apply(state: SessionFoldState, event: DurableSessionEvent): Sess
       }
     case "session.inbox.delivered": {
       const item = state.inbox.find((item) => item.id === event.data.inboxID)
-      if (!item || item.type === "compaction" || item.type === "move")
-        return { ...current, inbox: state.inbox.filter((item) => item.id !== event.data.inboxID) }
-      return append(
-        { ...current, inbox: state.inbox.filter((item) => item.id !== event.data.inboxID) },
-        item.type === "user"
-          ? { id: item.id, type: "user", ...item.payload, time: { created: event.created } }
-          : { id: item.id, type: "synthetic", ...item.payload, time: { created: event.created } },
-      )
+      const next = { ...current, inbox: state.inbox.filter((item) => item.id !== event.data.inboxID) }
+      if (!item) return next
+      const delivered = messageFromInbox(item, event.created)
+      return delivered ? append(next, delivered) : next
     }
     case "session.inbox.cancelled":
       return { ...current, inbox: state.inbox.filter((item) => item.id !== event.data.inboxID) }
@@ -261,10 +269,10 @@ export function apply(state: SessionFoldState, event: DurableSessionEvent): Sess
     case "session.text.started":
       return updateAssistant(current, event.data.assistantMessageID, (message) => ({
         ...message,
-        content: [...message.content, { type: "text", text: "" }],
+        content: insertOrdinal(message.content, "text", event.data.ordinal, { type: "text", text: "" }),
       }))
     case "session.text.ended":
-      return updateAssistantContent(current, event.data.assistantMessageID, "text", (part) => ({
+      return updateContent(current, event.data.assistantMessageID, "text", event.data.ordinal, (part) => ({
         ...part,
         text: event.data.text,
         state: event.data.state,
@@ -272,13 +280,15 @@ export function apply(state: SessionFoldState, event: DurableSessionEvent): Sess
     case "session.reasoning.started":
       return updateAssistant(current, event.data.assistantMessageID, (message) => ({
         ...message,
-        content: [
-          ...message.content,
-          { type: "reasoning", text: "", state: event.data.state, time: { created: event.created } },
-        ],
+        content: insertOrdinal(message.content, "reasoning", event.data.ordinal, {
+          type: "reasoning",
+          text: "",
+          state: event.data.state,
+          time: { created: event.created },
+        }),
       }))
     case "session.reasoning.ended":
-      return updateAssistantContent(current, event.data.assistantMessageID, "reasoning", (part) => ({
+      return updateContent(current, event.data.assistantMessageID, "reasoning", event.data.ordinal, (part) => ({
         ...part,
         text: event.data.text,
         state: event.data.state ?? part.state,
@@ -442,17 +452,18 @@ export function apply(state: SessionFoldState, event: DurableSessionEvent): Sess
   }
 }
 
-export function applyAll(state: SessionFoldState, events: Iterable<DurableSessionEvent>) {
-  return Array.from(events).reduce(apply, state)
-}
-
 function messageID(eventID: string) {
   return eventID.replace(/^evt_/, "msg_")
 }
 
-function append(state: SessionFoldState, item: SessionMessageInfo, session = state.session) {
-  if (state.messages.some((message) => message.id === item.id)) return { ...state, session }
-  return { ...state, session, messages: [...state.messages, item] }
+export function messageFromInbox(item: SessionInboxInfo, created = item.timeCreated): SessionMessageInfo | undefined {
+  if (item.type === "user") return { id: item.id, type: "user", ...item.payload, time: { created } }
+  if (item.type === "synthetic") return { id: item.id, type: "synthetic", ...item.payload, time: { created } }
+}
+
+function append(state: SessionFoldState, item: SessionMessageInfo) {
+  if (state.messages.some((message) => message.id === item.id)) return state
+  return { ...state, messages: [...state.messages, item] }
 }
 
 function updateMessage(
@@ -493,23 +504,26 @@ function updateActiveAssistant(
   )
 }
 
-function updateAssistantContent<Type extends "text" | "reasoning">(
+function updateContent<Type extends "text" | "reasoning">(
   state: SessionFoldState,
   messageID: string,
   type: Type,
+  ordinal: number,
   update: (
-    part: Type extends "text" ? SessionMessageAssistantText : SessionMessageAssistantReasoning,
-  ) => SessionMessageAssistantText | SessionMessageAssistantReasoning,
+    part: Extract<SessionMessageAssistant["content"][number], { readonly type: Type }>,
+  ) => Extract<SessionMessageAssistant["content"][number], { readonly type: Type }>,
 ) {
   return updateAssistant(state, messageID, (message) => {
-    const index = message.content.findLastIndex(
-      (part) =>
-        part.type === type && (type !== "reasoning" || part.type !== "reasoning" || part.time?.completed === undefined),
-    )
-    if (index < 0) return message
+    const position = message.content.flatMap((part, index) => (part.type === type ? [index] : []))[ordinal]
+    const part = position === undefined ? undefined : message.content[position]
+    if (!part || part.type !== type) return message
     return {
       ...message,
-      content: message.content.map((part, position) => (position === index ? update(part as never) : part)),
+      content: message.content.map((item, index) =>
+        index === position
+          ? update(part as Extract<SessionMessageAssistant["content"][number], { readonly type: Type }>)
+          : item,
+      ),
     }
   })
 }
@@ -530,6 +544,16 @@ function updateTool(
       ),
     }
   })
+}
+
+function insertOrdinal<Type extends SessionMessageAssistant["content"][number]["type"]>(
+  content: SessionMessageAssistant["content"],
+  type: Type,
+  ordinal: number,
+  part: Extract<SessionMessageAssistant["content"][number], { readonly type: Type }>,
+) {
+  if (content.filter((item) => item.type === type)[ordinal]) return content
+  return [...content, part]
 }
 
 function addUsage(session: SessionInfo, cost: number, tokens: TokenUsageInfo, updated: number): SessionInfo {

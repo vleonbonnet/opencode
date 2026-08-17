@@ -7,7 +7,7 @@ describe("session sync engine laws", () => {
   test("1. idempotency: lost responses converge to one admitted message", async () => {
     const server = new FakeSessionServer("session-idempotency")
     server.faults.loseResponses = 1
-    const engine = await Engine.createSessionEngine(server.sessionID, server.transport, {
+    const engine = await Engine.createSessionEngine(server.sessionID, server, {
       now: () => server.time,
       reconnect: async () => {},
     })
@@ -24,7 +24,7 @@ describe("session sync engine laws", () => {
 
   test("2. echo determinism: folding the echo does not change rendered messages", async () => {
     const server = new FakeSessionServer("session-echo")
-    const engine = await Engine.createSessionEngine(server.sessionID, server.transport, { now: () => server.time })
+    const engine = await Engine.createSessionEngine(server.sessionID, server, { now: () => server.time })
     await until(() => server.admitted.length === 0 && engine.view().seq === 0)
 
     engine.submit({ id: "msg_1", text: "instant" })
@@ -49,7 +49,7 @@ describe("session sync engine laws", () => {
 
   test("4. ordering: a burst admits in submission order", async () => {
     const server = new FakeSessionServer("session-ordering")
-    const engine = await Engine.createSessionEngine(server.sessionID, server.transport)
+    const engine = await Engine.createSessionEngine(server.sessionID, server)
 
     for (const value of [1, 2, 3, 4, 5]) engine.submit({ id: `msg_${value}`, text: `m${value}` })
     await engine.settled()
@@ -60,8 +60,8 @@ describe("session sync engine laws", () => {
 
   test("5. convergence: drained clients equal the server fold", async () => {
     const server = new FakeSessionServer("session-convergence")
-    const a = await Engine.createSessionEngine(server.sessionID, server.transport, { makeID: () => "msg_a" })
-    const b = await Engine.createSessionEngine(server.sessionID, server.transport, { makeID: () => "msg_b" })
+    const a = await Engine.createSessionEngine(server.sessionID, server, { makeID: () => "msg_a" })
+    const b = await Engine.createSessionEngine(server.sessionID, server, { makeID: () => "msg_b" })
 
     a.submit({ text: "from a" })
     b.submit({ text: "from b" })
@@ -77,7 +77,7 @@ describe("session sync engine laws", () => {
   test("6. failure atomicity: typed rejection removes and surfaces the intent", async () => {
     const server = new FakeSessionServer("session-failure")
     server.faults.reject = 1
-    const engine = await Engine.createSessionEngine(server.sessionID, server.transport)
+    const engine = await Engine.createSessionEngine(server.sessionID, server)
     const failures: Array<Engine.IntentFailure> = []
     engine.subscribeFailures((failure) => failures.push(failure))
     const before = engine.view()
