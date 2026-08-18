@@ -387,10 +387,19 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
 
   if (flags.experimentalCodeMode) return tools
 
-  for (const [key, entry] of Object.entries(yield* mcp.tools())) {
+  const mcpTools = Permission.visibleTools(
+    yield* mcp.tools(),
+    Permission.merge(input.agent.permission, input.session.permission ?? []),
+  )
+  for (const [key, entry] of Object.entries(mcpTools)) {
     const item = McpCatalog.convertTool(entry.def, entry.client, entry.timeout)
     const execute = item.execute
     if (!execute) continue
+
+    const definition = { description: item.description, parameters: item.inputSchema }
+    yield* plugin.trigger("tool.definition", { toolID: key }, definition)
+    item.description = definition.description
+    item.inputSchema = definition.parameters
 
     const schema = yield* Effect.promise(() => Promise.resolve(asSchema(item.inputSchema).jsonSchema))
     const transformed = ProviderTransform.schema(input.model, { ...schema, properties: schema.properties ?? {} })
