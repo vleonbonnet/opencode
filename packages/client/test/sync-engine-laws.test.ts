@@ -91,6 +91,58 @@ describe("session sync engine laws", () => {
     engine.stop()
   })
 
+  test("7. lossy history: reconnect without retained events recovers via snapshot", async () => {
+    const server = new FakeSessionServer("session-lossy")
+    let release: (() => void) | undefined
+    const engine = await Engine.createSessionEngine(server.sessionID, server, {
+      now: () => server.time,
+      reconnect: () => new Promise<void>((resolve) => (release = resolve)),
+    })
+    engine.submit({ id: "msg_1", text: "first" })
+    await engine.settled()
+
+    server.cutConnections()
+    await until(() => release !== undefined)
+    // While disconnected the session advances, then history is dropped: the
+    // reconnect cursor cannot be replayed and must recover via snapshot.
+    await server.submit({ id: "msg_2", sessionID: server.sessionID, request: { text: "second" } })
+    server.prune()
+    release!()
+
+    await until(() => engine.view().seq === 2)
+    expect(engine.view()).toEqual(server.truth())
+    engine.stop()
+  })
+
+  test("8. attach gaps: a synced marker past the fold forces snapshot recovery", async () => {
+    const server = new FakeSessionServer("session-marker-gap")
+    await server.submit({ id: "msg_1", sessionID: server.sessionID, request: { text: "hello" } })
+    const stale = { ...server.snapshotValue(), messages: [], inbox: [], seq: 0 }
+    let attempts = 0
+    const engine = await Engine.createSessionEngine(
+      server.sessionID,
+      {
+        snapshot: (sessionID) => (attempts === 0 ? Promise.resolve(stale) : server.snapshot(sessionID)),
+        async *stream(sessionID, after, signal) {
+          attempts++
+          if (attempts === 1) {
+            // Dishonest attach: the marker admits the cursor but skips the replay range.
+            yield { type: "log.synced" as const, aggregateID: sessionID, seq: server.snapshotValue().seq }
+            return
+          }
+          yield* server.stream(sessionID, after, signal)
+        },
+        submit: (input) => server.submit(input),
+      },
+      { reconnect: async () => {} },
+    )
+    await engine.ready()
+
+    expect(attempts).toBe(2)
+    expect(engine.view()).toEqual(server.truth())
+    engine.stop()
+  })
+
   test("snapshot refresh cannot move the fold behind the live log", async () => {
     const server = new FakeSessionServer("session-refresh-race")
     const stale = server.snapshotValue()

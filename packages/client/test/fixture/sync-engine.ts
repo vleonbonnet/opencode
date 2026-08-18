@@ -34,10 +34,13 @@ export class FakeSessionServer implements Engine.SessionTransport {
     await this.pause()
     this.assertSession(sessionID)
     if (after > this.folded.seq) throw new Engine.SeqUnavailable()
+    const replay = this.events.filter((event) => event.durable.seq > after)
+    // Honest replay contract: a cursor is only admitted when retained events fully cover (after, seq].
+    if (replay.length < this.folded.seq - after) throw new Engine.SeqUnavailable()
     const queue = new AsyncQueue<Engine.SessionStreamItem>()
     this.tails.add(queue)
     try {
-      for (const event of this.events.filter((event) => event.durable.seq > after)) yield event
+      for (const event of replay) yield event
       yield { type: "log.synced", aggregateID: sessionID, seq: this.folded.seq }
       while (true) yield await queue.take()
     } finally {
@@ -88,6 +91,11 @@ export class FakeSessionServer implements Engine.SessionTransport {
 
   cutConnections() {
     this.tails.forEach((tail) => tail.fail(new Error("connection cut")))
+  }
+
+  /** Drop retained event history, simulating `events.persist` off or pruned retention. */
+  prune() {
+    this.events.length = 0
   }
 
   truth() {

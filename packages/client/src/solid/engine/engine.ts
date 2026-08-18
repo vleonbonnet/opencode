@@ -192,6 +192,9 @@ export async function createSessionEngine(
         for await (const item of transport.stream(sessionID, state.folded.seq, abort.signal)) {
           if (stopped) return
           if (item.type === "log.synced") {
+            // A marker past the fold means the server skipped events it could not
+            // replay for this cursor; recover through a fresh snapshot.
+            if (item.seq !== undefined && item.seq > state.folded.seq) throw new SeqUnavailable()
             sent = undefined
             publish({ ...state, synced: true })
             ready.resolve()
