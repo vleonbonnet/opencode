@@ -207,6 +207,21 @@ GET /session/:id/log?after=seq&follow=true one ordered stream:
       is not servable → client full-rehydrates. Never silently clamp to the
       oldest retained event (Discord op 9 / Telegram `differenceTooLong` /
       Postgres explicitly warns against clamping).
+    - **Cursor honesty (S1 follow-up, landed):** `events.persist` defaults to
+      off (only workerd enables it), so `event` payload rows usually don't
+      exist even though `event_sequence` always advances. Old behavior:
+      `after < head` "replayed" nothing from the empty table and marked
+      synced — silent desync. Now `openLog` proves retained rows cover
+      `(after, head]` (`Bus.retainedCount`) and returns seq-unavailable
+      otherwise; the engine re-snapshots. A cursor is a resumption claim and
+      gets the strict check; a cursorless read remains "what's retained".
+      Client side, the engine also treats a `log.synced` marker past its
+      folded seq as a gap → snapshot recovery, closing the residual
+      in-process race between the head check and the live subscription.
+      Persistence therefore stays optional: snapshot + live tail + honest
+      refusal is a complete contract. A short retention window (persist on +
+      pruning sweep) can drop in later behind the same check to make busy
+      reconnects replay instead of refetch.
     - Resume-first discipline: reconnect tries the tail from the last seq
       before re-snapshotting (Discord meters full rehydrates, not resumes).
     - Keep the existing `log.synced` caught-up marker as a first-class engine
