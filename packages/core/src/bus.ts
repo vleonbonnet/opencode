@@ -44,6 +44,21 @@ export const reserveSequence = Effect.fn("Bus.reserveSequence")(function* (
     .pipe(Effect.orDie)
 })
 
+export const retainedCount = Effect.fn("Bus.retainedCount")(function* (
+  db: Database.Interface["db"],
+  aggregateID: string,
+  after: number,
+  through: number,
+) {
+  const row = yield* db
+    .select({ count: sql<number>`count(*)` })
+    .from(EventTable)
+    .where(and(eq(EventTable.aggregate_id, aggregateID), gt(EventTable.seq, after), lte(EventTable.seq, through)))
+    .get()
+    .pipe(Effect.orDie)
+  return row?.count ?? 0
+})
+
 export type SerializedEvent = {
   readonly id: Event.ID
   readonly type: string

@@ -759,7 +759,7 @@ export const SessionHandler = HttpApiBuilder.group(Api, "server.session", (handl
                       sessionID: error.sessionID,
                       after: error.after,
                       head: error.head,
-                      message: `Session sequence ${error.after} is beyond the current head`,
+                      message: `Session log is unavailable after sequence ${error.after}`,
                     }),
               ),
             )

@@ -624,6 +624,19 @@ const layer = Layer.effect(
               after: Event.Seq.make(input.after),
               head: head >= 0 ? Event.Seq.make(head) : undefined,
             })
+          // A cursor claims the caller already holds everything through `after`, so
+          // replay of (after, head] must be provably complete. Without retained rows
+          // covering the range (events.persist off, or pruned history) replaying
+          // nothing would silently desync the caller; fail so it re-snapshots instead.
+          if (input.after < head) {
+            const retained = yield* Bus.retainedCount(db, input.sessionID, input.after, head)
+            if (retained < head - input.after)
+              return yield* new SeqUnavailableError({
+                sessionID: input.sessionID,
+                after: Event.Seq.make(input.after),
+                head: Event.Seq.make(head),
+              })
+          }
         }
         return bus
           .log({

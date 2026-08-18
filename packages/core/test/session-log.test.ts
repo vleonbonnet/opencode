@@ -4,8 +4,10 @@ import { Database } from "@opencode-ai/core/database/database"
 import { Agent } from "@opencode-ai/core/agent"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { LayerNode } from "@opencode-ai/util/effect/layer-node"
+import { and, eq } from "drizzle-orm"
 import { Bus } from "@opencode-ai/core/bus"
 import { Event } from "@opencode-ai/schema/event"
+import { EventTable } from "@opencode-ai/core/event/sql"
 import { Location } from "@opencode-ai/core/location"
 import { Project } from "@opencode-ai/core/project"
 import { ProjectTable } from "@opencode-ai/core/project/sql"
@@ -25,6 +27,16 @@ const it = testEffect(
     LayerNode.group([Database.node, Bus.node, SessionProjector.node, SessionStore.node, Session.node]),
     [
       [Bus.node, Bus.configured({ persist: true })],
+      [Project.node, globalProjectLayer],
+      [SessionExecution.node, SessionExecution.noopLayer],
+    ],
+  ),
+)
+// Default bus: durable payloads are not retained (`events.persist` off).
+const itVolatile = testEffect(
+  AppNodeBuilder.build(
+    LayerNode.group([Database.node, Bus.node, SessionProjector.node, SessionStore.node, Session.node]),
+    [
       [Project.node, globalProjectLayer],
       [SessionExecution.node, SessionExecution.noopLayer],
     ],
@@ -237,6 +249,25 @@ describe("Session.log", () => {
     }),
   )
 
+  it.effect("fails with SeqUnavailable when the replay range is only partially retained", () =>
+    Effect.gen(function* () {
+      const db = (yield* Database.Service).db
+      const session = yield* Session.Service
+      const created = yield* session.create({ location })
+      yield* session.rename({ sessionID: created.id, title: "pruned" })
+      yield* db
+        .delete(EventTable)
+        .where(and(eq(EventTable.aggregate_id, created.id), eq(EventTable.seq, 1)))
+        .run()
+
+      const error = yield* Effect.flip(
+        Stream.runCollect(session.log({ sessionID: created.id, after: Event.Seq.make(0) })),
+      )
+
+      expect(error._tag).toBe("Session.SeqUnavailableError")
+    }),
+  )
+
   it.effect("completes with a bare synced marker for a migrated Session with no event sequence", () =>
     Effect.gen(function* () {
       const db = (yield* Database.Service).db
@@ -262,6 +293,49 @@ describe("Session.log", () => {
       const items = Array.from(yield* Stream.runCollect(session.log({ sessionID })))
 
       expect(items).toEqual([{ type: "log.synced", aggregateID: sessionID }])
+    }),
+  )
+})
+
+describe("Session.log without retained events", () => {
+  itVolatile.effect("accepts a cursor exactly at the head", () =>
+    Effect.gen(function* () {
+      const session = yield* Session.Service
+      const created = yield* session.create({ location })
+      yield* session.rename({ sessionID: created.id, title: "at head" })
+
+      const items = Array.from(
+        yield* Stream.runCollect(session.log({ sessionID: created.id, after: Event.Seq.make(1) })),
+      )
+
+      expect(items).toEqual([{ type: "log.synced", aggregateID: created.id, seq: Event.Seq.make(1) }])
+    }),
+  )
+
+  itVolatile.effect("fails with SeqUnavailable for a cursor behind the head", () =>
+    Effect.gen(function* () {
+      const session = yield* Session.Service
+      const created = yield* session.create({ location })
+      yield* session.rename({ sessionID: created.id, title: "behind head" })
+
+      const error = yield* Effect.flip(
+        Stream.runCollect(session.log({ sessionID: created.id, after: Event.Seq.make(0) })),
+      )
+
+      expect(error._tag).toBe("Session.SeqUnavailableError")
+      expect(error._tag === "Session.SeqUnavailableError" ? error.head : undefined).toEqual(Event.Seq.make(1))
+    }),
+  )
+
+  itVolatile.effect("replays nothing but stays live for a cursorless read", () =>
+    Effect.gen(function* () {
+      const session = yield* Session.Service
+      const created = yield* session.create({ location })
+      yield* session.rename({ sessionID: created.id, title: "cursorless" })
+
+      const items = Array.from(yield* Stream.runCollect(session.log({ sessionID: created.id })))
+
+      expect(items).toEqual([{ type: "log.synced", aggregateID: created.id, seq: Event.Seq.make(1) }])
     }),
   )
 })
