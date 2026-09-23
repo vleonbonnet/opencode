@@ -138,6 +138,7 @@ export const TaskTool = Tool.define(
         : undefined
       const childPermission = deriveSubagentSessionPermission({
         parentSessionPermission: parent.permission ?? [],
+        parentAgentPermission: ctx.agent === "plan" ? (yield* agent.get("plan"))?.permission : undefined,
         subagent: next,
       })
       const childToolDenies = [

@@ -158,3 +158,27 @@ it.effect("subagent inherits parent session deny rules as hard runtime ceilings"
     expect(Permission.evaluate("bash", "git status", effective).action).toBe("deny")
   }),
 )
+
+it.effect("plan-mode subagent inherits parent approval and protected-path rules", () =>
+  Effect.sync(() => {
+    const general = testAgent({ name: "general", mode: "subagent", permission: { edit: "allow", bash: "allow" } })
+    const parent = Permission.fromConfig({
+      edit: { "*": "ask", "*.pem": "deny" },
+      bash: { "*": "allow", "rm *": "deny" },
+    })
+    const effective = Permission.merge(
+      general.permission,
+      deriveSubagentSessionPermission({
+        parentSessionPermission: Permission.fromConfig({ edit: { "src/locked.ts": "deny" } }),
+        parentAgentPermission: parent,
+        subagent: general,
+      }),
+    )
+
+    expect(Permission.evaluate("edit", "src/app.ts", effective).action).toBe("ask")
+    expect(Permission.evaluate("edit", "src/locked.ts", effective).action).toBe("deny")
+    expect(Permission.evaluate("edit", "secret.pem", effective).action).toBe("deny")
+    expect(Permission.evaluate("bash", "rm -rf src", effective).action).toBe("deny")
+    expect(Permission.evaluate("bash", "git status", effective).action).toBe("allow")
+  }),
+)

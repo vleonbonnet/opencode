@@ -3146,6 +3146,21 @@ describe("ProviderTransform.message - cache control on gateway", () => {
     expect(result.every((message) => message.providerOptions === undefined)).toBe(true)
   })
 
+  test("uses one-hour cache breakpoints for Claude through Copilot", () => {
+    const model = createModel({
+      providerID: "github-copilot",
+      api: { id: "claude-opus-5.5", url: "https://api.githubcopilot.com/v1", npm: "@ai-sdk/anthropic" },
+    })
+    const msgs = [
+      { role: "system", content: "You are a helpful assistant" },
+      { role: "user", content: "Hello" },
+    ] as any[]
+
+    const result = ProviderTransform.message(msgs, model, {}) as any[]
+    expect(result[0].providerOptions.anthropic.cacheControl).toEqual({ type: "ephemeral", ttl: "1h" })
+    expect(result[1].providerOptions.anthropic.cacheControl).toEqual({ type: "ephemeral", ttl: "1h" })
+  })
+
   test("google-vertex-anthropic applies cache control", () => {
     const model = createModel({
       providerID: "google-vertex-anthropic",

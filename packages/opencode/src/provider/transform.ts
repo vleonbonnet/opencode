@@ -359,10 +359,11 @@ function normalizeMessages(
 function applyCaching(msgs: ModelMessage[], model: Provider.Model): ModelMessage[] {
   const system = msgs.filter((msg) => msg.role === "system").slice(0, 2)
   const final = msgs.filter((msg) => msg.role !== "system").slice(-2)
+  const copilotClaude = model.providerID === "github-copilot" && model.api.npm === "@ai-sdk/anthropic"
 
   const providerOptions = {
     anthropic: {
-      cacheControl: { type: "ephemeral" },
+      cacheControl: copilotClaude ? { type: "ephemeral", ttl: "1h" } : { type: "ephemeral" },
     },
     openrouter: {
       cacheControl: { type: "ephemeral" },
