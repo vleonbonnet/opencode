@@ -17,6 +17,7 @@ import { SessionProcessor } from "../../src/session/processor"
 import { MessageID, PartID, SessionID } from "../../src/session/schema"
 import { SessionStatus } from "../../src/session/status"
 import { SessionSummary } from "../../src/session/summary"
+import { Truncate } from "../../src/tool/truncate"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { provideTmpdirInstance, provideTmpdirServer } from "../fixture/fixture"
 import { testEffect } from "../lib/effect"
@@ -208,6 +209,29 @@ const providerErrorLLM = Layer.succeed(
 )
 const providerErrorEnv = LayerNode.compile(root, [...replacements, [LLM.node, providerErrorLLM]])
 const itProviderError = testEffect(providerErrorEnv)
+
+const hugeError = Array.from({ length: 20_000 }, (_, i) => `error line ${i} ${"x".repeat(40)}`).join("\n")
+const hugeErrorLLM = Layer.succeed(
+  LLM.Service,
+  LLM.Service.of({
+    stream: () =>
+      Stream.make(
+        LLMEvent.stepStart({ index: 0 }),
+        LLMEvent.toolInputStart({ id: "call-1", name: "lookup" }),
+        LLMEvent.toolInputEnd({ id: "call-1", name: "lookup" }),
+        LLMEvent.toolCall({ id: "call-1", name: "lookup", input: {}, providerExecuted: true }),
+        LLMEvent.toolResult({
+          id: "call-1",
+          name: "lookup",
+          result: { type: "error", value: hugeError },
+          providerExecuted: true,
+        }),
+        LLMEvent.stepFinish({ index: 0, reason: "stop" }),
+        LLMEvent.finish({ reason: "stop" }),
+      ),
+  }),
+)
+const itHugeError = testEffect(LayerNode.compile(root, [...replacements, [LLM.node, hugeErrorLLM]]))
 
 const fragmentFailureLLM = Layer.succeed(
   LLM.Service,
@@ -1055,6 +1079,50 @@ itProviderError.live("session.processor effect tests fail provider-executed erro
         expect(seen).toContain(MessageV2.Event.PartUpdated.type)
         expect(seen).toContain(MessageV2.Event.Updated.type)
         expect(seen.filter((type) => type.startsWith("session.next."))).toEqual([])
+      }),
+    { config: cfg },
+  ),
+)
+
+itHugeError.live("session.processor effect tests truncate oversized tool errors", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        const { processors, session, provider } = yield* boot()
+
+        const chat = yield* session.create({})
+        const parent = yield* user(chat.id, "huge tool error")
+        const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+        const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+        const handle = yield* processors.create({ assistantMessage: msg, sessionID: chat.id, model: mdl })
+
+        yield* handle.process({
+          user: {
+            id: parent.id,
+            sessionID: chat.id,
+            role: "user",
+            time: parent.time,
+            agent: parent.agent,
+            model: { providerID: ref.providerID, modelID: ref.modelID },
+          } satisfies SessionV1.User,
+          sessionID: chat.id,
+          model: mdl,
+          agent: agent(),
+          system: [],
+          messages: [{ role: "user", content: "huge tool error" }],
+          tools: {},
+        })
+
+        const parts = yield* MessageV2.parts(msg.id)
+        const call = parts.find((part): part is SessionV1.ToolPart => part.type === "tool")
+        expect(call?.state.status).toBe("error")
+        if (call?.state.status !== "error") return
+        expect(call.state.error.startsWith("error line 0 ")).toBe(true)
+        expect(Buffer.byteLength(call.state.error, "utf-8")).toBeLessThan(Truncate.MAX_BYTES + 1024)
+        expect(call.state.error).toContain("The tool call failed and its error message was truncated")
+        const saved = call.state.error.match(/Full error saved to: (\S+)/)?.[1]
+        expect(saved).toBeDefined()
+        expect(yield* Effect.promise(() => Bun.file(saved!).text())).toBe(hugeError)
       }),
     { config: cfg },
   ),

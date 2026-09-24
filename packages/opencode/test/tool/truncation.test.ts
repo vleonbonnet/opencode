@@ -192,6 +192,21 @@ describe("Truncate", () => {
       }),
     )
 
+    it.live("describes truncated error text as a failed call", () =>
+      Effect.gen(function* () {
+        const svc = yield* Truncate.Service
+        const lines = Array.from({ length: 100 }, (_, i) => `line${i}`).join("\n")
+        const result = yield* svc.output(lines, { maxLines: 10, kind: "error" })
+
+        expect(result.truncated).toBe(true)
+        expect(result.content).toContain("The tool call failed and its error message was truncated")
+        expect(result.content).not.toContain("succeeded")
+        if (!result.truncated) throw new Error("expected truncated")
+        const fsys = yield* FSUtil.Service
+        expect(yield* fsys.readFileString(result.outputPath)).toBe(lines)
+      }),
+    )
+
     it.live("suggests Task tool when agent has task permission", () =>
       Effect.gen(function* () {
         const svc = yield* Truncate.Service

@@ -22,6 +22,8 @@ export interface Options {
   maxLines?: number
   maxBytes?: number
   direction?: "head" | "tail"
+  /** What the text is. An `error` is described as a failed call's truncated error message. */
+  kind?: "output" | "error"
 }
 
 function hasTaskTool(agent?: Agent.Info) {
@@ -126,9 +128,13 @@ const layer = Layer.effect(
       const preview = out.join("\n")
       const file = yield* write(text)
 
+      const saved =
+        options.kind === "error"
+          ? `The tool call failed and its error message was truncated. Full error saved to: ${file}`
+          : `The tool call succeeded but the output was truncated. Full output saved to: ${file}`
       const hint = hasTaskTool(agent)
-        ? `The tool call succeeded but the output was truncated. Full output saved to: ${file}\nUse the Task tool to have explore agent process this file with Grep and Read (with offset/limit). Do NOT read the full file yourself - delegate to save context.`
-        : `The tool call succeeded but the output was truncated. Full output saved to: ${file}\nUse Grep to search the full content or Read with offset/limit to view specific sections.`
+        ? `${saved}\nUse the Task tool to have explore agent process this file with Grep and Read (with offset/limit). Do NOT read the full file yourself - delegate to save context.`
+        : `${saved}\nUse Grep to search the full content or Read with offset/limit to view specific sections.`
 
       return {
         content:

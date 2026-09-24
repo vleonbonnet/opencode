@@ -20,6 +20,7 @@ import { SessionStatus } from "./status"
 import { SessionSummary } from "./summary"
 import type { Provider } from "@/provider/provider"
 import { Question } from "@/question"
+import { Truncate } from "@/tool/truncate"
 import { errorMessage } from "@/util/error"
 import { isRecord } from "@/util/record"
 import { EventV2Bridge } from "@/event-v2-bridge"
@@ -94,6 +95,7 @@ const layer = Layer.effect(
     const image = yield* Image.Service
     const events = yield* EventV2Bridge.Service
     const database = yield* Database.Service
+    const truncate = yield* Truncate.Service
 
     const create = Effect.fn("SessionProcessor.create")(function* (input: Input) {
       // Pre-capture snapshot before the LLM stream starts. The AI SDK
@@ -186,12 +188,16 @@ const layer = Layer.effect(
       const failToolCall = Effect.fn("SessionProcessor.failToolCall")(function* (toolCallID: string, error: unknown) {
         const match = yield* readToolCall(toolCallID)
         if (!match || match.part.state.status !== "running") return false
+        // Error text goes back to the model like output does, so bound it the same way:
+        // an MCP server can return an arbitrarily large error that alone overflows the context.
+        const agent = yield* agents.get(ctx.assistantMessage.agent)
+        const bounded = yield* truncate.output(errorMessage(error), { kind: "error" }, agent)
         yield* session.updatePart({
           ...match.part,
           state: {
             status: "error",
             input: match.part.state.input,
-            error: errorMessage(error),
+            error: bounded.content,
             // Keep metadata streamed while running so failures retain progress detail (e.g. execute's child calls).
             metadata: match.part.state.metadata,
             time: { start: match.part.state.time.start, end: Date.now() },
@@ -712,6 +718,7 @@ export const node = LayerNode.make({
     Image.node,
     EventV2Bridge.node,
     Database.node,
+    Truncate.node,
   ],
 })
 
