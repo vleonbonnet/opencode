@@ -4,6 +4,8 @@ export interface Runner<A, E = never> {
   readonly state: State<A, E>
   readonly busy: boolean
   readonly ensureRunning: (work: Effect.Effect<A, E>) => Effect.Effect<A, E>
+  /** Like `ensureRunning`, but returns once the run is admitted, with an effect awaiting its result. */
+  readonly start: (work: Effect.Effect<A, E>) => Effect.Effect<Effect.Effect<A, E>>
   readonly startShell: (work: Effect.Effect<A, E>, ready?: Latch.Latch) => Effect.Effect<A, E | Busy>
   readonly cancel: Effect.Effect<void>
 }
@@ -112,7 +114,7 @@ export const make = <A, E = never>(
       yield* Fiber.interrupt(shell.fiber)
     })
 
-  const ensureRunning = (work: Effect.Effect<A, E>) =>
+  const start = (work: Effect.Effect<A, E>) =>
     SynchronizedRef.modifyEffect(
       ref,
       Effect.fnUntraced(function* (st) {
@@ -135,7 +137,9 @@ export const make = <A, E = never>(
           }
         }
       }),
-    ).pipe(Effect.flatten)
+    )
+
+  const ensureRunning = (work: Effect.Effect<A, E>) => start(work).pipe(Effect.flatten)
 
   const startShell = (work: Effect.Effect<A, E>, ready?: Latch.Latch): Effect.Effect<A, E | Busy> =>
     SynchronizedRef.modifyEffect(
@@ -209,6 +213,7 @@ export const make = <A, E = never>(
       return state()._tag !== "Idle"
     },
     ensureRunning,
+    start,
     startShell,
     cancel,
   }

@@ -51,8 +51,12 @@ import { EventV2Bridge } from "@/event-v2-bridge"
 import { Database } from "@opencode-ai/core/database/database"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { ProviderV2 } from "@opencode-ai/core/provider"
-import { eq } from "drizzle-orm"
-import { SessionTable } from "@opencode-ai/core/session/sql"
+import { and, eq, isNull, sql } from "drizzle-orm"
+import { MessageTable, SessionTable } from "@opencode-ai/core/session/sql"
+import { Question } from "@/question"
+import { QuestionID } from "@/question/schema"
+import { answerResult } from "@/tool/question"
+import { isRecord } from "@/util/record"
 import { SessionReminders } from "./reminders"
 import { SessionTools } from "./tools"
 import { LLMEvent } from "@opencode-ai/llm"
@@ -106,6 +110,11 @@ export interface Interface {
   readonly shell: (input: ShellInput) => Effect.Effect<SessionV1.WithParts, Session.BusyError>
   readonly command: (input: CommandInput) => Effect.Effect<SessionV1.WithParts, Image.Error>
   readonly resolvePromptParts: (template: string) => Effect.Effect<PromptInput["parts"]>
+  /**
+   * Re-ask questions orphaned by a previous server process and resume their
+   * turns once answered.  Runs once per instance, before it serves requests.
+   */
+  readonly recover: () => Effect.Effect<void>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/SessionPrompt") {}
@@ -140,7 +149,10 @@ const layer = Layer.effect(
     const events = yield* EventV2Bridge.Service
     const flags = yield* RuntimeFlags.Service
     const database = yield* Database.Service
+    const question = yield* Question.Service
     const { db } = database
+    // Sessions being cancelled by the user, as opposed to torn down with the instance.
+    const cancelling = new Set<SessionID>()
     const ops = Effect.fn("SessionPrompt.ops")(function* () {
       return {
         cancel: (sessionID: SessionID) => cancel(sessionID),
@@ -151,7 +163,8 @@ const layer = Layer.effect(
 
     const cancel = Effect.fn("SessionPrompt.cancel")(function* (sessionID: SessionID) {
       yield* Effect.logInfo("cancel", { "session.id": sessionID })
-      yield* state.cancel(sessionID)
+      cancelling.add(sessionID)
+      yield* state.cancel(sessionID).pipe(Effect.ensuring(Effect.sync(() => cancelling.delete(sessionID))))
     })
 
     const resolvePromptParts = Effect.fn("SessionPrompt.resolvePromptParts")(function* (template: string) {
@@ -1346,6 +1359,173 @@ const layer = Layer.effect(
       return yield* state.ensureRunning(input.sessionID, lastAssistant(input.sessionID), runLoop(input.sessionID))
     })
 
+    const recover = Effect.fn("SessionPrompt.recover")(function* () {
+      const ctx = yield* InstanceState.context
+      // A question's answer lives in the process that asked it, so a restart
+      // leaves the question tool part running in a turn that never finished.
+      // Such a turn is the last message of its session: re-ask its questions.
+      const rows = yield* db
+        .select({ id: SessionTable.id })
+        .from(SessionTable)
+        .innerJoin(MessageTable, eq(MessageTable.session_id, SessionTable.id))
+        .where(
+          and(
+            eq(SessionTable.directory, ctx.directory),
+            isNull(SessionTable.parent_id),
+            isNull(SessionTable.time_archived),
+            sql`${MessageTable.id} = (select latest.id from ${MessageTable} latest where latest.session_id = ${SessionTable.id} order by latest.time_created desc, latest.id desc limit 1)`,
+            sql`json_extract(${MessageTable.data}, '$.role') = 'assistant'`,
+            sql`json_extract(${MessageTable.data}, '$.time.completed') is null`,
+          ),
+        )
+        .all()
+        .pipe(Effect.orDie)
+      yield* Effect.forEach(rows, (row) => recoverQuestions(row.id), { discard: true })
+    })
+
+    const recoverQuestions = Effect.fnUntraced(function* (sessionID: SessionID) {
+      const [turn] = yield* sessions.messages({ sessionID, limit: 1 }).pipe(Effect.orDie)
+      if (turn?.info.role !== "assistant") return
+      const info = turn.info
+      // Other unfinished tools in the turn, and questions whose input never
+      // finished streaming, are closed as interrupted once the turn resumes.
+      const asked = turn.parts.flatMap((part) => {
+        if (part.type !== "tool" || part.tool !== "question" || part.state.status !== "running") return []
+        const questions = decodeQuestions(part.state.input.questions)
+        return Option.isSome(questions) ? [{ part, state: part.state, questions: questions.value }] : []
+      })
+      if (asked.length === 0) return
+      const busy = yield* state.assertNotBusy(sessionID).pipe(
+        Effect.as(false),
+        Effect.catch(() => Effect.succeed(true)),
+      )
+      if (busy) return
+
+      const pending = yield* Effect.forEach(asked, (item) =>
+        question
+          .register({
+            id: requestID(item.state.metadata?.requestID),
+            sessionID,
+            questions: item.questions,
+            tool: { messageID: info.id, callID: item.part.callID },
+          })
+          .pipe(Effect.map((answer) => ({ ...item, answer }))),
+      )
+      yield* Effect.logInfo("recovered questions", { "session.id": sessionID, count: pending.length })
+      yield* status.set(sessionID, { type: "busy" })
+      const done = yield* state.start(
+        sessionID,
+        lastAssistant(sessionID),
+        Effect.gen(function* () {
+          const outcomes = yield* Effect.forEach(
+            pending,
+            (item) =>
+              item.answer.pipe(
+                Effect.exit,
+                Effect.map((exit) => ({ ...item, exit })),
+              ),
+            { concurrency: "unbounded" },
+          ).pipe(
+            // A user abort ends the turn; an instance teardown leaves it recoverable.
+            Effect.onInterrupt(() => (cancelling.has(sessionID) ? finishTurn(info, { aborted: true }) : Effect.void)),
+          )
+          yield* Effect.forEach(
+            outcomes,
+            Effect.fnUntraced(function* (item) {
+              const end = Date.now()
+              if (Exit.isFailure(item.exit)) {
+                yield* sessions.updatePart({
+                  ...item.part,
+                  state: {
+                    status: "error",
+                    input: item.state.input,
+                    error: new Question.RejectedError().message,
+                    metadata: item.state.metadata,
+                    time: { start: item.state.time.start, end },
+                  },
+                })
+                return
+              }
+              const output = answerResult(item.questions, item.exit.value)
+              yield* plugin.trigger(
+                "tool.execute.after",
+                { tool: item.part.tool, sessionID, callID: item.part.callID, args: item.state.input },
+                output,
+              )
+              yield* sessions.updatePart({
+                ...item.part,
+                state: {
+                  status: "completed",
+                  input: item.state.input,
+                  output: output.output,
+                  metadata: output.metadata,
+                  title: output.title,
+                  time: { start: item.state.time.start, end },
+                },
+              })
+            }),
+            { discard: true },
+          )
+          yield* finishTurn(info, { aborted: false })
+          const dismissed = outcomes.some((item) => Exit.isFailure(item.exit))
+          if (dismissed && (yield* config.get()).experimental?.continue_loop_on_deny !== true)
+            return yield* lastAssistant(sessionID)
+          return yield* runLoop(sessionID)
+        }),
+      )
+      yield* done.pipe(
+        Effect.catchCause((cause) => Effect.logError("recovered turn failed", { "session.id": sessionID, cause })),
+        Effect.forkIn(scope),
+      )
+    })
+
+    // Close a turn whose stream died with the process that ran it, as the
+    // processor's cleanup would have: unfinished tools become interrupted.
+    const finishTurn = Effect.fnUntraced(function* (info: SessionV1.Assistant, input: { aborted: boolean }) {
+      const turn = yield* MessageV2.get({ sessionID: info.sessionID, messageID: info.id }).pipe(
+        Effect.provideService(Database.Service, database),
+        Effect.orDie,
+      )
+      const end = Date.now()
+      yield* Effect.forEach(
+        turn.parts,
+        (part) => {
+          if (part.type === "tool" && (part.state.status === "pending" || part.state.status === "running")) {
+            const metadata = "metadata" in part.state && isRecord(part.state.metadata) ? part.state.metadata : {}
+            return sessions.updatePart({
+              ...part,
+              state: {
+                status: "error",
+                input: part.state.input,
+                error: "Tool execution aborted",
+                metadata: { ...metadata, interrupted: true },
+                time: { start: part.state.status === "running" ? part.state.time.start : end, end },
+              },
+            })
+          }
+          if ((part.type === "text" || part.type === "reasoning") && part.time && !part.time.end)
+            return sessions.updatePart({ ...part, time: { ...part.time, end } })
+          return Effect.void
+        },
+        { discard: true },
+      )
+      if (turn.info.role !== "assistant") return
+      yield* sessions.updateMessage({
+        ...turn.info,
+        ...(input.aborted
+          ? {
+              error:
+                turn.info.error ??
+                MessageV2.fromError(new DOMException("Aborted", "AbortError"), {
+                  providerID: turn.info.providerID,
+                  aborted: true,
+                }),
+            }
+          : { finish: turn.info.finish ?? "tool-calls" }),
+        time: { ...turn.info.time, completed: end },
+      })
+    })
+
     const shell: (input: ShellInput) => Effect.Effect<SessionV1.WithParts, Session.BusyError> = Effect.fn(
       "SessionPrompt.shell",
     )(function* (input: ShellInput) {
@@ -1487,6 +1667,7 @@ const layer = Layer.effect(
       shell,
       command,
       resolvePromptParts,
+      recover,
     })
   }),
 )
@@ -1625,7 +1806,16 @@ export const node = LayerNode.make({
     EventV2Bridge.node,
     RuntimeFlags.node,
     Database.node,
+    Question.node,
   ],
 })
+
+const decodeQuestions = Schema.decodeUnknownOption(Schema.Array(Question.Prompt))
+const decodeQuestionID = Schema.decodeUnknownOption(QuestionID)
+
+/** The persisted request ID of an orphaned question, so clients keep their pending copy. */
+function requestID(value: unknown) {
+  return Option.getOrUndefined(decodeQuestionID(value))
+}
 
 export * as SessionPrompt from "./prompt"

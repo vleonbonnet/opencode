@@ -38,6 +38,7 @@ import { SessionPrompt } from "../../src/session/prompt"
 import { SessionRevert } from "../../src/session/revert"
 import { SessionRunState } from "../../src/session/run-state"
 import { MessageID, PartID, SessionID } from "../../src/session/schema"
+import { QuestionID } from "../../src/question/schema"
 import { SessionStatus } from "../../src/session/status"
 import { SessionV2 } from "@opencode-ai/core/session"
 import { SessionExecution } from "@opencode-ai/core/session/execution"
@@ -2439,4 +2440,183 @@ noLLMServer.instance(
       }
     }),
   30_000,
+)
+
+// Question recovery
+
+// A turn left behind by a process that died while its question tool waited.
+const orphanQuestion = Effect.fn("test.orphanQuestion")(function* (sessionID: SessionID) {
+  const sessions = yield* Session.Service
+  const requestID = QuestionID.ascending()
+  const asker = yield* user(sessionID, "ask me")
+  const assistant: SessionV1.Assistant = {
+    id: MessageID.ascending(),
+    role: "assistant",
+    parentID: asker.id,
+    sessionID,
+    mode: "build",
+    agent: "build",
+    cost: 0,
+    path: { cwd: "/tmp", root: "/tmp" },
+    tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+    modelID: ref.modelID,
+    providerID: ref.providerID,
+    time: { created: Date.now() },
+  }
+  yield* sessions.updateMessage(assistant)
+  yield* sessions.updatePart({
+    id: PartID.ascending(),
+    messageID: assistant.id,
+    sessionID,
+    type: "tool",
+    callID: "call-question",
+    tool: "question",
+    state: {
+      status: "running",
+      input: {
+        questions: [
+          {
+            question: "Pick a color",
+            header: "Color",
+            options: [
+              { label: "Red", description: "Warm" },
+              { label: "Blue", description: "Cool" },
+            ],
+          },
+        ],
+      },
+      metadata: { requestID },
+      time: { start: Date.now() },
+    },
+  })
+  return { assistant, requestID }
+})
+
+const waitForIdle = (sessionID: SessionID) =>
+  pollWithTimeout(
+    Effect.gen(function* () {
+      const status = yield* SessionStatus.Service
+      return (yield* status.get(sessionID)).type === "idle" ? (true as const) : undefined
+    }),
+    `session ${sessionID} never became idle`,
+  )
+
+const turnOf = (sessionID: SessionID, messageID: MessageID) => MessageV2.get({ sessionID, messageID })
+
+it.instance("recover re-asks an orphaned question and resumes its turn", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const question = yield* Question.Service
+    const status = yield* SessionStatus.Service
+    const chat = yield* sessions.create({
+      title: "Pinned",
+      permission: [{ permission: "*", pattern: "*", action: "allow" }],
+    })
+    const orphan = yield* orphanQuestion(chat.id)
+    yield* llm.text("You picked Red.")
+
+    yield* prompt.recover()
+    const pending = yield* question.list()
+    expect(pending.map((request) => request.id)).toEqual([orphan.requestID])
+    expect(pending[0]?.tool).toEqual({ messageID: orphan.assistant.id, callID: "call-question" })
+    expect((yield* status.get(chat.id)).type).toBe("busy")
+
+    yield* question.reply({ requestID: orphan.requestID, answers: [["Red"]] })
+    const result = yield* prompt.loop({ sessionID: chat.id })
+    expect(result.parts.some((part) => part.type === "text" && part.text === "You picked Red.")).toBe(true)
+
+    const turn = yield* turnOf(chat.id, orphan.assistant.id)
+    const tool = completedTool(turn.parts)
+    expect(tool?.state.output).toContain('"Pick a color"="Red"')
+    expect(tool?.state.metadata.answers).toEqual([["Red"]])
+    expect(turn.info.role === "assistant" && turn.info.finish).toBe("tool-calls")
+    expect(turn.info.role === "assistant" && turn.info.time.completed).toBeNumber()
+    expect(yield* llm.calls).toBe(1)
+    expect(JSON.stringify(yield* llm.inputs)).toContain('\\"Pick a color\\"=\\"Red\\"')
+  }),
+)
+
+it.instance("recover stops a turn whose recovered question is dismissed", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const question = yield* Question.Service
+    const chat = yield* sessions.create({ title: "Pinned" })
+    const orphan = yield* orphanQuestion(chat.id)
+
+    yield* prompt.recover()
+    yield* question.reject(orphan.requestID)
+    yield* waitForIdle(chat.id)
+
+    const tool = errorTool((yield* turnOf(chat.id, orphan.assistant.id)).parts)
+    expect(tool?.state.error).toBe(new Question.RejectedError().message)
+    expect(yield* llm.calls).toBe(0)
+  }),
+)
+
+it.instance("recover ignores a question the conversation has moved past", () =>
+  Effect.gen(function* () {
+    yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const question = yield* Question.Service
+    const status = yield* SessionStatus.Service
+    const chat = yield* sessions.create({ title: "Pinned" })
+    yield* orphanQuestion(chat.id)
+    yield* user(chat.id, "never mind")
+
+    yield* prompt.recover()
+    expect(yield* question.list()).toEqual([])
+    expect((yield* status.get(chat.id)).type).toBe("idle")
+  }),
+)
+
+it.instance("cancel closes a recovered turn as aborted", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const question = yield* Question.Service
+    const chat = yield* sessions.create({ title: "Pinned" })
+    const orphan = yield* orphanQuestion(chat.id)
+
+    yield* prompt.recover()
+    yield* prompt.cancel(chat.id)
+
+    expect(yield* question.list()).toEqual([])
+    const turn = yield* turnOf(chat.id, orphan.assistant.id)
+    const tool = errorTool(turn.parts)
+    expect(tool?.state.metadata?.interrupted).toBe(true)
+    expect(turn.info.role === "assistant" && turn.info.error?.name).toBe("MessageAbortedError")
+    expect(turn.info.role === "assistant" && turn.info.time.completed).toBeNumber()
+    expect(yield* llm.calls).toBe(0)
+  }),
+)
+
+it.instance("a recovered question stays recoverable when its run is torn down", () =>
+  Effect.gen(function* () {
+    yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const question = yield* Question.Service
+    const run = yield* SessionRunState.Service
+    const chat = yield* sessions.create({ title: "Pinned" })
+    const orphan = yield* orphanQuestion(chat.id)
+
+    yield* prompt.recover()
+    // Instance teardown cancels runners directly rather than through prompt.cancel.
+    yield* run.cancel(chat.id)
+
+    const turn = yield* turnOf(chat.id, orphan.assistant.id)
+    expect(toolPart(turn.parts)?.state.status).toBe("running")
+    expect(turn.info.role === "assistant" && turn.info.time.completed).toBeUndefined()
+
+    yield* prompt.recover()
+    expect((yield* question.list()).map((request) => request.id)).toEqual([orphan.requestID])
+    yield* question.reject(orphan.requestID)
+    yield* waitForIdle(chat.id)
+  }),
 )

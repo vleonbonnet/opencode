@@ -1,6 +1,7 @@
 import { Effect, Schema } from "effect"
 import * as Tool from "./tool"
 import { Question } from "../question"
+import { QuestionID } from "../question/schema"
 import DESCRIPTION from "./question.txt"
 
 export const Parameters = Schema.Struct({
@@ -8,7 +9,9 @@ export const Parameters = Schema.Struct({
 })
 
 type Metadata = {
-  answers: ReadonlyArray<Question.Answer>
+  answers?: ReadonlyArray<Question.Answer>
+  // Persisted while waiting so a restarted server can re-ask under the same ID.
+  requestID?: QuestionID
 }
 
 export const QuestionTool = Tool.define<typeof Parameters, Metadata, Question.Service>(
@@ -19,26 +22,33 @@ export const QuestionTool = Tool.define<typeof Parameters, Metadata, Question.Se
     return {
       description: DESCRIPTION,
       parameters: Parameters,
-      execute: (params: Schema.Schema.Type<typeof Parameters>, ctx: Tool.Context<Metadata>) =>
+      execute: (params: Schema.Schema.Type<typeof Parameters>, ctx: Tool.Context) =>
         Effect.gen(function* () {
+          const requestID = QuestionID.ascending()
+          yield* ctx.metadata({ metadata: { requestID } })
           const answers = yield* question.ask({
+            id: requestID,
             sessionID: ctx.sessionID,
             questions: params.questions,
             tool: ctx.callID ? { messageID: ctx.messageID, callID: ctx.callID } : undefined,
           })
-
-          const formatted = params.questions
-            .map((q, i) => `"${q.question}"="${answers[i]?.length ? answers[i].join(", ") : "Unanswered"}"`)
-            .join(", ")
-
-          return {
-            title: `Asked ${params.questions.length} question${params.questions.length > 1 ? "s" : ""}`,
-            output: `User has answered your questions: ${formatted}. You can now continue with the user's answers in mind.`,
-            metadata: {
-              answers,
-            },
-          }
+          return answerResult(params.questions, answers)
         }).pipe(Effect.orDie),
     }
   }),
 )
+
+/** The tool result for QUESTIONS answered with ANSWERS. */
+export function answerResult(questions: ReadonlyArray<Question.Prompt>, answers: ReadonlyArray<Question.Answer>) {
+  const formatted = questions
+    .map((q, i) => `"${q.question}"="${answers[i]?.length ? answers[i].join(", ") : "Unanswered"}"`)
+    .join(", ")
+
+  return {
+    title: `Asked ${questions.length} question${questions.length > 1 ? "s" : ""}`,
+    output: `User has answered your questions: ${formatted}. You can now continue with the user's answers in mind.`,
+    metadata: {
+      answers,
+    },
+  }
+}

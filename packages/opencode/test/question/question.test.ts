@@ -15,11 +15,7 @@ const questionLayer = LayerNode.compile(LayerNode.group([Question.node, EventV2B
 const it = testEffect(questionLayer)
 const lifecycle = testEffect(Layer.mergeAll(questionLayer, testInstanceStoreLayer))
 
-const askEffect = Effect.fn("QuestionTest.ask")(function* (input: {
-  sessionID: SessionID
-  questions: ReadonlyArray<Question.Info>
-  tool?: Question.Tool
-}) {
+const askEffect = Effect.fn("QuestionTest.ask")(function* (input: Question.AskInput) {
   const question = yield* Question.Service
   return yield* question.ask(input)
 })
@@ -115,6 +111,50 @@ it.instance(
       expect(pending[0].questions).toEqual(questions)
       yield* rejectAll
       expect((yield* Fiber.await(fiber))._tag).toBe("Failure")
+    }),
+  { git: true },
+)
+
+it.instance(
+  "ask - uses a provided request ID",
+  () =>
+    Effect.gen(function* () {
+      const id = QuestionID.ascending()
+      const fiber = yield* askEffect({
+        id,
+        sessionID: SessionID.make("ses_test"),
+        questions: [{ question: "Proceed?", header: "Proceed", options: [{ label: "Yes", description: "Go" }] }],
+      }).pipe(Effect.forkScoped)
+
+      expect((yield* waitForPending(1))[0].id).toBe(id)
+      yield* replyEffect({ requestID: id, answers: [["Yes"]] })
+      expect(yield* Fiber.join(fiber)).toEqual([["Yes"]])
+    }),
+  { git: true },
+)
+
+it.instance(
+  "register - pending before the answer is awaited",
+  () =>
+    Effect.gen(function* () {
+      const question = yield* Question.Service
+      const id = QuestionID.ascending()
+      const input = {
+        id,
+        sessionID: SessionID.make("ses_test"),
+        questions: [{ question: "Proceed?", header: "Proceed", options: [{ label: "Yes", description: "Go" }] }],
+      }
+      const answer = yield* question.register(input)
+      expect((yield* listEffect).map((request) => request.id)).toEqual([id])
+
+      // Registering the same ID again joins the pending request.
+      const again = yield* question.register(input)
+      expect(yield* listEffect).toHaveLength(1)
+
+      yield* replyEffect({ requestID: id, answers: [["Yes"]] })
+      expect(yield* answer).toEqual([["Yes"]])
+      expect(yield* again).toEqual([["Yes"]])
+      expect(yield* listEffect).toEqual([])
     }),
   { git: true },
 )

@@ -45,12 +45,22 @@ interface State {
 
 // Service
 
+export interface AskInput {
+  /** Reuse a known request ID, e.g. one persisted on the asking tool part. */
+  id?: QuestionID
+  sessionID: SessionID
+  questions: ReadonlyArray<Info>
+  tool?: Tool
+}
+
 export interface Interface {
-  readonly ask: (input: {
-    sessionID: SessionID
-    questions: ReadonlyArray<Info>
-    tool?: Tool
-  }) => Effect.Effect<ReadonlyArray<Answer>, RejectedError>
+  readonly ask: (input: AskInput) => Effect.Effect<ReadonlyArray<Answer>, RejectedError>
+  /**
+   * Publish the request now and return an effect that awaits its answer.
+   * Unlike `ask`, the request is pending as soon as this returns, which lets a
+   * caller re-ask persisted questions before the instance serves requests.
+   */
+  readonly register: (input: AskInput) => Effect.Effect<Effect.Effect<ReadonlyArray<Answer>, RejectedError>>
   readonly reply: (input: {
     requestID: QuestionID
     answers: ReadonlyArray<Answer>
@@ -84,13 +94,18 @@ const layer = Layer.effect(
       }),
     )
 
-    const ask = Effect.fn("Question.ask")(function* (input: {
-      sessionID: SessionID
-      questions: ReadonlyArray<Info>
-      tool?: Tool
-    }) {
+    const register = Effect.fn("Question.register")(function* (input: AskInput) {
       const pending = (yield* InstanceState.get(state)).pending
-      const id = QuestionID.ascending()
+      const id = input.id ?? QuestionID.ascending()
+      const answer = (deferred: PendingEntry["deferred"]) =>
+        Effect.ensuring(
+          Deferred.await(deferred),
+          Effect.sync(() => {
+            pending.delete(id)
+          }),
+        )
+      const existing = pending.get(id)
+      if (existing) return answer(existing.deferred)
       yield* Effect.logInfo("asking", { id, questions: input.questions.length })
 
       const deferred = yield* Deferred.make<ReadonlyArray<Answer>, RejectedError>()
@@ -102,13 +117,12 @@ const layer = Layer.effect(
       }
       pending.set(id, { info, deferred })
       yield* events.publish(Event.Asked, info)
+      return answer(deferred)
+    })
 
-      return yield* Effect.ensuring(
-        Deferred.await(deferred),
-        Effect.sync(() => {
-          pending.delete(id)
-        }),
-      )
+    const ask = Effect.fn("Question.ask")(function* (input: AskInput) {
+      const answer = yield* register(input)
+      return yield* answer
     })
 
     const reply = Effect.fn("Question.reply")(function* (input: {
@@ -152,7 +166,7 @@ const layer = Layer.effect(
       return Array.from(pending.values(), (x) => x.info)
     })
 
-    return Service.of({ ask, reply, reject, list })
+    return Service.of({ ask, register, reply, reject, list })
   }),
 )
 

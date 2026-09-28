@@ -10,6 +10,7 @@ import { ShareNext } from "@/share/share-next"
 import { Effect, Layer } from "effect"
 import { Config } from "@/config/config"
 import { Service } from "./bootstrap-service"
+import { SessionPrompt } from "@/session/prompt"
 
 export { Service } from "./bootstrap-service"
 export type { Interface } from "./bootstrap-service"
@@ -28,6 +29,7 @@ const layer = Layer.effect(
     const shareNext = yield* ShareNext.Service
     const snapshot = yield* Snapshot.Service
     const vcs = yield* Vcs.Service
+    const prompt = yield* SessionPrompt.Service
 
     const run = Effect.gen(function* () {
       const ctx = yield* InstanceState.context
@@ -43,6 +45,11 @@ const layer = Layer.effect(
         (s) => s.init().pipe(Effect.catchCause((cause) => Effect.logWarning("init failed", { cause }))),
         { concurrency: "unbounded", discard: true },
       ).pipe(Effect.withSpan("InstanceBootstrap.init"))
+      // Questions orphaned by a restart must be pending again before any
+      // client lists them, so this completes before the instance serves.
+      yield* prompt
+        .recover()
+        .pipe(Effect.catchCause((cause) => Effect.logWarning("question recovery failed", { cause })))
     }).pipe(Effect.withSpan("InstanceBootstrap"))
 
     return Service.of({ run })
@@ -52,7 +59,17 @@ const layer = Layer.effect(
 export const node = makeGlobalNode({
   service: Service,
   layer: layer,
-  deps: [Config.node, Format.node, LSP.node, Plugin.node, Project.node, ShareNext.node, Snapshot.node, Vcs.node],
+  deps: [
+    Config.node,
+    Format.node,
+    LSP.node,
+    Plugin.node,
+    Project.node,
+    ShareNext.node,
+    Snapshot.node,
+    Vcs.node,
+    SessionPrompt.node,
+  ],
 })
 
 export * as InstanceBootstrap from "./bootstrap"
