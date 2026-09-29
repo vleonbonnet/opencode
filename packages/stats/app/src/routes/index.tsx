@@ -8,6 +8,7 @@ import {
   type CountryEntry,
   type LeaderboardEntry,
   type MarketDay,
+  type RetentionEntry,
   type SessionCostEntry,
   type TokenCostEntry,
   type UsagePoint,
@@ -20,8 +21,7 @@ import { LocaleLinks } from "../component/locale-links"
 import { useI18n } from "../context/i18n"
 import { useLanguage } from "../context/language"
 import { localizedUrl } from "../lib/language"
-import { findModelCatalogEntry, loadModelCatalog, type ModelCatalog } from "./model-catalog"
-import { geoMapHeight, geoMapWidth, worldBorderPath, worldCountryMarkers, worldCountryPaths } from "./geo-map"
+import { findModelCatalogEntry, isKnownCatalogLab, loadModelCatalog, type ModelCatalog } from "./model-catalog"
 import { SectionHeading } from "./section-heading"
 import { setStatsPageCacheHeaders } from "./stats-cache"
 import { ComparisonCardsSection, uniqueComparisonPairs, type ComparisonModelRef } from "./compare-cards"
@@ -65,12 +65,14 @@ type StatsHomePageData = {
   updatedAt: string | null
   usage: UsagePoint[]
   users: UsagePoint[]
-  leaderboard: LeaderboardEntry[]
+  leaderboard: { daily: LeaderboardEntry[]; weekly: LeaderboardEntry[] }
   market: MarketDay[]
   tokenCost: TokenCostEntry[]
   cacheRatio: CacheRatioEntry[]
   sessionCost: SessionCostEntry[]
+  retention: RetentionEntry[]
   country: CountryEntry[]
+  catalogLabs: string[]
 }
 
 const countryNumericIds = new Map(
@@ -84,12 +86,14 @@ const getData = query(async () => {
     updatedAt: stats.updatedAt,
     usage: stats.usage.Go["2M"],
     users: stats.users.Go["2M"],
-    leaderboard: stats.leaderboard.Go["2M"],
+    leaderboard: { daily: stats.leaderboard.Go["1D"], weekly: stats.leaderboard.Go["1W"] },
     market: stats.market["2M"],
     tokenCost: priceTokenCostFromCatalog(stats.tokenCost.Go, catalog),
     cacheRatio: stats.cacheRatio.Go,
     sessionCost: stats.sessionCost.Go,
-    country: stats.country["2M"],
+    retention: stats.retention,
+    country: stats.country,
+    catalogLabs: catalog.labs.map((lab) => lab.id),
   } satisfies StatsHomePageData
 }, "getStatsHomeData")
 
@@ -145,15 +149,20 @@ export default function StatsHome() {
             {(stats) => (
               <>
                 <Hero updatedAt={stats().updatedAt} />
-                <TopModelsSection data={stats().usage} leaderboard={stats().leaderboard} />
+                <TopModelsSection
+                  data={stats().usage}
+                  leaderboard={stats().leaderboard}
+                  catalogLabs={stats().catalogLabs}
+                />
                 <UniqueUsersSection data={stats().users} />
+                <RetentionSection data={stats().retention} />
                 <SessionCostSection data={stats().sessionCost} />
                 <TokenCostSection data={stats().tokenCost} />
                 <CacheRatioSection data={stats().cacheRatio} />
                 <MarketShareSection data={stats().market} />
                 <GeoBreakdownSection data={stats().country} />
                 <ComparisonCardsSection
-                  pairs={homeComparisonPairs(stats().leaderboard)}
+                  pairs={homeComparisonPairs(stats().leaderboard.weekly, stats().catalogLabs)}
                   title="Model Comparisons"
                   description="Popular model pairs from the leaderboard."
                   variant="featured"
@@ -317,7 +326,7 @@ function ChartSection(props: {
   )
 }
 
-function SectionTitle(props: { id: string; title: string; description: string }) {
+function SectionTitle(props: { id: string; title: string; description?: string }) {
   return <SectionHeading href={`#${props.id}`} title={props.title} description={props.description} />
 }
 
@@ -365,9 +374,15 @@ function formatUpdatedAtLabel(value: { date: string; time: string }) {
   return `${value.date}, ${value.time}`
 }
 
-function TopModelsSection(props: { data: UsagePoint[]; leaderboard: LeaderboardEntry[] }) {
+function TopModelsSection(props: {
+  data: UsagePoint[]
+  leaderboard: StatsHomePageData["leaderboard"]
+  catalogLabs: readonly string[]
+}) {
   const i18n = useI18n()
   const [activeModel, setActiveModel] = createSignal<string>()
+  const [period, setPeriod] = createSignal<"weekly" | "daily">("weekly")
+  const leaderboard = createMemo(() => props.leaderboard[period()])
 
   return (
     <section id="top-models" data-section="top-models">
@@ -384,13 +399,45 @@ function TopModelsSection(props: { data: UsagePoint[]; leaderboard: LeaderboardE
       >
         <TopModelsChart data={props.data} range="2M" activeModel={activeModel()} onActiveModelChange={setActiveModel} />
       </Show>
+      <div data-slot="leaderboard-period" role="group" aria-label={i18n.t("nav.leaderboard")}>
+        <div data-component="usage-filter" data-variant="range">
+          <button
+            type="button"
+            data-active={period() === "weekly" ? "true" : undefined}
+            aria-pressed={period() === "weekly"}
+            onClick={() => {
+              setPeriod("weekly")
+              setActiveModel(undefined)
+            }}
+          >
+            {i18n.t("chart.weekly")}
+          </button>
+          <button
+            type="button"
+            data-active={period() === "daily" ? "true" : undefined}
+            aria-pressed={period() === "daily"}
+            onClick={() => {
+              setPeriod("daily")
+              setActiveModel(undefined)
+            }}
+          >
+            {i18n.t("chart.daily")}
+          </button>
+        </div>
+      </div>
       <Show
-        when={props.leaderboard.length > 0}
+        when={leaderboard().length > 0}
         fallback={
           <EmptyState title={i18n.t("home.noLeaderboardTitle")} description={i18n.t("home.noLeaderboardDescription")} />
         }
       >
-        <Leaderboard data={props.leaderboard} activeModel={activeModel()} onActiveModelChange={setActiveModel} />
+        <Leaderboard
+          data={leaderboard()}
+          showChange={period() === "weekly"}
+          activeModel={activeModel()}
+          onActiveModelChange={setActiveModel}
+          catalogLabs={props.catalogLabs}
+        />
       </Show>
     </section>
   )
@@ -568,8 +615,8 @@ function TopModelsChart(props: {
                               style={{
                                 background: getRankColor(item.segment.model, item.index, segmentOrder(), usageColors),
                               }}
-                            />{" "}
-                            {item.segment.model}
+                            />
+                            <span data-slot="tooltip-name">{item.segment.model}</span>
                           </span>
                           <b>{formatUsageChartValue(item.segment.value, metric())}</b>
                         </p>
@@ -615,6 +662,82 @@ function UniqueUsersSection(props: { data: UsagePoint[] }) {
       </Show>
     </section>
   )
+}
+
+function RetentionSection(props: { data: RetentionEntry[] }) {
+  const language = useLanguage()
+  const [activeIndex, setActiveIndex] = createSignal(0)
+
+  return (
+    <section id="retention" data-section="retention">
+      <SectionTitle id="retention" title="Weekly Retention" description="Weekly users returning the next week." />
+      <Show
+        when={props.data.length > 0}
+        fallback={
+          <EmptyState
+            title="No retention data"
+            description="Retention appears after a complete return week is available."
+          />
+        }
+      >
+        <div data-component="retention-chart">
+          <div data-slot="retention-heading" aria-hidden="true">
+            <span>Rank</span>
+            <strong>Model</strong>
+            <i>Retention</i>
+            <b>Rate</b>
+            <em>Eligible</em>
+          </div>
+          <ol>
+            <For each={props.data}>
+              {(item, index) => (
+                <li>
+                  <a
+                    data-active={activeIndex() === index() ? "true" : undefined}
+                    href={language.route(
+                      `${import.meta.env.BASE_URL}${modelSlug(item.provider)}/${modelSlug(item.model)}`,
+                    )}
+                    onPointerEnter={() => setActiveIndex(index())}
+                    onFocus={() => setActiveIndex(index())}
+                    onClick={() => setActiveIndex(index())}
+                    aria-label={`${item.model}, ${formatRetentionRate(item.rate)} weekly retention, ${formatUsers(item.eligibleUserWeeks)} eligible user-weeks`}
+                  >
+                    <span>{item.rank === null ? "–" : String(item.rank).padStart(2, "0")}</span>
+                    <strong>{item.model}</strong>
+                    <RetentionMarker rate={item.rate} active={activeIndex() === index()} />
+                    <b>{formatRetentionRate(item.rate)}</b>
+                    <em>{formatUsers(item.eligibleUserWeeks)}</em>
+                  </a>
+                </li>
+              )}
+            </For>
+          </ol>
+        </div>
+      </Show>
+    </section>
+  )
+}
+
+function RetentionMarker(props: { rate: number; active: boolean }) {
+  const fill = createMemo(() => Math.min(100, Math.max(0, props.rate)))
+  return (
+    <i
+      data-component="retention-marker"
+      data-active={props.active ? "true" : undefined}
+      style={{ "--retention-position": `${fill()}%` } as JSX.CSSProperties}
+      aria-hidden="true"
+    >
+      <span />
+      <span />
+      <span />
+      <span />
+      <em />
+    </i>
+  )
+}
+
+function formatRetentionRate(value: number) {
+  return `${value.toFixed(1)}%`
 }
 
 function isTopModelsBlankHover(bar: HTMLElement, clientY: number) {
@@ -725,8 +848,10 @@ function formatUsers(value: number) {
 
 function Leaderboard(props: {
   data: LeaderboardEntry[]
+  showChange: boolean
   activeModel: string | undefined
   onActiveModelChange: (model: string | undefined) => void
+  catalogLabs: readonly string[]
 }) {
   const featured = createMemo(() => props.data.slice(0, 3))
   const compact = createMemo(() => props.data.slice(3))
@@ -738,9 +863,11 @@ function Leaderboard(props: {
           {(entry) => (
             <LeaderboardCard
               entry={entry}
+              showChange={props.showChange}
               size="featured"
               active={props.activeModel === entry.model}
               onActiveModelChange={props.onActiveModelChange}
+              catalogLabs={props.catalogLabs}
             />
           )}
         </For>
@@ -751,9 +878,11 @@ function Leaderboard(props: {
           {(entry) => (
             <LeaderboardCard
               entry={entry}
+              showChange={props.showChange}
               size="compact"
               active={props.activeModel === entry.model}
               onActiveModelChange={props.onActiveModelChange}
+              catalogLabs={props.catalogLabs}
             />
           )}
         </For>
@@ -763,9 +892,11 @@ function Leaderboard(props: {
           {(entry) => (
             <LeaderboardCard
               entry={entry}
+              showChange={props.showChange}
               size="featured"
               active={props.activeModel === entry.model}
               onActiveModelChange={props.onActiveModelChange}
+              catalogLabs={props.catalogLabs}
             />
           )}
         </For>
@@ -776,12 +907,16 @@ function Leaderboard(props: {
 
 function LeaderboardCard(props: {
   entry: LeaderboardEntry
+  showChange: boolean
   size: "featured" | "compact"
   active: boolean
   onActiveModelChange: (model: string | undefined) => void
+  catalogLabs: readonly string[]
 }) {
   const i18n = useI18n()
   const language = useLanguage()
+  const hasProvider = () => isKnownCatalogLab(props.entry.provider, props.catalogLabs)
+  const icon = () => (hasProvider() ? getProviderIconId(props.entry.author) : "synthetic")
   return (
     <a
       data-component="leader-card"
@@ -800,23 +935,27 @@ function LeaderboardCard(props: {
       onClick={() => props.onActiveModelChange(props.entry.model)}
     >
       <span data-slot="rank">{String(props.entry.rank).padStart(2, "0")}</span>
-      <ProviderIcon data-slot="leader-watermark" aria-hidden="true" id={getProviderIconId(props.entry.author)} />
+      <ProviderIcon data-slot="leader-watermark" aria-hidden="true" id={icon()} />
       <div data-slot="leader-body">
-        <ProviderIcon data-slot="leader-avatar" aria-hidden="true" id={getProviderIconId(props.entry.author)} />
+        <ProviderIcon data-slot="leader-avatar" aria-hidden="true" id={icon()} />
         <div data-slot="leader-copy">
           <div>
             <strong>{props.entry.model}</strong>
             <span>{formatBillions(props.entry.tokens)}</span>
           </div>
           <div>
-            <span>{props.entry.author}</span>
-            <span
-              data-slot="delta"
-              data-new={props.entry.change === null ? "true" : undefined}
-              data-negative={props.entry.change !== null && props.entry.change < 0 ? "true" : undefined}
-            >
-              {formatChange(props.entry.change, i18n)}
-            </span>
+            <Show when={hasProvider()} fallback={<span />}>
+              <span>{props.entry.author}</span>
+            </Show>
+            <Show when={props.showChange || props.entry.change === null}>
+              <span
+                data-slot="delta"
+                data-new={props.entry.change === null ? "true" : undefined}
+                data-negative={props.entry.change !== null && props.entry.change < 0 ? "true" : undefined}
+              >
+                {formatChange(props.entry.change, i18n)}
+              </span>
+            </Show>
           </div>
         </div>
       </div>
@@ -849,7 +988,7 @@ function MarketShareSection(props: { data: MarketDay[] }) {
   const [inspecting, setInspecting] = createSignal(false)
   const authorOrder = createMemo(() => getMarketAuthorOrder(props.data))
   const selectedIndex = createMemo(() => Math.min(activeIndex(), Math.max(props.data.length - 1, 0)))
-  const activeDay = createMemo(() => props.data[selectedIndex()])
+  const today = createMemo(() => props.data[props.data.length - 1])
 
   return (
     <section
@@ -868,7 +1007,7 @@ function MarketShareSection(props: { data: MarketDay[] }) {
         description={i18n.t("home.marketShareDescription")}
       />
       <Show
-        when={activeDay()}
+        when={today()}
         fallback={<EmptyState title={i18n.t("home.noMarketTitle")} description={i18n.t("home.noMarketDescription")} />}
       >
         {(day) => (
@@ -884,19 +1023,14 @@ function MarketShareSection(props: { data: MarketDay[] }) {
                 setActiveIndex(index)
                 setInspecting(true)
               }}
-              onActiveAuthorChange={(author) => {
-                setActiveAuthor(author)
-                setInspecting(true)
-              }}
+              onActiveAuthorChange={setActiveAuthor}
+              onInspectingChange={setInspecting}
             />
             <MarketShareList
-              data={day().authors}
+              data={rankedMarketAuthors(day())}
               authorOrder={authorOrder()}
               activeAuthor={activeAuthor()}
-              onActiveAuthorChange={(author) => {
-                setActiveAuthor(author)
-                setInspecting(true)
-              }}
+              onActiveAuthorChange={setActiveAuthor}
             />
           </>
         )}
@@ -904,11 +1038,7 @@ function MarketShareSection(props: { data: MarketDay[] }) {
       <div data-slot="market-footer">
         <p>
           <span>[*]</span>
-          <strong>
-            {inspecting()
-              ? formatMarketDate(activeDay(), i18n.t("home.noData"))
-              : formatMarketRange(props.data, i18n.t("home.noData"))}
-          </strong>
+          <strong>{formatMarketDate(today(), i18n.t("home.noData"))}</strong>
         </p>
       </div>
     </section>
@@ -923,10 +1053,15 @@ function MarketShare(props: {
   activeAuthor: string | undefined
   inspecting: boolean
   onActiveIndexChange: (index: number) => void
-  onActiveAuthorChange: (author: string) => void
+  onActiveAuthorChange: (author: string | undefined) => void
+  onInspectingChange: (inspecting: boolean) => void
 }) {
   const i18n = useI18n()
   let chartRef: HTMLDivElement | undefined
+  const inspectDay = (index: number) => {
+    props.onActiveIndexChange(index)
+    props.onActiveAuthorChange(undefined)
+  }
 
   createEffect(() => scrollDenseChartToEnd(chartRef, props.range, props.data.length))
 
@@ -939,6 +1074,10 @@ function MarketShare(props: {
       role="img"
       aria-label={i18n.t("home.marketChart")}
       style={{ "--market-count": props.data.length } as JSX.CSSProperties}
+      onPointerLeave={(event) => {
+        if (event.pointerType === "touch") return
+        props.onInspectingChange(false)
+      }}
     >
       <div data-slot="market-labels">
         <For each={props.data}>
@@ -949,8 +1088,11 @@ function MarketShare(props: {
               data-active={props.inspecting && props.activeIndex === index() ? "true" : undefined}
               data-label-hidden={isColumnLabelHidden(index(), props.data.length) ? "true" : undefined}
               data-mobile-hidden={isMarketMobileLabelHidden(index(), props.data.length) ? "true" : undefined}
-              onClick={() => props.onActiveIndexChange(index())}
-              onPointerEnter={() => props.onActiveIndexChange(index())}
+              aria-describedby={props.inspecting && props.activeIndex === index() ? "market-share-tooltip" : undefined}
+              onBlur={() => props.onInspectingChange(false)}
+              onClick={() => inspectDay(index())}
+              onFocus={() => inspectDay(index())}
+              onPointerEnter={() => inspectDay(index())}
             >
               <span data-slot="market-axis-label">
                 <span data-slot="market-total">{formatTrillions(day.total)}</span>
@@ -970,8 +1112,11 @@ function MarketShare(props: {
               type="button"
               aria-label={`${day.date} ${formatTrillions(day.total)}`}
               data-active={props.inspecting && props.activeIndex === index() ? "true" : undefined}
-              onClick={() => props.onActiveIndexChange(index())}
-              onPointerEnter={() => props.onActiveIndexChange(index())}
+              aria-describedby={props.inspecting && props.activeIndex === index() ? "market-share-tooltip" : undefined}
+              onBlur={() => props.onInspectingChange(false)}
+              onClick={() => inspectDay(index())}
+              onFocus={() => inspectDay(index())}
+              onPointerEnter={() => inspectDay(index())}
             >
               <For each={stackedMarketAuthors(day, props.authorOrder)}>
                 {(item) => (
@@ -1011,6 +1156,45 @@ function MarketShare(props: {
           )}
         </For>
       </div>
+      <Show when={props.inspecting ? props.data[props.activeIndex] : undefined} keyed>
+        {(day) => (
+          <div
+            id="market-share-tooltip"
+            data-component="chart-tooltip"
+            data-placement={props.activeIndex > props.data.length * 0.62 ? "left" : "right"}
+            role="tooltip"
+            style={
+              {
+                "--market-tooltip-left": `${((props.activeIndex + 0.5) / props.data.length) * 100}%`,
+                "--market-tooltip-right": `${100 - ((props.activeIndex + 0.5) / props.data.length) * 100}%`,
+              } as JSX.CSSProperties
+            }
+          >
+            <strong>{day.date}</strong>
+            <span>
+              {formatTrillions(day.total)} {i18n.t("home.total")}
+            </span>
+            <div data-slot="tooltip-divider" />
+            <For each={rankedMarketAuthors(day)}>
+              {(item, index) => (
+                <p
+                  data-active={props.activeAuthor === item.author ? "true" : undefined}
+                  data-muted={
+                    props.activeAuthor !== undefined && props.activeAuthor !== item.author ? "true" : undefined
+                  }
+                >
+                  <span data-slot="tooltip-label">
+                    <i style={{ background: getRankColor(item.author, index(), props.authorOrder, marketColors) }} />
+                    <span data-slot="tooltip-name">{item.author}</span>
+                  </span>
+                  <em>{formatTrillions(item.tokens)}</em>
+                  <b>{item.share.toFixed(1)}%</b>
+                </p>
+              )}
+            </For>
+          </div>
+        )}
+      </Show>
     </div>
   )
 }
@@ -1074,20 +1258,9 @@ function MarketShareList(props: {
 
 function GeoBreakdownSection(props: { data: CountryEntry[] }) {
   const i18n = useI18n()
-  const language = useLanguage()
   const [activeCountry, setActiveCountry] = createSignal<string>()
-  const countryById = createMemo(
-    () =>
-      new Map(
-        props.data.flatMap((country) => {
-          const id = countryNumericId(country.country)
-          return id ? [[id, country] as const] : []
-        }),
-      ),
-  )
   const maxTokens = createMemo(() => Math.max(0, ...props.data.map((country) => country.tokens)) || 1)
   const topCountries = createMemo(() => props.data.slice(0, 15))
-  const active = createMemo(() => props.data.find((country) => country.country === activeCountry()) ?? props.data[0])
 
   return (
     <section
@@ -1099,34 +1272,12 @@ function GeoBreakdownSection(props: { data: CountryEntry[] }) {
       }}
     >
       <SectionBridge label={i18n.t("nav.marketShare").toUpperCase()} href="#market-share" />
-      <SectionTitle id="geo-breakdown" title={i18n.t("home.geoTitle")} description={i18n.t("home.geoDescription")} />
+      <SectionTitle id="geo-breakdown" title={i18n.t("home.geoTitle")} />
       <Show
         when={props.data.length > 0}
         fallback={<EmptyState title={i18n.t("home.noGeoTitle")} description={i18n.t("home.noGeoDescription")} />}
       >
         <div data-component="geo-breakdown">
-          <div data-slot="geo-map-panel">
-            <GeoWorldMap
-              countryById={countryById()}
-              activeCountry={activeCountry()}
-              maxTokens={maxTokens()}
-              onActiveCountryChange={setActiveCountry}
-            />
-            <Show when={active()}>
-              {(country) => (
-                <div data-slot="geo-active-country">
-                  <span>#{String(country().rank).padStart(2, "0")}</span>
-                  <strong>
-                    {formatCountryName(country().country, language.tag(language.locale()), i18n.t("home.unknown"))}
-                  </strong>
-                  <p>
-                    <b>{formatGeoTokens(country().tokens)}</b>
-                    <em>{formatGeoShare(country().share)}</em>
-                  </p>
-                </div>
-              )}
-            </Show>
-          </div>
           <GeoCountryList
             data={topCountries()}
             activeCountry={activeCountry()}
@@ -1136,92 +1287,6 @@ function GeoBreakdownSection(props: { data: CountryEntry[] }) {
         </div>
       </Show>
     </section>
-  )
-}
-
-function GeoWorldMap(props: {
-  countryById: Map<string, CountryEntry>
-  activeCountry: string | undefined
-  maxTokens: number
-  onActiveCountryChange: (country: string | undefined) => void
-}) {
-  const i18n = useI18n()
-  const opacityScale = createMemo(() => scaleSqrt().domain([0, props.maxTokens]).range([0.26, 0.96]).clamp(true))
-  const countryOpacity = (country: CountryEntry | undefined) => {
-    if (!country || country.tokens <= 0) return 0
-    const opacity = opacityScale()(country.tokens)
-    if (props.activeCountry === country.country) return 1
-    if (!props.activeCountry) return opacity
-    return Math.max(0.18, opacity * 0.36)
-  }
-
-  return (
-    <svg
-      data-component="geo-world-map"
-      viewBox={`0 0 ${geoMapWidth} ${geoMapHeight}`}
-      role="img"
-      aria-label={i18n.t("home.worldMap")}
-    >
-      <title>{i18n.t("home.geoMapTitle")}</title>
-      <g data-slot="geo-countries">
-        <For each={worldCountryPaths}>
-          {(country) => {
-            const entry = () => props.countryById.get(country.id)
-            return (
-              <path
-                d={country.path}
-                data-country-id={country.id}
-                data-has-data={entry() ? "true" : undefined}
-                data-active={entry()?.country === props.activeCountry ? "true" : undefined}
-                style={{ "--geo-country-opacity": String(countryOpacity(entry())) } as JSX.CSSProperties}
-                aria-hidden="true"
-                onPointerEnter={() => {
-                  const item = entry()
-                  if (!item) return
-                  props.onActiveCountryChange(item.country)
-                }}
-                onClick={() => {
-                  const item = entry()
-                  if (!item) return
-                  props.onActiveCountryChange(item.country)
-                }}
-              />
-            )
-          }}
-        </For>
-      </g>
-      <g data-slot="geo-country-markers">
-        <For each={worldCountryMarkers}>
-          {(country) => {
-            const entry = () => props.countryById.get(country.id)
-            return (
-              <Show when={entry()}>
-                <circle
-                  cx={country.marker.x}
-                  cy={country.marker.y}
-                  data-country-id={country.id}
-                  r={entry()?.country === props.activeCountry ? 3.4 : 2.4}
-                  data-active={entry()?.country === props.activeCountry ? "true" : undefined}
-                  style={{ "--geo-country-opacity": String(countryOpacity(entry())) } as JSX.CSSProperties}
-                  aria-hidden="true"
-                  onPointerEnter={() => {
-                    const item = entry()
-                    if (!item) return
-                    props.onActiveCountryChange(item.country)
-                  }}
-                  onClick={() => {
-                    const item = entry()
-                    if (!item) return
-                    props.onActiveCountryChange(item.country)
-                  }}
-                />
-              </Show>
-            )
-          }}
-        </For>
-      </g>
-      <path data-slot="geo-borders" d={worldBorderPath} aria-hidden="true" />
-    </svg>
   )
 }
 
@@ -1288,6 +1353,10 @@ function getMarketSegmentColor(author: string, color: string, activeAuthor: stri
   return "var(--stats-bar-idle)"
 }
 
+function rankedMarketAuthors(day: MarketDay) {
+  return day.authors.toSorted((a, b) => b.tokens - a.tokens || a.author.localeCompare(b.author))
+}
+
 function stackedMarketAuthors(day: MarketDay, order: Map<string, number>) {
   return day.authors
     .map((author, index) => ({ author, index }))
@@ -1340,16 +1409,6 @@ function formatTrillions(value: number) {
 function formatMarketDate(day: MarketDay | undefined, fallback: string) {
   if (!day) return fallback
   return formatMarketDateLabel(day.date)
-}
-
-function formatMarketRange(data: MarketDay[], fallback: string) {
-  const first = data[0]?.date
-  const last = data[data.length - 1]?.date
-  if (!first || !last) return fallback
-  const start = marketDateParts(first).start
-  const end = marketDateParts(last).end
-  if (start === end) return formatMarketDateLabel(start)
-  return `${start} ${new Date().getFullYear()} → ${end} ${new Date().getFullYear()}`
 }
 
 function formatMarketDateLabel(label: string) {
@@ -1670,22 +1729,24 @@ function formatSessionCost(value: number) {
   return `$${value.toFixed(4)}`
 }
 
-function homeComparisonPairs(leaderboard: LeaderboardEntry[]) {
+function homeComparisonPairs(leaderboard: LeaderboardEntry[], catalogLabs: readonly string[]) {
   return uniqueComparisonPairs(
     comparisonPairIndexes.flatMap(([firstIndex, secondIndex, detail]) => {
       const first = leaderboard[firstIndex]
       const second = leaderboard[secondIndex]
-      return first && second ? [{ first: leaderboardRef(first), second: leaderboardRef(second), detail }] : []
+      return first && second
+        ? [{ first: leaderboardRef(first, catalogLabs), second: leaderboardRef(second, catalogLabs), detail }]
+        : []
     }),
   )
 }
 
-function leaderboardRef(entry: LeaderboardEntry): ComparisonModelRef {
+function leaderboardRef(entry: LeaderboardEntry, catalogLabs: readonly string[]): ComparisonModelRef {
   return {
     name: entry.model,
     lab: entry.provider,
     slug: modelSlug(entry.model),
-    labName: entry.author,
+    labName: isKnownCatalogLab(entry.provider, catalogLabs) ? entry.author : undefined,
     metric: `#${entry.rank} / ${formatBillions(entry.tokens)}`,
   }
 }
