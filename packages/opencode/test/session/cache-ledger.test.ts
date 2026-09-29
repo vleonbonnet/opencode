@@ -278,6 +278,19 @@ describe("CacheLedger", () => {
     expect(report.reasons[0]).toContain("cache namespace changed (credential, endpoint)")
   })
 
+  test("a namespace switch can hit a prefix another session cached there", async () => {
+    const copilot = (body: Body) =>
+      request("https://api.githubcopilot.com/v1/messages", body, { "x-api-key": "", authorization: "Bearer c" })
+    // Another session already cached the same prefix on copilot.
+    await wire("ses_other", copilot(anthropicBody(turn1)))
+    CacheLedger.observe("ses_other", { input: 3, read: 0, write: 120_000 })
+    await wire(sessionID, request(ANTHROPIC, anthropicBody(turn1)))
+    CacheLedger.observe(sessionID, { input: 3, read: 0, write: 120_000 })
+    const report = CacheLedger.predict(sessionID, copilot(anthropicBody(turn2)))
+    expect(report.status).toBe("hit")
+    expect(report.reasons[0]).toContain("already holds a matching prefix")
+  })
+
   test("expired entries are reported with the idle time", async () => {
     setSystemTime(new Date(Date.now() - 2 * 60 * 60_000))
     try {

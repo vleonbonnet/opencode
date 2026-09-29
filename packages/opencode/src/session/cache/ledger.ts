@@ -349,7 +349,9 @@ export function predict(sessionID: string, request: Captured): Report {
     const moved = describeNamespace(normalized, previous)
     if (moved.length)
       reasons.push(
-        `cache namespace changed (${moved.join(", ")}): caches are not shared across gateways, credentials or affinity`,
+        best
+          ? `cache namespace changed (${moved.join(", ")}), but it already holds a matching prefix from an earlier request`
+          : `cache namespace changed (${moved.join(", ")}): caches are not shared across gateways, credentials or affinity`,
       )
     if (previous.model !== normalized.model)
       reasons.push(`model changed: ${previous.model ?? "?"} -> ${normalized.model ?? "?"}`)
