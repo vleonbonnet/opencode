@@ -1499,6 +1499,23 @@ const scenarios: Scenario[] = [
       }),
     ),
   http.protected
+    .post("/session/{sessionID}/preflight", "session.preflight")
+    .preserveDatabase()
+    .withLlm()
+    .seeded((ctx) => ctx.session({ title: "Preflight session" }))
+    .at((ctx) => ({
+      path: route("/session/{sessionID}/preflight", { sessionID: ctx.state.id }),
+      headers: ctx.headers(),
+      body: { agent: "build", model: { providerID: "test", modelID: "test-model" } },
+    }))
+    .json(200, (body) => {
+      object(body)
+      // A session without observed requests cannot claim cache reuse.
+      check(body.status === "unknown", "preflight without history should be unknown")
+      check(Array.isArray(body.reasons) && body.reasons.length > 0, "preflight should explain its status")
+      check(body.agent === "build", "preflight should report the resolved agent")
+    }),
+  http.protected
     .post("/session/{sessionID}/command", "session.command")
     .preserveDatabase()
     .withLlm()
@@ -1746,6 +1763,7 @@ const llmScenarios = new Set([
   "session.init",
   "session.prompt",
   "session.prompt_async",
+  "session.preflight",
   "session.command",
   "session.summarize",
 ])

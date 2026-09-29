@@ -69,6 +69,7 @@ export const SummarizePayload = Schema.Struct({
 })
 export const PromptPayload = Schema.Struct(Struct.omit(SessionPrompt.PromptInput.fields, ["sessionID"]))
 export const CommandPayload = Schema.Struct(Struct.omit(SessionPrompt.CommandInput.fields, ["sessionID"]))
+export const PreflightPayload = Schema.Struct(Struct.omit(SessionPrompt.PreflightInput.fields, ["sessionID"]))
 export const ShellPayload = Schema.Struct(Struct.omit(SessionPrompt.ShellInput.fields, ["sessionID"]))
 export const RevertPayload = Schema.Struct(Struct.omit(SessionRevert.RevertInput.fields, ["sessionID"]))
 export const PermissionResponsePayload = Schema.Struct({
@@ -94,6 +95,7 @@ export const SessionPaths = {
   summarize: `${root}/:sessionID/summarize`,
   prompt: `${root}/:sessionID/message`,
   promptAsync: `${root}/:sessionID/prompt_async`,
+  preflight: `${root}/:sessionID/preflight`,
   command: `${root}/:sessionID/command`,
   shell: `${root}/:sessionID/shell`,
   revert: `${root}/:sessionID/revert`,
@@ -338,6 +340,20 @@ export const SessionApi = HttpApi.make("session")
             summary: "Send async message",
             description:
               "Create and send a new message to a session asynchronously, starting the session if needed and returning immediately.",
+          }),
+        ),
+        HttpApiEndpoint.post("preflight", SessionPaths.preflight, {
+          params: { sessionID: SessionID },
+          query: WorkspaceRoutingQuery,
+          payload: PreflightPayload,
+          success: described(SessionPrompt.PreflightResult, "Predicted prompt-cache reuse"),
+          error: [HttpApiError.BadRequest, ApiNotFoundError],
+        }).annotateMerge(
+          OpenApi.annotations({
+            identifier: "session.preflight",
+            summary: "Predict prompt-cache reuse",
+            description:
+              "Dry-run the request the next turn would send (same agent, model, tools, system prompt and history) without sending it, and report how much of the provider's prompt cache it reuses.",
           }),
         ),
         HttpApiEndpoint.post("command", SessionPaths.command, {

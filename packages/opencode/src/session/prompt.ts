@@ -59,6 +59,8 @@ import { answerResult } from "@/tool/question"
 import { isRecord } from "@/util/record"
 import { SessionReminders } from "./reminders"
 import { SessionTools } from "./tools"
+import { Wire } from "./cache/wire"
+import { CacheLedger } from "./cache/ledger"
 import { LLMEvent } from "@opencode-ai/llm"
 
 // @ts-ignore
@@ -111,6 +113,11 @@ export interface Interface {
   readonly command: (input: CommandInput) => Effect.Effect<SessionV1.WithParts, Image.Error>
   readonly resolvePromptParts: (template: string) => Effect.Effect<PromptInput["parts"]>
   /**
+   * Predict how much of the provider's prompt cache the next turn reuses, by
+   * dry-running the exact request that turn would send. Nothing is stored.
+   */
+  readonly preflight: (input: PreflightInput) => Effect.Effect<PreflightResult>
+  /**
    * Re-ask questions orphaned by a previous server process and resume their
    * turns once answered.  Runs once per instance, before it serves requests.
    */
@@ -159,6 +166,219 @@ const layer = Layer.effect(
         resolvePromptParts: (template: string) => resolvePromptParts(template),
         prompt: (input: PromptInput) => prompt(input).pipe(Effect.catch(Effect.die)),
       } satisfies TaskPromptOps
+    })
+
+    const applyReminders = (input: {
+      messages: SessionV1.WithParts[]
+      agent: Agent.Info
+      session: Session.Info
+      persist: boolean
+    }) =>
+      SessionReminders.apply(input).pipe(
+        Effect.provideService(RuntimeFlags.Service, flags),
+        Effect.provideService(FSUtil.Service, fsys),
+        Effect.provideService(Session.Service, sessions),
+      )
+
+    // Builds the LLM request for one loop step from the (reminder-applied)
+    // history. The loop and preflight both use it, so a preflight dry run is
+    // the exact request the next turn sends.
+    const turnRequest = Effect.fn("SessionPrompt.turnRequest")(function* (input: {
+      session: Session.Info
+      msgs: SessionV1.WithParts[]
+      lastUser: SessionV1.User
+      agent: Agent.Info
+      model: Provider.Model
+      step: number
+      processor: Pick<SessionProcessor.Handle, "message" | "updateToolCall" | "completeToolCall">
+      onStructured: (output: unknown) => void
+    }) {
+      const { session, msgs, lastUser, agent, model } = input
+      const isLastStep = input.step >= (agent.steps ?? Infinity)
+      const lastUserMsg = msgs.findLast((m) => m.info.role === "user")
+      const bypassAgentCheck = lastUserMsg?.parts.some((p) => p.type === "agent") ?? false
+      const promptOps = yield* ops()
+
+      const tools = yield* SessionTools.resolve({
+        agent,
+        session,
+        model,
+        processor: input.processor,
+        bypassAgentCheck,
+        messages: msgs,
+        promptOps,
+      }).pipe(
+        Effect.provideService(Plugin.Service, plugin),
+        Effect.provideService(Permission.Service, permission),
+        Effect.provideService(ToolRegistry.Service, registry),
+        Effect.provideService(MCP.Service, mcp),
+        Effect.provideService(Truncate.Service, truncate),
+        Effect.provideService(RuntimeFlags.Service, flags),
+      )
+
+      if (lastUser.format?.type === "json_schema") {
+        tools["StructuredOutput"] = createStructuredOutputTool({
+          schema: lastUser.format.schema,
+          onSuccess: input.onStructured,
+        })
+      }
+
+      yield* plugin.trigger("experimental.chat.messages.transform", {}, { messages: msgs })
+
+      const [skills, env, instructions, mcpInstructions, modelMsgs] = yield* Effect.all([
+        sys.skills(agent),
+        sys.environment(model),
+        instruction.system().pipe(Effect.orDie),
+        sys.mcp(agent, session.permission),
+        MessageV2.toModelMessagesEffect(msgs, model),
+      ])
+      const system = [
+        ...env,
+        ...instructions,
+        ...(mcpInstructions ? [mcpInstructions] : []),
+        ...(skills ? [skills] : []),
+      ]
+      const format = lastUser.format ?? { type: "text" as const }
+      if (format.type === "json_schema") system.push(STRUCTURED_OUTPUT_SYSTEM_PROMPT)
+      return {
+        user: lastUser,
+        agent,
+        permission: session.permission,
+        sessionID: session.id,
+        parentSessionID: session.parentID,
+        system,
+        messages: [...modelMsgs, ...(isLastStep ? [{ role: "assistant" as const, content: MAX_STEPS_PROMPT }] : [])],
+        tools,
+        model,
+        toolChoice: format.type === "json_schema" ? ("required" as const) : undefined,
+      } satisfies LLM.StreamInput
+    })
+
+    const preflight = Effect.fn("SessionPrompt.preflight")(function* (input: PreflightInput) {
+      const sessionID = input.sessionID
+      const unknown = (reason: string, extra?: { agent?: string; model?: { providerID: string; modelID: string } }) =>
+        ({ ...CacheLedger.unknown(sessionID, reason), ...preflightTarget(extra) }) satisfies PreflightResult
+      const session = yield* sessions.get(sessionID).pipe(Effect.orDie)
+
+      // Resolve the agent and model exactly as prompt() / command() would.
+      let target: Pick<PromptInput, "agent" | "model" | "variant"> = {
+        agent: input.agent,
+        model: input.model,
+        variant: input.variant,
+      }
+      if (input.command) {
+        const cmd = yield* commands.get(input.command)
+        if (!cmd) return unknown(`command not found: ${input.command}`)
+        const commandInput = {
+          sessionID,
+          agent: input.agent,
+          model: input.model ? `${input.model.providerID}/${input.model.modelID}` : undefined,
+        }
+        const agentName = cmd.agent ?? input.agent
+        const taskModel = yield* commandTaskModel(cmd, commandInput)
+        const agent = agentName ? yield* agents.get(agentName) : yield* agents.defaultInfo()
+        if (!agent) return unknown(`agent not found: ${agentName}`)
+        const isSubtask = commandIsSubtask(cmd, agent)
+        const { userAgent, userModel } = yield* commandUserTarget({ input: commandInput, agent, taskModel, isSubtask })
+        target = { agent: userAgent, model: userModel, variant: input.variant }
+      }
+      const resolved = yield* resolveUserTarget({ sessionID, ...target })
+      if (!resolved.ok) return unknown(resolved.error.message)
+      const targetInfo = {
+        agent: resolved.agent.name,
+        model: { providerID: resolved.model.providerID, modelID: resolved.model.modelID },
+      }
+
+      // prompt() turns per-message tool toggles into session permissions.
+      const toggles = Object.entries(input.tools ?? {}).map(
+        ([t, enabled]): PermissionV1.Rule => ({ permission: t, action: enabled ? "allow" : "deny", pattern: "*" }),
+      )
+      const view: Session.Info = toggles.length ? { ...session, permission: toggles } : session
+
+      // History as the loop will load it, after prompt() applies a pending revert.
+      const loaded = yield* MessageV2.filterCompactedEffect(sessionID).pipe(
+        Effect.provideService(Database.Service, database),
+      )
+      const info: SessionV1.User = {
+        id: MessageID.ascending(),
+        role: "user",
+        sessionID,
+        time: { created: Date.now() },
+        tools: input.tools,
+        agent: resolved.agent.name,
+        model: { providerID: resolved.model.providerID, modelID: resolved.model.modelID, variant: resolved.variant },
+        system: input.system,
+        format: input.format,
+      }
+      // The new message's own content only affects the uncached tail.
+      const placeholder: SessionV1.TextPart = {
+        id: PartID.ascending(),
+        messageID: info.id,
+        sessionID,
+        type: "text",
+        text: "(preflight)",
+      }
+      let msgs: SessionV1.WithParts[] = [...revertView(loaded, session.revert), { info, parts: [placeholder] }]
+
+      // Decisions the loop takes before its first request of a turn.
+      const { finished: lastFinished, tasks } = MessageV2.latest(msgs)
+      const modelExit = yield* provider.getModel(resolved.model.providerID, resolved.model.modelID).pipe(Effect.exit)
+      if (Exit.isFailure(modelExit)) return unknown(`model not available: ${Cause.pretty(modelExit.cause)}`, targetInfo)
+      const model = modelExit.value
+      const pendingTask = tasks.at(-1)
+      if (pendingTask?.type === "compaction")
+        return unknown("a pending compaction runs before the next request", targetInfo)
+      if (
+        lastFinished &&
+        lastFinished.summary !== true &&
+        (yield* compaction.isOverflow({ tokens: lastFinished.tokens, model }))
+      )
+        return unknown("the context overflows the model window; the next turn starts with compaction", targetInfo)
+
+      const agent = resolved.agent
+      msgs = yield* applyReminders({ messages: msgs, agent, session: view, persist: false })
+      const assistant: SessionV1.Assistant = {
+        id: MessageID.ascending(),
+        parentID: info.id,
+        role: "assistant",
+        mode: agent.name,
+        agent: agent.name,
+        variant: info.model.variant,
+        path: { cwd: (yield* InstanceState.context).directory, root: (yield* InstanceState.context).worktree },
+        cost: 0,
+        tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+        modelID: model.id,
+        providerID: model.providerID,
+        time: { created: Date.now() },
+        sessionID,
+      }
+      const request = yield* turnRequest({
+        session: view,
+        msgs,
+        lastUser: info,
+        agent,
+        model,
+        step: 1,
+        processor: {
+          message: assistant,
+          updateToolCall: () => Effect.die(new Error("preflight never executes tools")),
+          completeToolCall: () => Effect.die(new Error("preflight never executes tools")),
+        },
+        onStructured: () => {},
+      })
+      const id = Wire.nextID()
+      const exit = yield* llm.stream({ ...request, wire: { mode: "dryrun", id } }).pipe(Stream.runDrain, Effect.exit)
+      const captured = Wire.take(id)
+      if (!captured) {
+        const why = Exit.isFailure(exit) ? Cause.pretty(exit.cause) : "the request completed without reaching fetch"
+        return unknown(`dry run did not reach the network layer: ${why}`, targetInfo)
+      }
+      const report = CacheLedger.predict(sessionID, captured)
+      return {
+        ...report,
+        reasons: pendingTask?.type === "subtask" ? [...report.reasons, "a pending subtask runs first"] : report.reasons,
+        ...preflightTarget(targetInfo),
+      } satisfies PreflightResult
     })
 
     const cancel = Effect.fn("SessionPrompt.cancel")(function* (sessionID: SessionID) {
@@ -645,15 +865,20 @@ const layer = Layer.effect(
       return yield* provider.defaultModel().pipe(Effect.orDie)
     })
 
-    const createUserMessage = Effect.fn("SessionPrompt.createUserMessage")(function* (input: PromptInput) {
+    // Agent, model and variant a new user message runs with. Shared by
+    // createUserMessage and preflight so a preflight predicts the same turn.
+    const resolveUserTarget = Effect.fn("SessionPrompt.resolveUserTarget")(function* (
+      input: Pick<PromptInput, "sessionID" | "agent" | "model" | "variant">,
+    ) {
       const agentName = input.agent
       const ag = agentName ? yield* agents.get(agentName) : yield* agents.defaultInfo()
       if (!ag) {
         const available = (yield* agents.list()).filter((a) => !a.hidden).map((a) => a.name)
         const hint = available.length ? ` Available agents: ${available.join(", ")}` : ""
-        const error = new NamedError.Unknown({ message: `Agent not found: "${agentName}".${hint}` })
-        yield* events.publish(Session.Event.Error, { sessionID: input.sessionID, error: error.toObject() })
-        throw error
+        return {
+          ok: false,
+          error: new NamedError.Unknown({ message: `Agent not found: "${agentName}".${hint}` }),
+        } as const
       }
 
       const model = input.model ?? ag.model ?? (yield* currentModel(input.sessionID))
@@ -665,6 +890,16 @@ const layer = Layer.effect(
               .pipe(Effect.catchIf(Provider.ModelNotFoundError.isInstance, () => Effect.succeed(undefined)))
           : undefined
       const variant = input.variant ?? (ag.variant && full?.variants?.[ag.variant] ? ag.variant : undefined)
+      return { ok: true, agent: ag, model, variant } as const
+    })
+
+    const createUserMessage = Effect.fn("SessionPrompt.createUserMessage")(function* (input: PromptInput) {
+      const target = yield* resolveUserTarget(input)
+      if (!target.ok) {
+        yield* events.publish(Session.Event.Error, { sessionID: input.sessionID, error: target.error.toObject() })
+        throw target.error
+      }
+      const { agent: ag, model, variant } = target
 
       const info: SessionV1.User = {
         id: input.messageID ?? MessageID.ascending(),
@@ -1188,13 +1423,7 @@ const layer = Layer.effect(
             yield* events.publish(Session.Event.Error, { sessionID, error: error.toObject() })
             throw error
           }
-          const maxSteps = agent.steps ?? Infinity
-          const isLastStep = step >= maxSteps
-          msgs = yield* SessionReminders.apply({ messages: msgs, agent, session }).pipe(
-            Effect.provideService(RuntimeFlags.Service, flags),
-            Effect.provideService(FSUtil.Service, fsys),
-            Effect.provideService(Session.Service, sessions),
-          )
+          msgs = yield* applyReminders({ messages: msgs, agent, session, persist: true })
 
           const msg: SessionV1.Assistant = {
             id: MessageID.ascending(),
@@ -1232,71 +1461,24 @@ const layer = Layer.effect(
             .pipe(Effect.onInterrupt(() => finalizeInterruptedAssistant))
 
           const outcome: "break" | "continue" = yield* Effect.gen(function* () {
-            const lastUserMsg = msgs.findLast((m) => m.info.role === "user")
-            const bypassAgentCheck = lastUserMsg?.parts.some((p) => p.type === "agent") ?? false
-            const promptOps = yield* ops()
-
-            const tools = yield* SessionTools.resolve({
-              agent,
-              session,
-              model,
-              processor: handle,
-              bypassAgentCheck,
-              messages: msgs,
-              promptOps,
-            }).pipe(
-              Effect.provideService(Plugin.Service, plugin),
-              Effect.provideService(Permission.Service, permission),
-              Effect.provideService(ToolRegistry.Service, registry),
-              Effect.provideService(MCP.Service, mcp),
-              Effect.provideService(Truncate.Service, truncate),
-              Effect.provideService(RuntimeFlags.Service, flags),
-            )
-
-            if (lastUser.format?.type === "json_schema") {
-              tools["StructuredOutput"] = createStructuredOutputTool({
-                schema: lastUser.format.schema,
-                onSuccess(output) {
-                  structured = output
-                },
-              })
-            }
-
+            const format = lastUser.format ?? { type: "text" as const }
             if (step === 1)
               yield* summary.summarize({ sessionID, messageID: lastUser.id }).pipe(Effect.ignore, Effect.forkIn(scope))
 
-            yield* plugin.trigger("experimental.chat.messages.transform", {}, { messages: msgs })
-
-            const [skills, env, instructions, mcpInstructions, modelMsgs] = yield* Effect.all([
-              sys.skills(agent),
-              sys.environment(model),
-              instruction.system().pipe(Effect.orDie),
-              sys.mcp(agent, session.permission),
-              MessageV2.toModelMessagesEffect(msgs, model),
-            ])
-            const system = [
-              ...env,
-              ...instructions,
-              ...(mcpInstructions ? [mcpInstructions] : []),
-              ...(skills ? [skills] : []),
-            ]
-            const format = lastUser.format ?? { type: "text" as const }
-            if (format.type === "json_schema") system.push(STRUCTURED_OUTPUT_SYSTEM_PROMPT)
-            const result = yield* handle.process({
-              user: lastUser,
-              agent,
-              permission: session.permission,
-              sessionID,
-              parentSessionID: session.parentID,
-              system,
-              messages: [
-                ...modelMsgs,
-                ...(isLastStep ? [{ role: "assistant" as const, content: MAX_STEPS_PROMPT }] : []),
-              ],
-              tools,
-              model,
-              toolChoice: format.type === "json_schema" ? "required" : undefined,
-            })
+            const result = yield* handle.process(
+              yield* turnRequest({
+                session,
+                msgs,
+                lastUser,
+                agent,
+                model,
+                step,
+                processor: handle,
+                onStructured(output) {
+                  structured = output
+                },
+              }),
+            )
 
             if (structured !== undefined) {
               handle.message.structured = structured
@@ -1533,6 +1715,40 @@ const layer = Layer.effect(
       return yield* state.startShell(input.sessionID, lastAssistant(input.sessionID), shellImpl(input, ready), ready)
     })
 
+    // Command target resolution, shared by command and preflight.
+    const commandTaskModel = Effect.fn("SessionPrompt.commandTaskModel")(function* (
+      cmd: Command.Info,
+      input: Pick<CommandInput, "model" | "sessionID">,
+    ) {
+      if (cmd.model) return Provider.parseModel(cmd.model)
+      if (cmd.agent) {
+        const cmdAgent = yield* agents.get(cmd.agent)
+        if (cmdAgent?.model) return cmdAgent.model
+      }
+      if (input.model) return Provider.parseModel(input.model)
+      return yield* currentModel(input.sessionID)
+    })
+
+    const commandIsSubtask = (cmd: Command.Info, agent: Agent.Info) =>
+      (agent.mode === "subagent" && cmd.subtask !== false) || cmd.subtask === true
+
+    const commandUserTarget = Effect.fn("SessionPrompt.commandUserTarget")(function* (target: {
+      input: Pick<CommandInput, "agent" | "model" | "sessionID">
+      agent: Agent.Info
+      taskModel: { providerID: ProviderV2.ID; modelID: ModelV2.ID }
+      isSubtask: boolean
+    }) {
+      const userAgent = target.isSubtask
+        ? (target.input.agent ?? (yield* agents.defaultInfo()).name)
+        : target.agent.name
+      const userModel = target.isSubtask
+        ? target.input.model
+          ? Provider.parseModel(target.input.model)
+          : yield* currentModel(target.input.sessionID)
+        : target.taskModel
+      return { userAgent, userModel }
+    })
+
     const command = Effect.fn("SessionPrompt.command")(function* (input: CommandInput) {
       yield* Effect.logInfo("command", {
         "session.id": input.sessionID,
@@ -1588,15 +1804,7 @@ const layer = Layer.effect(
       }
       template = template.trim()
 
-      const taskModel = yield* Effect.gen(function* () {
-        if (cmd.model) return Provider.parseModel(cmd.model)
-        if (cmd.agent) {
-          const cmdAgent = yield* agents.get(cmd.agent)
-          if (cmdAgent?.model) return cmdAgent.model
-        }
-        if (input.model) return Provider.parseModel(input.model)
-        return yield* currentModel(input.sessionID)
-      })
+      const taskModel = yield* commandTaskModel(cmd, input)
 
       yield* getModel(taskModel.providerID, taskModel.modelID, input.sessionID)
 
@@ -1616,7 +1824,7 @@ const layer = Layer.effect(
       const uniqueTemplateParts = templateParts.filter(
         (part) => part.type !== "file" || !inputFiles.has(fileURLToPath(part.url)),
       )
-      const isSubtask = (agent.mode === "subagent" && cmd.subtask !== false) || cmd.subtask === true
+      const isSubtask = commandIsSubtask(cmd, agent)
       const parts = isSubtask
         ? [
             {
@@ -1630,12 +1838,7 @@ const layer = Layer.effect(
           ]
         : [...uniqueTemplateParts, ...(input.parts ?? [])]
 
-      const userAgent = isSubtask ? (input.agent ?? (yield* agents.defaultInfo()).name) : agent.name
-      const userModel = isSubtask
-        ? input.model
-          ? Provider.parseModel(input.model)
-          : yield* currentModel(input.sessionID)
-        : taskModel
+      const { userAgent, userModel } = yield* commandUserTarget({ input, agent, taskModel, isSubtask })
 
       yield* plugin.trigger(
         "command.execute.before",
@@ -1667,6 +1870,7 @@ const layer = Layer.effect(
       shell,
       command,
       resolvePromptParts,
+      preflight,
       recover,
     })
   }),
@@ -1676,6 +1880,80 @@ const ModelRef = Schema.Struct({
   providerID: ProviderV2.ID,
   modelID: ModelV2.ID,
 })
+
+/** Messages as they remain after SessionRevert.cleanup applies REVERT. */
+function revertView(msgs: SessionV1.WithParts[], revert: Session.Info["revert"]): SessionV1.WithParts[] {
+  if (!revert) return msgs
+  const index = msgs.findIndex((msg) => msg.info.id === revert.messageID)
+  if (index < 0) return msgs
+  if (!revert.partID) return msgs.slice(0, index)
+  const target = msgs[index]
+  const cut = target.parts.findIndex((part) => part.id === revert.partID)
+  return [...msgs.slice(0, index), cut >= 0 ? { ...target, parts: target.parts.slice(0, cut) } : target]
+}
+
+function preflightTarget(target?: { agent?: string; model?: { providerID: string; modelID: string } }) {
+  return {
+    ...(target?.agent ? { agent: target.agent } : {}),
+    ...(target?.model ? { providerID: target.model.providerID, modelID: target.model.modelID } : {}),
+  }
+}
+
+export const PreflightInput = Schema.Struct({
+  sessionID: SessionID,
+  model: Schema.optional(ModelRef),
+  agent: Schema.optional(Schema.String),
+  variant: Schema.optional(Schema.String),
+  tools: Schema.optional(Schema.Record(Schema.String, Schema.Boolean)),
+  format: Schema.optional(SessionV1.Format),
+  system: Schema.optional(Schema.String),
+  /** Predict for a slash command instead of a plain prompt. */
+  command: Schema.optional(Schema.String),
+})
+export type PreflightInput = Schema.Schema.Type<typeof PreflightInput>
+
+const CacheVerification = Schema.Struct({
+  time: Schema.Number,
+  predicted: Schema.Number,
+  actual: Schema.Number,
+  written: Schema.Number,
+  prompt: Schema.Number,
+  ok: Schema.Boolean,
+})
+
+export const PreflightResult = Schema.Struct({
+  status: Schema.Literals(["hit", "partial", "miss", "unknown"]),
+  format: Schema.String,
+  model: Schema.optional(Schema.String),
+  agent: Schema.optional(Schema.String),
+  providerID: Schema.optional(Schema.String),
+  modelID: Schema.optional(Schema.String),
+  previous: Schema.optional(
+    Schema.Struct({
+      time: Schema.Number,
+      promptTokens: Schema.Number,
+      model: Schema.optional(Schema.String),
+      ageMs: Schema.Number,
+    }),
+  ),
+  reusableTokens: Schema.Number,
+  reusableExact: Schema.Boolean,
+  lostTokens: Schema.Number,
+  reasons: Schema.Array(Schema.String),
+  divergence: Schema.optional(
+    Schema.Struct({
+      index: Schema.Number,
+      path: Schema.String,
+      label: Schema.String,
+      excerpt: Schema.String,
+      previousPath: Schema.optional(Schema.String),
+      previousLabel: Schema.optional(Schema.String),
+      previousExcerpt: Schema.optional(Schema.String),
+    }),
+  ),
+  verification: Schema.optional(Schema.Array(CacheVerification)),
+}).annotate({ identifier: "SessionPreflight" })
+export type PreflightResult = Schema.Schema.Type<typeof PreflightResult>
 
 export const PromptInput = Schema.Struct({
   sessionID: SessionID,

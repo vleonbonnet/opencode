@@ -54,6 +54,8 @@ import { Format } from "../../src/format"
 import { TestInstance } from "../fixture/fixture"
 import { awaitWithTimeout, pollWithTimeout, testEffect } from "../lib/effect"
 import { reply, TestLLMServer } from "../lib/llm-server"
+import { Wire } from "../../src/session/cache/wire"
+import { CacheLedger } from "../../src/session/cache/ledger"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
@@ -557,6 +559,76 @@ it.instance("loop calls LLM and returns assistant message", () =>
 
 const mainHits = <T extends { body: Record<string, unknown> }>(hits: T[]) =>
   hits.filter((hit) => !JSON.stringify(hit.body).includes("Generate a title for this conversation"))
+
+it.instance("preflight dry-runs the exact next request without sending or storing anything", () => {
+  const captures: { mode: string; body: Record<string, any> }[] = []
+  const off = Wire.onCapture((tag, request) =>
+    captures.push({ mode: tag.mode, body: JSON.parse(request.body ?? "{}") }),
+  )
+  return Effect.gen(function* () {
+    CacheLedger.reset()
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const chat = yield* sessions.create({
+      title: "Pinned",
+      permission: [{ permission: "*", pattern: "*", action: "allow" }],
+    })
+
+    const empty = yield* prompt.preflight({ sessionID: chat.id, agent: "build", model: ref })
+    expect(empty.status).toBe("unknown")
+
+    yield* prompt.prompt({
+      sessionID: chat.id,
+      agent: "build",
+      model: ref,
+      noReply: true,
+      parts: [{ type: "text", text: "hello" }],
+    })
+    yield* llm.text("world", { usage: { input: 5000, output: 10 } })
+    yield* prompt.loop({ sessionID: chat.id })
+    const stored = (yield* sessions.messages({ sessionID: chat.id })).length
+    const sent = mainHits(yield* llm.hits).length
+
+    const report = yield* prompt.preflight({ sessionID: chat.id, agent: "build", model: ref })
+    expect(report.status).toBe("hit")
+    expect(report.reusableTokens).toBe(5000)
+    expect(report.lostTokens).toBe(0)
+    expect(report.agent).toBe("build")
+    // Nothing reached the provider and nothing was stored.
+    expect(mainHits(yield* llm.hits)).toHaveLength(sent)
+    expect(yield* sessions.messages({ sessionID: chat.id })).toHaveLength(stored)
+
+    // A different agent exposes different tools: the dry run sees it.
+    const plan = yield* prompt.preflight({ sessionID: chat.id, agent: "plan", model: ref })
+    expect(plan.reusableTokens).toBeLessThan(5000)
+    expect(plan.reasons.some((reason) => reason.includes("diverges"))).toBe(true)
+
+    yield* prompt.prompt({
+      sessionID: chat.id,
+      agent: "build",
+      model: ref,
+      noReply: true,
+      parts: [{ type: "text", text: "second" }],
+    })
+    yield* llm.text("again", { usage: { input: 5100, output: 5, cached: 5000 } })
+    yield* prompt.loop({ sessionID: chat.id })
+
+    const hits = mainHits(yield* llm.hits)
+    const real = hits.at(-1)!.body as Record<string, any>
+    const dry = captures.filter((item) => item.mode === "dryrun")[1].body
+    // Byte-identical request except the new user message's own content.
+    const head = (body: Record<string, any>) => ({ ...body, messages: body.messages.slice(0, -1) })
+    expect(head(dry)).toEqual(head(real))
+    expect(dry.messages.at(-1).role).toBe("user")
+    expect(hits.every((hit) => hit.headers[Wire.HEADER] === undefined)).toBe(true)
+
+    // The provider-reported read confirms the prediction.
+    const next = yield* prompt.preflight({ sessionID: chat.id, agent: "build", model: ref })
+    expect(next.verification?.at(-1)).toMatchObject({ predicted: 5000, actual: 5000, ok: true })
+    expect(next.status).toBe("hit")
+  }).pipe(Effect.ensuring(Effect.sync(off)))
+})
 
 it.instance("mode reminders stay on the user message they were sent with", () =>
   Effect.gen(function* () {

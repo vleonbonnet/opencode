@@ -29,6 +29,10 @@ import * as OtelTracer from "@effect/opentelemetry/Tracer"
 import { LLMAISDK } from "./llm/ai-sdk"
 import { LLMNativeRuntime } from "./llm/native-runtime"
 import { LLMRequestPrep } from "./llm/request"
+import { Wire } from "./cache/wire"
+import { CacheLedger } from "./cache/ledger"
+import { Global } from "@opencode-ai/core/global"
+import path from "path"
 
 export const OUTPUT_TOKEN_MAX = ProviderTransform.OUTPUT_TOKEN_MAX
 
@@ -45,6 +49,12 @@ export type StreamInput = {
   tools: Record<string, Tool>
   retries?: number
   toolChoice?: "auto" | "required" | "none"
+  /**
+   * Wire tagging for prompt-cache accounting. Session requests are tagged
+   * `send` by default; `dryrun` captures the exact request body and aborts it
+   * before it reaches the network (see SessionPrompt.preflight).
+   */
+  wire?: { mode: Wire.Mode; id: string }
 }
 
 export type StreamRequest = StreamInput & {
@@ -82,6 +92,9 @@ const live: Layer.Layer<
     const llmClient = yield* LLMClient.Service
     const flags = yield* RuntimeFlags.Service
 
+    Wire.install()
+    CacheLedger.configure({ file: path.join(Global.Path.data, "cache-ledger.json") })
+
     const run = Effect.fn("LLM.run")(function* (input: StreamRequest) {
       yield* Effect.logInfo("stream", {
         providerID: input.model.providerID,
@@ -111,6 +124,16 @@ const live: Layer.Layer<
         flags,
         isWorkflow,
       })
+      // Small-model utility calls (titles, summaries) do not share the
+      // session prompt, so only session requests are tagged for the ledger.
+      const wireHeaders =
+        input.small && !input.wire
+          ? {}
+          : Wire.header({
+              mode: input.wire?.mode ?? "send",
+              id: input.wire?.id ?? Wire.nextID(),
+              sessionID: input.sessionID,
+            })
 
       // Wire up toolExecutor for DWS workflow models so that tool calls
       // from the workflow service are executed via opencode's tool system
@@ -237,7 +260,7 @@ const live: Layer.Layer<
           topK: prepared.params.topK,
           maxOutputTokens: prepared.params.maxOutputTokens,
           providerOptions: prepared.params.options,
-          headers: prepared.headers,
+          headers: { ...prepared.headers, ...wireHeaders },
           abort: input.abort,
         })
         if (native.type === "supported") {
@@ -279,6 +302,7 @@ const live: Layer.Layer<
         type: "ai-sdk" as const,
         result: streamText({
           onError(error) {
+            if (Wire.isDryRunCaptured(error.error)) return
             bridge.fork(
               Effect.logError("stream error", {
                 providerID: input.model.providerID,
@@ -319,8 +343,8 @@ const live: Layer.Layer<
           toolChoice: input.toolChoice,
           maxOutputTokens: prepared.params.maxOutputTokens,
           abortSignal: input.abort,
-          headers: prepared.headers,
-          maxRetries: input.retries ?? 0,
+          headers: { ...prepared.headers, ...wireHeaders },
+          maxRetries: input.wire?.mode === "dryrun" ? 0 : (input.retries ?? 0),
           messages: prepared.messages,
           model: wrapLanguageModel({
             model: language,

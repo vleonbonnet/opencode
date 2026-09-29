@@ -24,6 +24,7 @@ import { HttpApiBuilder, HttpApiError, HttpApiSchema } from "effect/unstable/htt
 import { InstanceHttpApi } from "../api"
 import {
   CommandPayload,
+  PreflightPayload,
   DiffQuery,
   ForkPayload,
   InitPayload,
@@ -328,6 +329,14 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
       return HttpApiSchema.NoContent.make()
     })
 
+    const preflight = Effect.fn("SessionHttpApi.preflight")(function* (ctx: {
+      params: { sessionID: SessionID }
+      payload: typeof PreflightPayload.Type
+    }) {
+      yield* requireSession(ctx.params.sessionID)
+      return yield* promptSvc.preflight({ ...ctx.payload, sessionID: ctx.params.sessionID })
+    })
+
     const command = Effect.fn("SessionHttpApi.command")(function* (ctx: {
       params: { sessionID: SessionID }
       payload: typeof CommandPayload.Type
@@ -430,6 +439,7 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
       .handle("summarize", summarize)
       .handle("prompt", prompt)
       .handle("promptAsync", promptAsync)
+      .handle("preflight", preflight)
       .handle("command", command)
       .handle("shell", shell)
       .handle("revert", revert)

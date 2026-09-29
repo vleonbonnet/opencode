@@ -2033,6 +2033,12 @@ export type Config = {
     preserve_recent_tokens?: number
     reserved?: number
   }
+  retention?: {
+    /**
+     * Delete durable event history and make event replay unavailable for sessions idle longer than this many days
+     */
+    event_idle_days?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+  }
   experimental?: {
     disable_paste_summary?: boolean
     batch_tool?: boolean
@@ -2608,6 +2614,42 @@ export type SubtaskPartInput = {
     modelID: string
   }
   command?: string
+}
+
+export type SessionPreflight = {
+  status: "hit" | "partial" | "miss" | "unknown"
+  format: string
+  model?: string
+  agent?: string
+  providerID?: string
+  modelID?: string
+  previous?: {
+    time: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+    promptTokens: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+    model?: string
+    ageMs: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+  }
+  reusableTokens: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+  reusableExact: boolean
+  lostTokens: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+  reasons: Array<string>
+  divergence?: {
+    index: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+    path: string
+    label: string
+    excerpt: string
+    previousPath?: string
+    previousLabel?: string
+    previousExcerpt?: string
+  }
+  verification?: Array<{
+    time: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+    predicted: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+    actual: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+    written: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+    prompt: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+    ok: boolean
+  }>
 }
 
 export type SessionBusyError = {
@@ -10229,6 +10271,53 @@ export type SessionPromptAsyncResponses = {
 }
 
 export type SessionPromptAsyncResponse = SessionPromptAsyncResponses[keyof SessionPromptAsyncResponses]
+
+export type SessionPreflightData = {
+  body?: {
+    model?: {
+      providerID: string
+      modelID: string
+    }
+    agent?: string
+    variant?: string
+    tools?: {
+      [key: string]: boolean
+    }
+    format?: OutputFormat
+    system?: string
+    command?: string
+  }
+  path: {
+    sessionID: string
+  }
+  query?: {
+    directory?: string
+    workspace?: string
+  }
+  url: "/session/{sessionID}/preflight"
+}
+
+export type SessionPreflightErrors = {
+  /**
+   * BadRequest | InvalidRequestError
+   */
+  400: EffectHttpApiErrorBadRequest | InvalidRequestError
+  /**
+   * NotFoundError
+   */
+  404: NotFoundError
+}
+
+export type SessionPreflightError = SessionPreflightErrors[keyof SessionPreflightErrors]
+
+export type SessionPreflightResponses = {
+  /**
+   * Predicted prompt-cache reuse
+   */
+  200: SessionPreflight
+}
+
+export type SessionPreflightResponse = SessionPreflightResponses[keyof SessionPreflightResponses]
 
 export type SessionCommandData = {
   body?: {

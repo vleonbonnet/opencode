@@ -4,7 +4,7 @@ import { Deferred, Effect, Layer, Context, Stream } from "effect"
 import * as HttpServer from "effect/unstable/http/HttpServer"
 import { HttpRouter, HttpServerRequest, HttpServerResponse } from "effect/unstable/http"
 
-export type Usage = { input: number; output: number }
+export type Usage = { input: number; output: number; cached?: number }
 
 type Line = Record<string, unknown>
 
@@ -18,6 +18,7 @@ type Flow =
 type Hit = {
   url: URL
   body: Record<string, unknown>
+  headers: Record<string, string>
 }
 
 type Match = (hit: Hit) => boolean
@@ -63,6 +64,7 @@ function tokens(input?: Usage) {
     prompt_tokens: input.input,
     completion_tokens: input.output,
     total_tokens: input.input + input.output,
+    ...(input.cached !== undefined ? { prompt_tokens_details: { cached_tokens: input.cached } } : {}),
   }
 }
 
@@ -597,10 +599,11 @@ function item(input: Item | Reply) {
   return input instanceof Reply ? input.item() : input
 }
 
-function hit(url: string, body: unknown) {
+function hit(url: string, body: unknown, headers: Record<string, string> = {}) {
   return {
     url: new URL(url, "http://localhost"),
     body: body && typeof body === "object" ? (body as Record<string, unknown>) : {},
+    headers,
   } satisfies Hit
 }
 
@@ -672,7 +675,7 @@ export class TestLLMServer extends Context.Service<TestLLMServer, TestLLMServer.
       const handle = Effect.fn("TestLLMServer.handle")(function* (mode: "chat" | "responses") {
         const req = yield* HttpServerRequest.HttpServerRequest
         const body = yield* req.json.pipe(Effect.orElseSucceed(() => ({})))
-        const current = hit(req.originalUrl, body)
+        const current = hit(req.originalUrl, body, { ...req.headers })
         if (isTitleRequest(body)) {
           hits = [...hits, current]
           yield* notify()
