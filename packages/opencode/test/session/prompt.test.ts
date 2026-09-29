@@ -555,6 +555,57 @@ it.instance("loop calls LLM and returns assistant message", () =>
   }),
 )
 
+const mainHits = <T extends { body: Record<string, unknown> }>(hits: T[]) =>
+  hits.filter((hit) => !JSON.stringify(hit.body).includes("Generate a title for this conversation"))
+
+it.instance("mode reminders stay on the user message they were sent with", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const chat = yield* sessions.create({
+      title: "Pinned",
+      permission: [{ permission: "*", pattern: "*", action: "allow" }],
+    })
+    const turn = Effect.fn("test.turn")(function* (agent: string, text: string) {
+      yield* prompt.prompt({ sessionID: chat.id, agent, model: ref, noReply: true, parts: [{ type: "text", text }] })
+      yield* llm.text(`reply to ${text}`)
+      yield* prompt.loop({ sessionID: chat.id })
+    })
+    yield* turn("plan", "first")
+    yield* turn("plan", "second")
+    yield* turn("build", "third")
+    yield* turn("build", "fourth")
+
+    const requests = mainHits(yield* llm.hits).map((hit) => hit.body.messages as Record<string, any>[])
+    expect(requests).toHaveLength(4)
+    const userMessage = (messages: Record<string, any>[], text: string) =>
+      messages.find((message) => message.role === "user" && JSON.stringify(message.content).includes(text))
+    const said = (message: Record<string, any> | undefined, text: string) =>
+      JSON.stringify(message?.content ?? "").includes(text)
+
+    // Every earlier user message is replayed exactly as it was first sent.
+    for (let later = 1; later < requests.length; later++) {
+      for (const text of ["first", "second", "third"].slice(0, later)) {
+        expect(userMessage(requests[later], text)).toEqual(userMessage(requests[later - 1], text))
+      }
+    }
+    expect(said(userMessage(requests[1], "first"), "Plan Mode - System Reminder")).toBe(true)
+    expect(said(userMessage(requests[1], "second"), "Plan Mode - System Reminder")).toBe(true)
+    // The switch is announced once, on the first build turn.
+    expect(said(userMessage(requests[2], "third"), "operational mode has changed from plan to build")).toBe(true)
+    expect(said(userMessage(requests[2], "third"), "Plan Mode - System Reminder")).toBe(false)
+    expect(said(userMessage(requests[3], "fourth"), "operational mode has changed")).toBe(false)
+
+    // Stored once, not once per loop step.
+    const stored = yield* sessions.messages({ sessionID: chat.id })
+    const reminders = stored.flatMap((message) =>
+      message.parts.filter((part) => part.type === "text" && part.synthetic && part.text.includes("system-reminder")),
+    )
+    expect(reminders).toHaveLength(3)
+  }),
+)
+
 withMcpInstructions.instance(
   "loop includes MCP instructions in model system context",
   () =>

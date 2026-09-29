@@ -16,35 +16,41 @@ export const apply = Effect.fn("SessionReminders.apply")(function* (input: {
   messages: SessionV1.WithParts[]
   agent: Agent.Info
   session: Session.Info
+  /** Store synthetic reminder parts. Preflight dry runs pass false. */
+  persist?: boolean
 }) {
   const flags = yield* RuntimeFlags.Service
   const fsys = yield* FSUtil.Service
   const sessions = yield* Session.Service
   const userMessage = input.messages.findLast((msg) => msg.info.role === "user")
   if (!userMessage) return input.messages
+  const store = (part: SessionV1.TextPart) =>
+    input.persist === false ? Effect.succeed(part) : sessions.updatePart(part)
 
   if (!flags.experimentalPlanMode) {
-    if (input.agent.name === "plan") {
-      userMessage.parts.push({
+    // Reminders are stored on the user message they were first sent with.
+    // Adding them in memory to whichever user message is newest rewrote the
+    // previous user message on every turn: that breaks the provider prompt
+    // cache from that message on, and invalidates thinking signatures bound
+    // to the old prefix.
+    const has = (text: string) =>
+      userMessage.parts.some((part) => part.type === "text" && part.synthetic === true && part.text === text)
+    const remind = (text: string) =>
+      store({
         id: PartID.ascending(),
         messageID: userMessage.info.id,
         sessionID: userMessage.info.sessionID,
         type: "text",
-        text: PROMPT_PLAN,
+        text,
         synthetic: true,
-      })
-    }
-    const wasPlan = input.messages.some((msg) => msg.info.role === "assistant" && msg.info.agent === "plan")
-    if (wasPlan && input.agent.name === "build") {
-      userMessage.parts.push({
-        id: PartID.ascending(),
-        messageID: userMessage.info.id,
-        sessionID: userMessage.info.sessionID,
-        type: "text",
-        text: BUILD_SWITCH,
-        synthetic: true,
-      })
-    }
+      }).pipe(Effect.map((part) => userMessage.parts.push(part)))
+    if (input.agent.name === "plan" && !has(PROMPT_PLAN)) yield* remind(PROMPT_PLAN)
+    // Announce the switch once, on the first build turn after a plan turn.
+    const previous = input.messages
+      .slice(0, input.messages.indexOf(userMessage))
+      .findLast((msg) => msg.info.role === "assistant")
+    if (input.agent.name === "build" && previous?.info.agent === "plan" && !has(BUILD_SWITCH))
+      yield* remind(BUILD_SWITCH)
     return input.messages
   }
 
@@ -53,7 +59,7 @@ export const apply = Effect.fn("SessionReminders.apply")(function* (input: {
     const ctx = yield* InstanceState.context
     const plan = Session.plan(input.session, ctx)
     const exists = yield* fsys.existsSafe(plan)
-    const part = yield* sessions.updatePart({
+    const part = yield* store({
       id: PartID.ascending(),
       messageID: userMessage.info.id,
       sessionID: userMessage.info.sessionID,
@@ -72,8 +78,8 @@ export const apply = Effect.fn("SessionReminders.apply")(function* (input: {
   const ctx = yield* InstanceState.context
   const plan = Session.plan(input.session, ctx)
   const exists = yield* fsys.existsSafe(plan)
-  if (!exists) yield* fsys.ensureDir(path.dirname(plan)).pipe(Effect.catch(Effect.die))
-  const part = yield* sessions.updatePart({
+  if (!exists && input.persist !== false) yield* fsys.ensureDir(path.dirname(plan)).pipe(Effect.catch(Effect.die))
+  const part = yield* store({
     id: PartID.ascending(),
     messageID: userMessage.info.id,
     sessionID: userMessage.info.sessionID,
