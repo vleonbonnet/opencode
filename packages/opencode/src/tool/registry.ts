@@ -264,9 +264,8 @@ const layer = Layer.effect(
 
     const describeTask = Effect.fn("ToolRegistry.describeTask")(function* (agent: Agent.Info) {
       const items = (yield* agents.list()).filter((item) => item.mode !== "primary")
-      const filtered = items.filter(
-        (item) => Permission.evaluate("task", item.name, agent.permission).action !== "deny",
-      )
+      const exposure = yield* agents.exposure(agent)
+      const filtered = items.filter((item) => !Permission.deniedForAll("task", item.name, exposure))
       const list = filtered.toSorted((a, b) => a.name.localeCompare(b.name))
       const description = list
         .map(
@@ -282,8 +281,10 @@ const layer = Layer.effect(
       permission?: PermissionV1.Ruleset
     }) {
       if (!codeMode) return
-      const ruleset = Permission.merge(input.agent.permission, input.permission ?? [])
-      const tools = Permission.visibleTools(yield* mcp.tools(), ruleset)
+      const exposure = (yield* agents.exposure(input.agent)).map((ruleset) =>
+        Permission.merge(ruleset, input.permission ?? []),
+      )
+      const tools = Permission.visibleToAny(yield* mcp.tools(), exposure)
       if (Object.keys(tools).length === 0) return
       return codeMode.describeCatalog(tools, Object.keys(yield* mcp.clients()).map(McpCatalog.sanitize))
     })

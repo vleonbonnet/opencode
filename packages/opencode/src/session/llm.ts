@@ -43,6 +43,8 @@ export type StreamInput = {
   model: Provider.Model
   agent: Agent.Info
   permission?: PermissionV1.Ruleset
+  /** Rulesets deciding which tools are listed; defaults to the agent's own (see Agent.exposureOf). */
+  exposure?: readonly PermissionV1.Ruleset[]
   system: string[]
   messages: ModelMessage[]
   small?: boolean

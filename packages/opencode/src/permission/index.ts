@@ -218,6 +218,33 @@ export function visibleTools<T>(tools: Record<string, T>, ruleset: PermissionV1.
   return Object.fromEntries(Object.entries(tools).filter(([name]) => !hidden.has(name)))
 }
 
+// Exposure: what the model is shown is decided by a set of rulesets, and an
+// item is hidden only when every one of them hides it. Agents that take turns
+// in one session share an exposure, so switching between them keeps the
+// request prefix (and the provider's prompt cache) intact; each agent's own
+// ruleset still decides at call time.
+
+/** Tools that every ruleset in RULESETS hides. */
+export function disabledForAll(tools: string[], rulesets: readonly PermissionV1.Ruleset[]): Set<string> {
+  if (rulesets.length === 0) return new Set()
+  const hidden = rulesets.map((ruleset) => disabled(tools, ruleset))
+  return new Set(tools.filter((tool) => hidden.every((set) => set.has(tool))))
+}
+
+/** TOOLS that at least one ruleset in RULESETS shows. */
+export function visibleToAny<T>(
+  tools: Record<string, T>,
+  rulesets: readonly PermissionV1.Ruleset[],
+): Record<string, T> {
+  const hidden = disabledForAll(Object.keys(tools), rulesets)
+  return Object.fromEntries(Object.entries(tools).filter(([name]) => !hidden.has(name)))
+}
+
+/** Whether every ruleset in RULESETS denies PERMISSION for PATTERN. */
+export function deniedForAll(permission: string, pattern: string, rulesets: readonly PermissionV1.Ruleset[]) {
+  return rulesets.length > 0 && rulesets.every((ruleset) => evaluate(permission, pattern, ruleset).action === "deny")
+}
+
 export const node = LayerNode.make({ service: Service, layer: layer, deps: [EventV2Bridge.node] })
 
 export * as Permission from "."

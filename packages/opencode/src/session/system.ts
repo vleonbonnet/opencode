@@ -52,8 +52,13 @@ export function provider(model: Provider.Model) {
 
 export interface Interface {
   readonly environment: (model: Provider.Model) => Effect.Effect<string[]>
-  readonly skills: (agent: Agent.Info) => Effect.Effect<string | undefined>
-  readonly mcp: (agent: Agent.Info, permission?: PermissionV1.Ruleset) => Effect.Effect<string | undefined>
+  /** EXPOSURE (see Agent.exposureOf) defaults to the agent's own ruleset. */
+  readonly skills: (agent: Agent.Info, exposure?: readonly PermissionV1.Ruleset[]) => Effect.Effect<string | undefined>
+  readonly mcp: (
+    agent: Agent.Info,
+    permission?: PermissionV1.Ruleset,
+    exposure?: readonly PermissionV1.Ruleset[],
+  ) => Effect.Effect<string | undefined>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/SystemPrompt") {}
@@ -104,10 +109,14 @@ const layer = Layer.effect(
         ].filter((part): part is string => part !== undefined)
       }),
 
-      skills: Effect.fn("SystemPrompt.skills")(function* (agent: Agent.Info) {
-        if (Permission.disabled(["skill"], agent.permission).has("skill")) return
+      skills: Effect.fn("SystemPrompt.skills")(function* (
+        agent: Agent.Info,
+        exposure?: readonly PermissionV1.Ruleset[],
+      ) {
+        const rulesets = exposure ?? [agent.permission]
+        if (Permission.disabledForAll(["skill"], rulesets).has("skill")) return
 
-        const list = yield* skill.available(agent)
+        const list = yield* skill.available(agent, rulesets)
 
         return [
           "Skills provide specialized instructions and workflows for specific tasks.",
@@ -118,10 +127,14 @@ const layer = Layer.effect(
         ].join("\n")
       }),
 
-      mcp: Effect.fn("SystemPrompt.mcp")(function* (agent: Agent.Info, permission?: PermissionV1.Ruleset) {
-        const ruleset = Permission.merge(agent.permission, permission ?? [])
+      mcp: Effect.fn("SystemPrompt.mcp")(function* (
+        agent: Agent.Info,
+        permission?: PermissionV1.Ruleset,
+        exposure?: readonly PermissionV1.Ruleset[],
+      ) {
+        const rulesets = (exposure ?? [agent.permission]).map((ruleset) => Permission.merge(ruleset, permission ?? []))
         const instructions = (yield* mcp.instructions()).filter(
-          (item) => item.tools.length === 0 || Permission.disabled(item.tools, ruleset).size < item.tools.length,
+          (item) => item.tools.length === 0 || Permission.disabledForAll(item.tools, rulesets).size < item.tools.length,
         )
         if (instructions.length === 0) return
 

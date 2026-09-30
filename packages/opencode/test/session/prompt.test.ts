@@ -599,10 +599,13 @@ it.instance("preflight dry-runs the exact next request without sending or storin
     expect(mainHits(yield* llm.hits)).toHaveLength(sent)
     expect(yield* sessions.messages({ sessionID: chat.id })).toHaveLength(stored)
 
-    // A different agent exposes different tools: the dry run sees it.
+    // Switching agent keeps the prefix: selectable agents share one exposure.
     const plan = yield* prompt.preflight({ sessionID: chat.id, agent: "plan", model: ref })
-    expect(plan.reusableTokens).toBeLessThan(5000)
-    expect(plan.reasons.some((reason) => reason.includes("diverges"))).toBe(true)
+    expect(plan.status).toBe("hit")
+    // A per-message tool toggle changes the tool list: the dry run sees it.
+    const toggled = yield* prompt.preflight({ sessionID: chat.id, agent: "build", model: ref, tools: { glob: false } })
+    expect(toggled.reusableTokens).toBeLessThan(5000)
+    expect(toggled.reasons.some((reason) => reason.includes("diverges"))).toBe(true)
 
     yield* prompt.prompt({
       sessionID: chat.id,
@@ -676,6 +679,54 @@ it.instance("mode reminders stay on the user message they were sent with", () =>
     )
     expect(reminders).toHaveLength(3)
   }),
+)
+
+it.instance(
+  "plan and build send the same tools and system prompt; each agent's ruleset still decides calls",
+  () =>
+    Effect.gen(function* () {
+      // glob is denied for every agent except plan: before shared exposure,
+      // plan listed it and build did not, so switching lost the prompt cache.
+      const { llm } = yield* useServerConfig((url) => ({
+        ...providerCfg(url),
+        permission: { glob: "deny" },
+        agent: { plan: { permission: { glob: "allow" } } },
+      }))
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({ title: "Shared exposure" })
+      yield* prompt.prompt({
+        sessionID: chat.id,
+        agent: "plan",
+        model: ref,
+        noReply: true,
+        parts: [{ type: "text", text: "look" }],
+      })
+      yield* llm.text("planned")
+      yield* prompt.loop({ sessionID: chat.id })
+      yield* prompt.prompt({
+        sessionID: chat.id,
+        agent: "build",
+        model: ref,
+        noReply: true,
+        parts: [{ type: "text", text: "do" }],
+      })
+      yield* llm.tool("glob", { pattern: "*" })
+      yield* prompt.loop({ sessionID: chat.id })
+
+      const [plan, build] = mainHits(yield* llm.hits).map((hit) => hit.body as Record<string, any>)
+      const names = (body: Record<string, any>) => body.tools.map((tool: any) => tool.function.name)
+      expect(names(plan)).toContain("glob")
+      expect(build.tools).toEqual(plan.tools)
+      expect(build.messages[0]).toEqual(plan.messages[0])
+
+      // Listed, but build's ruleset still denies the call.
+      const stored = (yield* sessions.messages({ sessionID: chat.id })).flatMap((message) => message.parts)
+      const glob = stored.find((part) => part.type === "tool" && part.tool === "glob")
+      expect(glob?.type === "tool" && glob.state.status).toBe("error")
+      expect(glob?.type === "tool" && glob.state.status === "error" && glob.state.error).toContain("prevents you")
+    }),
+  15_000,
 )
 
 withMcpInstructions.instance(

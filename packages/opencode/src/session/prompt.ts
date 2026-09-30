@@ -198,6 +198,7 @@ const layer = Layer.effect(
       const lastUserMsg = msgs.findLast((m) => m.info.role === "user")
       const bypassAgentCheck = lastUserMsg?.parts.some((p) => p.type === "agent") ?? false
       const promptOps = yield* ops()
+      const exposure = yield* agents.exposure(agent)
 
       const tools = yield* SessionTools.resolve({
         agent,
@@ -207,6 +208,7 @@ const layer = Layer.effect(
         bypassAgentCheck,
         messages: msgs,
         promptOps,
+        exposure,
       }).pipe(
         Effect.provideService(Plugin.Service, plugin),
         Effect.provideService(Permission.Service, permission),
@@ -226,10 +228,10 @@ const layer = Layer.effect(
       yield* plugin.trigger("experimental.chat.messages.transform", {}, { messages: msgs })
 
       const [skills, env, instructions, mcpInstructions, modelMsgs] = yield* Effect.all([
-        sys.skills(agent),
+        sys.skills(agent, exposure),
         sys.environment(model),
         instruction.system().pipe(Effect.orDie),
-        sys.mcp(agent, session.permission),
+        sys.mcp(agent, session.permission, exposure),
         MessageV2.toModelMessagesEffect(msgs, model),
       ])
       const system = [
@@ -244,6 +246,7 @@ const layer = Layer.effect(
         user: lastUser,
         agent,
         permission: session.permission,
+        exposure,
         sessionID: session.id,
         parentSessionID: session.parentID,
         system,

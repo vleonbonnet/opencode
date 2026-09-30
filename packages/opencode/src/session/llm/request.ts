@@ -24,6 +24,7 @@ type PrepareInput = {
   readonly model: Provider.Model
   readonly agent: Agent.Info
   readonly permission?: PermissionV1.Ruleset
+  readonly exposure?: readonly PermissionV1.Ruleset[]
   readonly system: string[]
   readonly messages: ModelMessage[]
   readonly small?: boolean
@@ -205,10 +206,12 @@ export const prepare = Effect.fn("LLMRequestPrep.prepare")(function* (input: Pre
   }
 })
 
-function resolveTools(input: Pick<PrepareInput, "tools" | "agent" | "permission" | "user">) {
-  const disabled = Permission.disabled(
+function resolveTools(input: Pick<PrepareInput, "tools" | "agent" | "permission" | "user" | "exposure">) {
+  // Listed tools follow the exposure shared by the agents of a session; the
+  // agent's own ruleset is enforced when a tool is called.
+  const disabled = Permission.disabledForAll(
     Object.keys(input.tools),
-    Permission.merge(input.agent.permission, input.permission ?? []),
+    (input.exposure ?? [input.agent.permission]).map((ruleset) => Permission.merge(ruleset, input.permission ?? [])),
   )
   return Record.filter(input.tools, (_, k) => input.user.tools?.[k] !== false && !disabled.has(k))
 }

@@ -61,9 +61,27 @@ const GeneratedAgent = Schema.Struct({
   systemPrompt: Schema.String,
 })
 
+/** Agents a user switches between within one session. */
+export function selectable(agent: Pick<Info, "mode" | "hidden">) {
+  return (agent.mode === "primary" || agent.mode === "all") && agent.hidden !== true
+}
+
+/**
+ * Rulesets deciding what AGENT's requests expose to the model (tools, the
+ * task tool's subagents, skills, MCP instructions). Selectable agents share
+ * one exposure, so switching between them keeps the request prefix and the
+ * provider's prompt cache; enforcement still uses the agent's own ruleset.
+ */
+export function exposureOf(agent: Info, agents: readonly Info[]): PermissionV1.Ruleset[] {
+  if (!selectable(agent)) return [agent.permission]
+  const peers = agents.filter((item) => selectable(item) && item.name !== agent.name)
+  return [agent.permission, ...peers.map((item) => item.permission)]
+}
+
 export interface Interface {
   readonly get: (agent: string) => Effect.Effect<Info>
   readonly list: () => Effect.Effect<Info[]>
+  readonly exposure: (agent: Info) => Effect.Effect<PermissionV1.Ruleset[]>
   readonly defaultInfo: () => Effect.Effect<Info>
   readonly defaultAgent: () => Effect.Effect<string>
   readonly generate: (input: {
@@ -79,7 +97,7 @@ export interface Interface {
   >
 }
 
-type State = Omit<Interface, "generate">
+type State = Omit<Interface, "generate" | "exposure">
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/Agent") {}
 
@@ -358,6 +376,9 @@ const layer = Layer.effect(
       }),
       list: Effect.fn("Agent.list")(function* () {
         return yield* InstanceState.useEffect(state, (s) => s.list())
+      }),
+      exposure: Effect.fn("Agent.exposure")(function* (agent: Info) {
+        return exposureOf(agent, yield* InstanceState.useEffect(state, (s) => s.list()))
       }),
       defaultInfo: Effect.fn("Agent.defaultInfo")(function* () {
         return yield* InstanceState.useEffect(state, (s) => s.defaultInfo())

@@ -8,6 +8,7 @@ import { InstanceState } from "@/effect/instance-state"
 import { Global } from "@opencode-ai/core/global"
 import { SkillPlugin } from "@opencode-ai/core/plugin/skill"
 import { Permission } from "@/permission"
+import type { PermissionV1 } from "@opencode-ai/core/v1/permission"
 import { FSUtil } from "@opencode-ai/core/fs-util"
 import { Config } from "@/config/config"
 import { FrontmatterError } from "@opencode-ai/core/v1/config/error"
@@ -99,7 +100,8 @@ export interface Interface {
   readonly require: (name: string) => Effect.Effect<Info, NotFoundError>
   readonly all: () => Effect.Effect<Info[]>
   readonly dirs: () => Effect.Effect<string[]>
-  readonly available: (agent?: Agent.Info) => Effect.Effect<Info[]>
+  /** Skills AGENT may see; EXPOSURE (see Agent.exposureOf) widens it to shared visibility. */
+  readonly available: (agent?: Agent.Info, exposure?: readonly PermissionV1.Ruleset[]) => Effect.Effect<Info[]>
 }
 
 const add = Effect.fnUntraced(function* (state: State, match: string, events: EventV2Bridge.Service["Service"]) {
@@ -307,11 +309,15 @@ const layer = Layer.effect(
       return (yield* InstanceState.get(discovered)).dirs
     })
 
-    const available = Effect.fn("Skill.available")(function* (agent?: Agent.Info) {
+    const available = Effect.fn("Skill.available")(function* (
+      agent?: Agent.Info,
+      exposure?: readonly PermissionV1.Ruleset[],
+    ) {
       const s = yield* InstanceState.get(state)
       const list = Object.values(s.skills).toSorted((a, b) => a.name.localeCompare(b.name))
       if (!agent) return list
-      return list.filter((skill) => Permission.evaluate("skill", skill.name, agent.permission).action !== "deny")
+      const rulesets = exposure ?? [agent.permission]
+      return list.filter((skill) => !Permission.deniedForAll("skill", skill.name, rulesets))
     })
 
     return Service.of({ get, require, all, dirs, available })

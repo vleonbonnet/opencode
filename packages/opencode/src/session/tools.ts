@@ -5,6 +5,7 @@ import { ProviderTransform } from "@/provider/transform"
 import { MCP } from "@/mcp"
 import { McpCatalog } from "@/mcp/catalog"
 import { Permission } from "@/permission"
+import type { PermissionV1 } from "@opencode-ai/core/v1/permission"
 import { Tool } from "@/tool/tool"
 import { ToolJsonSchema } from "@/tool/json-schema"
 import { ToolRegistry } from "@/tool/registry"
@@ -46,6 +47,8 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
   bypassAgentCheck: boolean
   messages: SessionV1.WithParts[]
   promptOps: TaskPromptOps
+  /** Rulesets deciding which MCP tools are listed (see Agent.exposureOf). */
+  exposure?: readonly PermissionV1.Ruleset[]
 }) {
   const tools: Record<string, AITool> = {}
   const run = yield* EffectBridge.make()
@@ -387,9 +390,13 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
 
   if (flags.experimentalCodeMode) return tools
 
-  const mcpTools = Permission.visibleTools(
+  // Exposure, not the agent's own ruleset, decides what is listed; calls are
+  // still checked against the agent's ruleset.
+  const mcpTools = Permission.visibleToAny(
     yield* mcp.tools(),
-    Permission.merge(input.agent.permission, input.session.permission ?? []),
+    (input.exposure ?? [input.agent.permission]).map((ruleset) =>
+      Permission.merge(ruleset, input.session.permission ?? []),
+    ),
   )
   for (const [key, entry] of Object.entries(mcpTools)) {
     const item = McpCatalog.convertTool(entry.def, entry.client, entry.timeout)
