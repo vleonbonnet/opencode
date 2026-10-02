@@ -249,11 +249,25 @@ export const toModelMessagesEffect = Effect.fnUntraced(function* (
       const differentModel = `${model.providerID}/${model.id}` !== `${msg.info.providerID}/${msg.info.modelID}`
       const media: Array<{ mime: string; url: string; filename?: string }> = []
 
+      // A step that ended in an error is skipped: replaying a failed response
+      // to the model that produced it can repeat the failure (a refusal) or
+      // carry signed blocks the provider no longer accepts. Another model has
+      // no such stake, and the failed step often holds the reasoning the user
+      // switched models to keep (a content-filter stop after long thinking),
+      // so it receives whatever the step produced.
       if (
         msg.info.error &&
         !(
           AbortedError.isInstance(msg.info.error) &&
           msg.parts.some((part) => part.type !== "step-start" && part.type !== "reasoning")
+        ) &&
+        !(
+          differentModel &&
+          msg.parts.some(
+            (part) =>
+              part.type === "tool" ||
+              ((part.type === "text" || part.type === "reasoning") && part.text.trim().length > 0),
+          )
         )
       ) {
         continue

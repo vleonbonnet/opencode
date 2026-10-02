@@ -988,6 +988,80 @@ describe("session.message-v2.toModelMessage", () => {
     expect(await MessageV2.toModelMessages(input, model)).toStrictEqual([])
   })
 
+  test("another model receives what a failed step produced, reasoning included", async () => {
+    const assistantID = "m-refused"
+    const refused = new SessionV1.ContentFilterError({
+      message: "The response was blocked by the provider's content filter",
+    }).toObject() as SessionV1.Assistant["error"]
+    const previous = { providerID: "anthropic", modelID: "claude-opus-5-5" }
+    const input: SessionV1.WithParts[] = [
+      {
+        info: assistantInfo(assistantID, "m-parent", refused, previous),
+        parts: [
+          { ...basePart(assistantID, "a0"), type: "step-start" },
+          {
+            ...basePart(assistantID, "a1"),
+            type: "reasoning",
+            text: "The guard must run at the wire layer.",
+            time: { start: 0 },
+            metadata: { anthropic: { signature: "sig" } },
+          },
+          { ...basePart(assistantID, "a2"), type: "text", text: "Starting with the guard." },
+          {
+            ...basePart(assistantID, "a3"),
+            type: "tool",
+            callID: "call-1",
+            tool: "bash",
+            state: { status: "running", input: { cmd: "ls" }, time: { start: 0 } },
+          },
+        ] as SessionV1.Part[],
+      },
+    ]
+
+    expect(await MessageV2.toModelMessages(input, model)).toStrictEqual([
+      {
+        role: "assistant",
+        content: [
+          { type: "text", text: "The guard must run at the wire layer." },
+          { type: "text", text: "Starting with the guard." },
+          {
+            type: "tool-call",
+            toolCallId: "call-1",
+            toolName: "bash",
+            input: { cmd: "ls" },
+            providerExecuted: undefined,
+          },
+        ],
+      },
+      {
+        role: "tool",
+        content: [
+          {
+            type: "tool-result",
+            toolCallId: "call-1",
+            toolName: "bash",
+            output: { type: "error-text", value: "[Tool execution was interrupted]" },
+          },
+        ],
+      },
+    ])
+  })
+
+  test("a failed step stays out for the model that produced it, and when it produced nothing", async () => {
+    const refused = new SessionV1.ContentFilterError({ message: "blocked" }).toObject() as SessionV1.Assistant["error"]
+    const reasoning = (id: string, text: string) =>
+      ({ ...basePart(id, `${id}-r`), type: "reasoning", text, time: { start: 0 } }) as SessionV1.Part
+    const input: SessionV1.WithParts[] = [
+      { info: assistantInfo("m-same", "m-parent", refused), parts: [reasoning("m-same", "own refused thinking")] },
+      {
+        info: assistantInfo("m-empty", "m-parent", refused, { providerID: "anthropic", modelID: "claude-opus-5-5" }),
+        parts: [reasoning("m-empty", "  ")],
+      },
+    ]
+
+    expect(await MessageV2.toModelMessages(input, model)).toStrictEqual([])
+  })
+
   test("includes aborted assistant messages only when they have non-step-start/reasoning content", async () => {
     const assistantID1 = "m-assistant-1"
     const assistantID2 = "m-assistant-2"
