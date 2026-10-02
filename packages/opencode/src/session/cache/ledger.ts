@@ -54,6 +54,8 @@ type SessionRecord = {
   thinking: Record<string, Bound>
   /** The provider rejected a thinking block the ledger could not predict. */
   refused?: { id: string; path: string; detail: string; time: number }
+  /** When a request of this session was last confirmed. */
+  seen?: number
 }
 
 type Bound = [system: string, tools: string, prefix: string]
@@ -107,6 +109,11 @@ const RETAIN_EXPIRED = 24 * 60 * 60_000
 
 // Thinking bindings kept per session, most recently accepted first to stay.
 const THINKING_LIMIT = 500
+
+// Sessions keep their cache snapshot this long, and their thinking bindings
+// (or a provider refusal) this long.
+const RETAIN_CACHE = 48 * 60 * 60_000
+const RETAIN_THINKING = 30 * 24 * 60 * 60_000
 
 // Allow for provider rounding (e.g. Fireworks reports cache in 16k pages) and,
 // for estimated entries, for the byte-to-token spread.
@@ -195,12 +202,24 @@ function flush() {
         ;(out.entries[ns] ??= {})[key] = entry
       }
     }
-    // Keep the most recently used sessions; older ones cannot have live cache.
+    // Keep the most recently used sessions. Past two days their cache is gone,
+    // so only what tells stale thinking apart stays, for a month: a session
+    // resumed later is still asked about instead of failing at the provider.
+    const time = (record: SessionRecord) => record.seen ?? record.last?.time ?? 0
     const recent = [...sessions.entries()]
-      .filter(([, record]) => record.last && now - record.last.time < 48 * 60 * 60_000)
-      .sort((a, b) => (b[1].last?.time ?? 0) - (a[1].last?.time ?? 0))
+      .filter(([, record]) => now - time(record) < RETAIN_THINKING)
+      .sort((a, b) => time(b[1]) - time(a[1]))
       .slice(0, 200)
-    for (const [id, record] of recent) out.sessions[id] = record
+    for (const [id, record] of recent) {
+      if (now - time(record) < RETAIN_CACHE) out.sessions[id] = record
+      else if (Object.keys(record.thinking).length > 0 || record.refused)
+        out.sessions[id] = {
+          verifications: [],
+          thinking: record.thinking,
+          seen: time(record),
+          ...(record.refused ? { refused: record.refused } : {}),
+        }
+    }
     try {
       fs.mkdirSync(path.dirname(file), { recursive: true })
       const temp = `${file}.${process.pid}.tmp`
@@ -504,6 +523,7 @@ export function observe(sessionID: string, usage: Usage, dropped: readonly strin
   })
   record.verifications = record.verifications.slice(-20)
   record.last = { ...snapshot(normalized, sent.time), usage, prompt }
+  record.seen = sent.time
   // The provider accepted every thinking block it did not drop, so each was
   // valid under this request's binding; later requests are checked against it.
   const signed = CacheModel.signedThinking(sent.body)
@@ -610,7 +630,9 @@ function bindingBehavior(request: Captured): string | undefined {
 /**
  * The thinking blocks of REQUEST (about to be sent) that are no longer bound
  * to what they were last accepted under, plus a block the provider already
- * rejected. Blocks the ledger has never seen accepted are assumed valid.
+ * rejected. The provider names the first invalid block, and whatever changed
+ * before it also precedes every later block, so later blocks the ledger has
+ * no binding for are stale too. Other unknown blocks are assumed valid.
  */
 export function staleThinking(sessionID: string, request: Captured): StaleThinking | undefined {
   load()
@@ -619,14 +641,21 @@ export function staleThinking(sessionID: string, request: Captured): StaleThinki
   const signed = CacheModel.signedThinking(request)
   const stale: CacheModel.SignedThinking[] = []
   const reasons = new Set<string>()
+  const refused = record.refused
+  const rejected = refused && `the provider rejected the block at ${refused.path}: ${refused.detail}`
+  let afterRefused = false
   for (const block of signed) {
-    if (record.refused?.id === block.id) {
+    if (refused?.id === block.id) {
+      afterRefused = true
       stale.push(block)
-      reasons.add(`the provider rejected the block at ${record.refused.path}: ${record.refused.detail}`)
+      reasons.add(rejected!)
       continue
     }
     const bound = record.thinking[block.id]
-    if (!bound) continue
+    if (!bound) {
+      if (afterRefused) stale.push(block)
+      continue
+    }
     const reason =
       bound[0] !== block.binding.system
         ? "the system prompt changed"
@@ -658,12 +687,14 @@ export function refuseThinking(sessionID: string, message: string) {
   const block = CacheModel.signedThinking(sent.body).find((item) => item.path === path)
   if (!block) return
   const detail = /bound to a different conversation\.(?:.*?drop_block"?\.)?\s*(.*)$/s.exec(message)?.[1]?.trim()
-  session(sessionID).refused = {
+  const record = session(sessionID)
+  record.refused = {
     id: block.id,
     path,
     detail: detail || "it no longer matches the conversation",
     time: Date.now(),
   }
+  record.seen = Date.now()
   flush()
 }
 

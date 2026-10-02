@@ -534,17 +534,18 @@ describe("CacheLedger thinking binding", () => {
     expect(CacheLedger.isThinkingRefusal(message)).toBe(true)
     CacheLedger.refuseThinking(sessionID, message)
     CacheLedger.discard(sessionID)
+    // sig-b follows the rejected block, so whatever changed precedes it too.
     const stale = CacheLedger.staleThinking(sessionID, send(anthropicBody(history)))
-    expect(ids(stale)).toEqual(["sig-a"])
+    expect(ids(stale)).toEqual(["sig-a", "sig-b"])
     expect(stale?.reason).toBe(
       "the provider rejected the block at messages.1.content.0: The `system` prompt differs from when this block was created.",
     )
-    await expect(guarded(anthropicBody(history))).rejects.toThrow("Stale thinking: 1 thinking block")
+    await expect(guarded(anthropicBody(history))).rejects.toThrow("Stale thinking: 2 thinking blocks")
     CacheLedger.discard(sessionID)
     // A turn on another model does not carry the block: still refused.
     await wire(sessionID, request(FIREWORKS, { model: "glm", messages: [{ role: "user", content: "hi" }] }))
     CacheLedger.observe(sessionID, { input: 3, read: 0, write: 0 })
-    expect(ids(CacheLedger.staleThinking(sessionID, send(anthropicBody(history))))).toEqual(["sig-a"])
+    expect(ids(CacheLedger.staleThinking(sessionID, send(anthropicBody(history))))).toEqual(["sig-a", "sig-b"])
     // The consented turn lets the provider drop it.
     const lost = await accepted(
       {
@@ -553,8 +554,49 @@ describe("CacheLedger thinking binding", () => {
       },
       ["messages.1.content.0"],
     )
-    expect(lost.map((item) => item.signature)).toEqual(["sig-a"])
+    expect(lost.map((item) => item.signature)).toEqual(["sig-a", "sig-b"])
     expect(CacheLedger.staleThinking(sessionID, send(anthropicBody(history)))).toBeUndefined()
+  })
+
+  test("blocks after a refused one are stale too, earlier unknown ones are not", async () => {
+    const a0 = { role: "assistant", content: [think("sig-0"), text("answer 0")] }
+    const longer = [u1, a0, user("between"), a1, u2, a2, u3]
+    await accepted(anthropicBody([u1]))
+    await wire(sessionID, send(anthropicBody(longer)))
+    CacheLedger.refuseThinking(
+      sessionID,
+      "messages.3.content.0: Invalid `signature` in `thinking` block. The block is bound to a different conversation. " +
+        'Remove the block, or set `thinking.block_binding.prefix_mismatch_behavior` to "drop_block". ' +
+        "Content before this block differs from when it was created.",
+    )
+    CacheLedger.discard(sessionID)
+    expect(ids(CacheLedger.staleThinking(sessionID, send(anthropicBody(longer))))).toEqual(["sig-a", "sig-b"])
+  })
+
+  test("a session's thinking bindings outlive its cache snapshot", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "ledger-"))
+    const file = path.join(dir, "cache-ledger.json")
+    try {
+      CacheLedger.configure({ file })
+      setSystemTime(new Date(Date.now() - 3 * 24 * 60 * 60_000))
+      try {
+        await accepted(anthropicBody(history))
+      } finally {
+        setSystemTime()
+      }
+      await Bun.sleep(1200)
+      const saved = JSON.parse(await fs.readFile(file, "utf8")).sessions[sessionID]
+      expect(saved.last).toBeUndefined()
+      expect(Object.keys(saved.thinking)).toHaveLength(2)
+      CacheLedger.reset()
+      CacheLedger.configure({ file })
+      const changed = { ...anthropicBody(history), tools: [tool("read")] }
+      expect(ids(CacheLedger.staleThinking(sessionID, send(changed)))).toEqual(["sig-a", "sig-b"])
+      expect(CacheLedger.predict(sessionID, send(anthropicBody(next))).status).toBe("unknown")
+    } finally {
+      CacheLedger.configure({})
+      await fs.rm(dir, { recursive: true, force: true })
+    }
   })
 
   test("other request formats are never checked", async () => {
