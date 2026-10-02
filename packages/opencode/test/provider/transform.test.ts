@@ -920,6 +920,8 @@ describe("ProviderTransform.providerOptions", () => {
 
   describe("anthropic thinking block binding", () => {
     const binding = { prefixMismatchBehavior: "drop_block" }
+    // Adaptive thinking on Claude asks for the summarized display (see anthropicThinkingDisplay).
+    const shown = (option: string) => (option === "thinking" ? { display: "summarized" } : {})
     const claude = (npm: string, id: string) =>
       createModel({ providerID: "custom", api: { id, url: "https://example.com", npm } })
     const sdks = [
@@ -931,7 +933,7 @@ describe("ProviderTransform.providerOptions", () => {
     test("adds blockBinding to explicit adaptive thinking on @ai-sdk/anthropic", () => {
       const model = claude("@ai-sdk/anthropic", "claude-fable-5-1")
       expect(ProviderTransform.providerOptions(model, { thinking: { type: "adaptive" }, effort: "high" })).toEqual({
-        anthropic: { thinking: { type: "adaptive", blockBinding: binding }, effort: "high" },
+        anthropic: { thinking: { type: "adaptive", display: "summarized", blockBinding: binding }, effort: "high" },
       })
     })
 
@@ -962,7 +964,7 @@ describe("ProviderTransform.providerOptions", () => {
         ])("adds binding for %s", (id) => {
           const model = claude(sdk.npm, id)
           expect(ProviderTransform.providerOptions(model, {})).toEqual({
-            [sdk.key]: { [sdk.option]: { type: "adaptive", blockBinding: binding } },
+            [sdk.key]: { [sdk.option]: { type: "adaptive", blockBinding: binding, ...shown(sdk.option) } },
           })
           expect(
             ProviderTransform.providerOptions(model, { [sdk.option]: { type: "adaptive", display: "summarized" } }),
@@ -1015,13 +1017,15 @@ describe("ProviderTransform.providerOptions", () => {
             [sdk.option]: Object.freeze({ type: "adaptive", blockBinding: false }),
           })
           expect(ProviderTransform.providerOptions(model, options)).toEqual({
-            [sdk.key]: { [sdk.option]: { type: "adaptive" } },
+            [sdk.key]: { [sdk.option]: { type: "adaptive", ...shown(sdk.option) } },
           })
           expect(ProviderTransform.providerOptions(model, { [sdk.option]: { blockBinding: false } })).toEqual({
             [sdk.key]: {},
           })
           const custom = { [sdk.option]: { type: "adaptive", blockBinding: { prefixMismatchBehavior: "error" } } }
-          expect(ProviderTransform.providerOptions(model, custom)).toEqual({ [sdk.key]: custom })
+          expect(ProviderTransform.providerOptions(model, custom)).toEqual({
+            [sdk.key]: { [sdk.option]: { ...custom[sdk.option], ...shown(sdk.option) } },
+          })
         })
 
         test.each([
@@ -1118,7 +1122,7 @@ describe("ProviderTransform.providerOptions", () => {
     test("applies to vertex anthropic", () => {
       const model = claude("@ai-sdk/google-vertex/anthropic", "claude-fable-5-1")
       expect(ProviderTransform.providerOptions(model, { thinking: { type: "adaptive" }, effort: "max" })).toEqual({
-        anthropic: { thinking: { type: "adaptive", blockBinding: binding }, effort: "max" },
+        anthropic: { thinking: { type: "adaptive", display: "summarized", blockBinding: binding }, effort: "max" },
       })
     })
 
@@ -1179,6 +1183,7 @@ describe("ProviderTransform.providerOptions", () => {
       })
       expect(sent?.body.thinking).toEqual({
         type: "adaptive",
+        display: "summarized",
         block_binding: { prefix_mismatch_behavior: "drop_block" },
       })
       expect(sent?.headers.get("anthropic-beta")?.split(",")).toContain("thinking-binding-controls-2026-08-01")
@@ -1228,6 +1233,7 @@ describe("ProviderTransform.providerOptions", () => {
       expect(sent?.body.anthropic_version).toBe("vertex-2023-10-16")
       expect(sent?.body.thinking).toEqual({
         type: "adaptive",
+        display: "summarized",
         block_binding: { prefix_mismatch_behavior: "drop_block" },
       })
       expect(sent?.headers.get("anthropic-beta")?.split(",")).toContain("thinking-binding-controls-2026-08-01")
@@ -3627,7 +3633,7 @@ describe("ProviderTransform.message - cache control on gateway", () => {
     expect(result[0].providerOptions).toBeUndefined()
   })
 
-  test("non-gateway anthropic keeps existing cache control behavior", () => {
+  test("non-gateway anthropic uses one-hour cache control", () => {
     const model = createModel({
       providerID: "anthropic",
       api: {
@@ -3653,6 +3659,7 @@ describe("ProviderTransform.message - cache control on gateway", () => {
       anthropic: {
         cacheControl: {
           type: "ephemeral",
+          ttl: "1h",
         },
       },
       openrouter: {
@@ -3697,11 +3704,12 @@ describe("ProviderTransform.message - cache control on gateway", () => {
     expect(result.every((message) => message.providerOptions === undefined)).toBe(true)
   })
 
-  test("uses one-hour cache breakpoints for Claude through Copilot", () => {
-    const model = createModel({
-      providerID: "github-copilot",
-      api: { id: "claude-opus-5.5", url: "https://api.githubcopilot.com/v1", npm: "@ai-sdk/anthropic" },
-    })
+  test.each([
+    ["github-copilot", "claude-opus-5.5", "https://api.githubcopilot.com/v1"],
+    ["anthropic", "claude-opus-5-5", "https://api.anthropic.com/v1"],
+    ["grove-anthropic", "claude-opus-5-5", "https://grove.example/anthropic/v1"],
+  ])("uses one-hour cache breakpoints for Claude through %s", (providerID, id, url) => {
+    const model = createModel({ providerID, api: { id, url, npm: "@ai-sdk/anthropic" } })
     const msgs = [
       { role: "system", content: "You are a helpful assistant" },
       { role: "user", content: "Hello" },
@@ -3710,6 +3718,26 @@ describe("ProviderTransform.message - cache control on gateway", () => {
     const result = ProviderTransform.message(msgs, model, {}) as any[]
     expect(result[0].providerOptions.anthropic.cacheControl).toEqual({ type: "ephemeral", ttl: "1h" })
     expect(result[1].providerOptions.anthropic.cacheControl).toEqual({ type: "ephemeral", ttl: "1h" })
+  })
+
+  test("adaptive thinking asks for summarized display on Anthropic Messages gateways", () => {
+    const claude = createModel({
+      providerID: "anthropic",
+      api: { id: "claude-opus-5-5", url: "https://api.anthropic.com/v1", npm: "@ai-sdk/anthropic" },
+    })
+    const adaptive = ProviderTransform.providerOptions(claude, { thinking: { type: "adaptive" }, effort: "high" })
+    expect(adaptive.anthropic.thinking.display).toBe("summarized")
+    // An explicit choice is kept.
+    const omitted = ProviderTransform.providerOptions(claude, { thinking: { type: "adaptive", display: "omitted" } })
+    expect(omitted.anthropic.thinking.display).toBe("omitted")
+    // Other SDKs are untouched.
+    const other = createModel({
+      providerID: "fireworks-ai",
+      api: { id: "glm", url: "https://api.fireworks.ai/inference/v1", npm: "@ai-sdk/openai-compatible" },
+    })
+    expect(JSON.stringify(ProviderTransform.providerOptions(other, { reasoningEffort: "high" }))).not.toContain(
+      "summarized",
+    )
   })
 
   test("google-vertex-anthropic applies cache control", () => {
@@ -3739,6 +3767,7 @@ describe("ProviderTransform.message - cache control on gateway", () => {
       anthropic: {
         cacheControl: {
           type: "ephemeral",
+          ttl: "1h",
         },
       },
       openrouter: {

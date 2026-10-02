@@ -358,11 +358,15 @@ function normalizeMessages(
 function applyCaching(msgs: ModelMessage[], model: Provider.Model): ModelMessage[] {
   const system = msgs.filter((msg) => msg.role === "system").slice(0, 2)
   const final = msgs.filter((msg) => msg.role !== "system").slice(-2)
-  const copilotClaude = model.providerID === "github-copilot" && model.api.npm === "@ai-sdk/anthropic"
+  // Anthropic Messages caches (direct, Copilot, Grove, Vertex) all honour a
+  // 1h TTL (verified: entries still read after 25 idle minutes, 5m entries
+  // gone after 8). A write costs 2x base input instead of 1.25x, far less
+  // than re-sending a long conversation after a short break.
+  const anthropicMessages = model.api.npm === "@ai-sdk/anthropic" || model.api.npm === "@ai-sdk/google-vertex/anthropic"
 
   const providerOptions = {
     anthropic: {
-      cacheControl: copilotClaude ? { type: "ephemeral", ttl: "1h" } : { type: "ephemeral" },
+      cacheControl: anthropicMessages ? { type: "ephemeral", ttl: "1h" } : { type: "ephemeral" },
     },
     openrouter: {
       cacheControl: { type: "ephemeral" },
@@ -737,6 +741,20 @@ function anthropicBlockBinding(model: Provider.Model, options: { [x: string]: an
     }
   }
   return options
+}
+
+// Adaptive thinking returns an empty block plus its signature unless a
+// display mode is requested. Ask for the summarized text on every Anthropic
+// Messages gateway so reasoning is readable wherever the model runs; the
+// summary is display-only (the signature is what the model reads back) and
+// does not key the prompt cache.
+function anthropicThinkingDisplay(model: Provider.Model, options: { [x: string]: any }) {
+  if (model.api.npm !== "@ai-sdk/anthropic" && model.api.npm !== "@ai-sdk/google-vertex/anthropic") return options
+  // Other models behind Anthropic-compatible endpoints may reject the field.
+  if (!/claude/i.test(model.api.id)) return options
+  const thinking = options.thinking
+  if (!thinking || thinking.type !== "adaptive" || thinking.display !== undefined) return options
+  return { ...options, thinking: { ...thinking, display: "summarized" } }
 }
 
 function isLegacyGemini(apiId: string) {
@@ -1428,7 +1446,7 @@ export function providerOptions(model: Provider.Model, options: { [x: string]: a
     usesOpenAIReasoningGate &&
     (model.capabilities.reasoning || options.reasoningEffort !== undefined || options.reasoningSummary !== undefined)
       ? { ...options, forceReasoning: true }
-      : anthropicBlockBinding(model, options)
+      : anthropicThinkingDisplay(model, anthropicBlockBinding(model, options))
 
   if (model.api.npm === "@ai-sdk/gateway") {
     // Gateway providerOptions are split across two namespaces:
