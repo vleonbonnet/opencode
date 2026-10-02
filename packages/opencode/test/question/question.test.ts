@@ -144,11 +144,11 @@ it.instance(
         sessionID: SessionID.make("ses_test"),
         questions: [{ question: "Proceed?", header: "Proceed", options: [{ label: "Yes", description: "Go" }] }],
       }
-      const answer = yield* question.register(input)
+      const { answer } = yield* question.register(input)
       expect((yield* listEffect).map((request) => request.id)).toEqual([id])
 
       // Registering the same ID again joins the pending request.
-      const again = yield* question.register(input)
+      const { answer: again } = yield* question.register(input)
       expect(yield* listEffect).toHaveLength(1)
 
       yield* replyEffect({ requestID: id, answers: [["Yes"]] })
@@ -472,6 +472,60 @@ lifecycle.live("pending question rejects on instance dispose", () =>
     const exit = yield* Fiber.await(fiber)
     expect(Exit.isFailure(exit)).toBe(true)
     if (Exit.isFailure(exit)) expect(Cause.squash(exit.cause)).toBeInstanceOf(Question.RejectedError)
+  }),
+)
+
+lifecycle.live("instance dispose interrupts a registration that asks for it, rather than rejecting it", () =>
+  Effect.gen(function* () {
+    const dir = yield* tmpdirScoped({ git: true })
+    const registration = yield* Question.Service.use((svc) =>
+      svc.register({
+        sessionID: SessionID.make("ses_recovered"),
+        questions: [
+          {
+            question: "Still there?",
+            header: "Recovered",
+            options: [{ label: "Yes", description: "Yes" }],
+          },
+        ],
+        interruptOnDispose: true,
+      }),
+    ).pipe(provideInstance(dir))
+    const fiber = yield* registration.answer.pipe(Effect.forkScoped)
+
+    expect(yield* waitForPending(1).pipe(provideInstance(dir))).toHaveLength(1)
+    const ctx = yield* InstanceRef.pipe(provideInstance(dir))
+    if (!ctx) return yield* Effect.die(new Error("missing test instance"))
+    yield* InstanceStore.Service.use((store) => store.dispose(ctx))
+
+    const exit = yield* Fiber.await(fiber)
+    expect(Exit.isFailure(exit) && Cause.hasInterruptsOnly(exit.cause)).toBe(true)
+  }),
+)
+
+lifecycle.live("withdraw removes a registration whose answer is never awaited", () =>
+  Effect.gen(function* () {
+    const dir = yield* tmpdirScoped({ git: true })
+    yield* Effect.gen(function* () {
+      const question = yield* Question.Service
+      const input = {
+        sessionID: SessionID.make("ses_withdraw"),
+        questions: [{ question: "Proceed?", header: "Proceed", options: [{ label: "Yes", description: "Go" }] }],
+      }
+      const first = yield* question.register(input)
+      expect(yield* listEffect).toHaveLength(1)
+      yield* first.withdraw
+      expect(yield* listEffect).toEqual([])
+
+      // A stale registration never withdraws a newer request under the same ID.
+      const id = QuestionID.ascending()
+      const stale = yield* question.register({ ...input, id })
+      yield* stale.withdraw
+      yield* question.register({ ...input, id })
+      yield* stale.withdraw
+      expect((yield* listEffect).map((request) => request.id)).toEqual([id])
+      yield* rejectAll
+    }).pipe(provideInstance(dir))
   }),
 )
 

@@ -2,6 +2,7 @@ import { Effect, Schema } from "effect"
 import * as Tool from "./tool"
 import { Question } from "../question"
 import { QuestionID } from "../question/schema"
+import { QuestionOwner } from "../question/owner"
 import DESCRIPTION from "./question.txt"
 
 export const Parameters = Schema.Struct({
@@ -12,6 +13,8 @@ type Metadata = {
   answers?: ReadonlyArray<Question.Answer>
   // Persisted while waiting so a restarted server can re-ask under the same ID.
   requestID?: QuestionID
+  // The process holding the pending request; recovery leaves its live questions alone.
+  owner?: QuestionOwner.Owner
 }
 
 export const QuestionTool = Tool.define<typeof Parameters, Metadata, Question.Service>(
@@ -25,7 +28,7 @@ export const QuestionTool = Tool.define<typeof Parameters, Metadata, Question.Se
       execute: (params: Schema.Schema.Type<typeof Parameters>, ctx: Tool.Context) =>
         Effect.gen(function* () {
           const requestID = QuestionID.ascending()
-          yield* ctx.metadata({ metadata: { requestID } })
+          yield* ctx.metadata({ metadata: { requestID, owner: QuestionOwner.current } })
           const answers = yield* question.ask({
             id: requestID,
             sessionID: ctx.sessionID,

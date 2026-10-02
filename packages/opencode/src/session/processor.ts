@@ -170,7 +170,17 @@ const layer = Layer.effect(
         },
       ) {
         const match = yield* readToolCall(toolCallID)
-        if (!match || match.part.state.status !== "running") return
+        if (!match) return
+        if (match.part.state.status !== "running") {
+          // Another writer settled the part first, e.g. a process sharing the database.
+          yield* Effect.logWarning("tool result dropped: part no longer running", {
+            "session.id": match.part.sessionID,
+            partID: match.part.id,
+            tool: match.part.tool,
+            status: match.part.state.status,
+          })
+          return
+        }
         yield* session.updatePart({
           ...match.part,
           state: {

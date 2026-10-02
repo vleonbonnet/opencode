@@ -42,7 +42,7 @@ import { Truncate } from "@/tool/truncate"
 import { Image } from "@/image/image"
 import { decodeDataUrl } from "@/util/data-url"
 import { Process } from "@/util/process"
-import { Cause, Effect, Exit, Latch, Layer, Option, Scope, Context, Schema, Types } from "effect"
+import { Cause, Deferred, Effect, Exit, Fiber, Latch, Layer, Option, Scope, Context, Schema, Types } from "effect"
 import { InstanceState } from "@/effect/instance-state"
 import { TaskTool, type TaskPromptOps } from "@/tool/task"
 import { SessionRunState } from "./run-state"
@@ -55,6 +55,7 @@ import { and, eq, isNull, sql } from "drizzle-orm"
 import { MessageTable, SessionTable } from "@opencode-ai/core/session/sql"
 import { Question } from "@/question"
 import { QuestionID } from "@/question/schema"
+import { QuestionOwner } from "@/question/owner"
 import { answerResult } from "@/tool/question"
 import { isRecord } from "@/util/record"
 import { SessionReminders } from "./reminders"
@@ -1601,40 +1602,72 @@ const layer = Layer.effect(
         return Option.isSome(questions) ? [{ part, state: part.state, questions: questions.value }] : []
       })
       if (asked.length === 0) return
+      // Every process opened on this directory bootstraps it, including short
+      // CLI commands, so a question still waiting in its asking process must
+      // be left alone: re-asking it here would take over its answer.
+      const orphaned = yield* Effect.forEach(asked, (item) =>
+        QuestionOwner.orphaned(QuestionOwner.fromMetadata(item.state.metadata)),
+      )
+      if (orphaned.some((value) => !value)) {
+        yield* Effect.logInfo("questions still pending in their asking process", { "session.id": sessionID })
+        return
+      }
       const busy = yield* state.assertNotBusy(sessionID).pipe(
         Effect.as(false),
         Effect.catch(() => Effect.succeed(true)),
       )
       if (busy) return
 
-      const pending = yield* Effect.forEach(asked, (item) =>
+      // Claim the questions, so that other processes leave them to this one.
+      const claimed = yield* Effect.forEach(
+        asked,
+        Effect.fnUntraced(function* (item) {
+          const metadata: Record<string, unknown> = { ...item.state.metadata, owner: QuestionOwner.current }
+          const state = { ...item.state, metadata }
+          const part = yield* sessions.updatePart({ ...item.part, state })
+          return { ...item, part, state }
+        }),
+      )
+      const pending = yield* Effect.forEach(claimed, (item) =>
         question
           .register({
             id: requestID(item.state.metadata?.requestID),
             sessionID,
             questions: item.questions,
             tool: { messageID: info.id, callID: item.part.callID },
+            interruptOnDispose: true,
           })
-          .pipe(Effect.map((answer) => ({ ...item, answer }))),
+          .pipe(Effect.map((registration) => ({ ...item, ...registration }))),
       )
       yield* Effect.logInfo("recovered questions", { "session.id": sessionID, count: pending.length })
       yield* status.set(sessionID, { type: "busy" })
+      const withdraw = Effect.forEach(pending, (item) => item.withdraw, { discard: true })
+      const started = yield* Deferred.make<void>()
       const done = yield* state.start(
         sessionID,
         lastAssistant(sessionID),
         Effect.gen(function* () {
-          const outcomes = yield* Effect.forEach(
-            pending,
-            (item) =>
-              item.answer.pipe(
-                Effect.exit,
-                Effect.map((exit) => ({ ...item, exit })),
-              ),
-            { concurrency: "unbounded" },
-          ).pipe(
+          const outcomes = yield* Effect.gen(function* () {
+            yield* Deferred.succeed(started, undefined)
+            return yield* Effect.forEach(
+              pending,
+              (item) =>
+                item.answer.pipe(
+                  Effect.exit,
+                  Effect.map((exit) => ({ ...item, exit })),
+                ),
+              { concurrency: "unbounded" },
+            )
+          }).pipe(
             // A user abort ends the turn; an instance teardown leaves it recoverable.
             Effect.onInterrupt(() => (cancelling.has(sessionID) ? finishTurn(info, { aborted: true }) : Effect.void)),
           )
+          // The instance tore down while waiting: leave the turn as it is, for
+          // the next process opened on this directory to recover.
+          if (outcomes.some((item) => Exit.isFailure(item.exit) && Cause.hasInterruptsOnly(item.exit.cause))) {
+            yield* Effect.logInfo("recovered questions left for the next process", { "session.id": sessionID })
+            return yield* lastAssistant(sessionID)
+          }
           yield* Effect.forEach(
             outcomes,
             Effect.fnUntraced(function* (item) {
@@ -1677,12 +1710,17 @@ const layer = Layer.effect(
           if (dismissed && (yield* config.get()).experimental?.continue_loop_on_deny !== true)
             return yield* lastAssistant(sessionID)
           return yield* runLoop(sessionID)
-        }),
+        }).pipe(Effect.ensuring(withdraw)),
       )
-      yield* done.pipe(
+      const awaiting = yield* done.pipe(
         Effect.catchCause((cause) => Effect.logError("recovered turn failed", { "session.id": sessionID, cause })),
+        // Also covers a run cancelled before it started, whose own cleanup never ran.
+        Effect.ensuring(withdraw),
         Effect.forkIn(scope),
       )
+      // Return once the run awaits the answers, so that cancelling it from now
+      // on closes the turn, or once the run is over without having started.
+      yield* Effect.raceFirst(Deferred.await(started), Fiber.await(awaiting))
     })
 
     // Close a turn whose stream died with the process that ran it, as the

@@ -41,6 +41,8 @@ interface PendingEntry {
 
 interface State {
   pending: Map<QuestionID, PendingEntry>
+  /** Set once the instance tears down, before its pending requests are rejected. */
+  disposed: boolean
 }
 
 // Service
@@ -51,16 +53,28 @@ export interface AskInput {
   sessionID: SessionID
   questions: ReadonlyArray<Info>
   tool?: Tool
+  /**
+   * Interrupt the wait when the instance tears down instead of failing it with
+   * `RejectedError`, so a teardown is not mistaken for the user dismissing it.
+   */
+  interruptOnDispose?: boolean
+}
+
+export interface Registration {
+  /** Await the answer; the request is withdrawn once the wait ends. */
+  readonly answer: Effect.Effect<ReadonlyArray<Answer>, RejectedError>
+  /** Withdraw the request unanswered, also when its wait never started. */
+  readonly withdraw: Effect.Effect<void>
 }
 
 export interface Interface {
   readonly ask: (input: AskInput) => Effect.Effect<ReadonlyArray<Answer>, RejectedError>
   /**
-   * Publish the request now and return an effect that awaits its answer.
+   * Publish the request now and return its registration.
    * Unlike `ask`, the request is pending as soon as this returns, which lets a
    * caller re-ask persisted questions before the instance serves requests.
    */
-  readonly register: (input: AskInput) => Effect.Effect<Effect.Effect<ReadonlyArray<Answer>, RejectedError>>
+  readonly register: (input: AskInput) => Effect.Effect<Registration>
   readonly reply: (input: {
     requestID: QuestionID
     answers: ReadonlyArray<Answer>
@@ -79,10 +93,12 @@ const layer = Layer.effect(
       Effect.fn("Question.state")(function* () {
         const state = {
           pending: new Map<QuestionID, PendingEntry>(),
+          disposed: false,
         }
 
         yield* Effect.addFinalizer(() =>
           Effect.gen(function* () {
+            state.disposed = true
             for (const item of state.pending.values()) {
               yield* Deferred.fail(item.deferred, new RejectedError())
             }
@@ -95,17 +111,30 @@ const layer = Layer.effect(
     )
 
     const register = Effect.fn("Question.register")(function* (input: AskInput) {
-      const pending = (yield* InstanceState.get(state)).pending
+      const current = yield* InstanceState.get(state)
+      const pending = current.pending
       const id = input.id ?? QuestionID.ascending()
-      const answer = (deferred: PendingEntry["deferred"]) =>
-        Effect.ensuring(
-          Deferred.await(deferred),
-          Effect.sync(() => {
-            pending.delete(id)
-          }),
-        )
+      const registration = (deferred: PendingEntry["deferred"]): Registration => {
+        const withdraw = Effect.sync(() => {
+          if (pending.get(id)?.deferred === deferred) pending.delete(id)
+        })
+        return {
+          answer: Effect.ensuring(
+            input.interruptOnDispose
+              ? Deferred.await(deferred).pipe(
+                  Effect.catchIf(
+                    () => current.disposed,
+                    () => Effect.interrupt,
+                  ),
+                )
+              : Deferred.await(deferred),
+            withdraw,
+          ),
+          withdraw,
+        }
+      }
       const existing = pending.get(id)
-      if (existing) return answer(existing.deferred)
+      if (existing) return registration(existing.deferred)
       yield* Effect.logInfo("asking", { id, questions: input.questions.length })
 
       const deferred = yield* Deferred.make<ReadonlyArray<Answer>, RejectedError>()
@@ -117,12 +146,11 @@ const layer = Layer.effect(
       }
       pending.set(id, { info, deferred })
       yield* events.publish(Event.Asked, info)
-      return answer(deferred)
+      return registration(deferred)
     })
 
     const ask = Effect.fn("Question.ask")(function* (input: AskInput) {
-      const answer = yield* register(input)
-      return yield* answer
+      return yield* (yield* register(input)).answer
     })
 
     const reply = Effect.fn("Question.reply")(function* (input: {

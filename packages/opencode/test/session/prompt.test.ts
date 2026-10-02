@@ -39,6 +39,7 @@ import { SessionRevert } from "../../src/session/revert"
 import { SessionRunState } from "../../src/session/run-state"
 import { MessageID, PartID, SessionID } from "../../src/session/schema"
 import { QuestionID } from "../../src/question/schema"
+import { QuestionOwner } from "../../src/question/owner"
 import { SessionStatus } from "../../src/session/status"
 import { SessionV2 } from "@opencode-ai/core/session"
 import { SessionExecution } from "@opencode-ai/core/session/execution"
@@ -51,7 +52,9 @@ import { Truncate } from "@/tool/truncate"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { Ripgrep } from "@opencode-ai/core/ripgrep"
 import { Format } from "../../src/format"
-import { TestInstance } from "../fixture/fixture"
+import { provideInstance, TestInstance } from "../fixture/fixture"
+import { InstanceStore } from "../../src/project/instance-store"
+import os from "os"
 import { awaitWithTimeout, pollWithTimeout, testEffect } from "../lib/effect"
 import { anthropicReply, reply, TestLLMServer } from "../lib/llm-server"
 import { Wire } from "../../src/session/cache/wire"
@@ -2827,8 +2830,8 @@ noLLMServer.instance(
 
 // Question recovery
 
-// A turn left behind by a process that died while its question tool waited.
-const orphanQuestion = Effect.fn("test.orphanQuestion")(function* (sessionID: SessionID) {
+// A turn whose question tool waits in another process: dead unless OWNER says otherwise.
+const orphanQuestion = Effect.fn("test.orphanQuestion")(function* (sessionID: SessionID, owner?: QuestionOwner.Owner) {
   const sessions = yield* Session.Service
   const requestID = QuestionID.ascending()
   const asker = yield* user(sessionID, "ask me")
@@ -2868,12 +2871,41 @@ const orphanQuestion = Effect.fn("test.orphanQuestion")(function* (sessionID: Se
           },
         ],
       },
-      metadata: { requestID },
+      metadata: owner ? { requestID, owner } : { requestID },
       time: { start: Date.now() },
     },
   })
   return { assistant, requestID }
 })
+
+// Another process of ours, standing in for the server or CLI that asked a question.
+const otherProcess = Effect.acquireRelease(
+  Effect.sync(() => {
+    const start = Date.now()
+    const child = Bun.spawn([process.execPath, "-e", "setInterval(() => {}, 1000)"], {
+      stdout: "ignore",
+      stderr: "ignore",
+    })
+    const owner: QuestionOwner.Owner = { pid: child.pid, start, host: os.hostname() }
+    return { child, owner }
+  }),
+  ({ child }) =>
+    Effect.promise(async () => {
+      child.kill()
+      await child.exited
+    }),
+)
+
+const deadProcess = Effect.gen(function* () {
+  const start = Date.now()
+  const child = Bun.spawn([process.execPath, "-e", ""], { stdout: "ignore", stderr: "ignore" })
+  yield* Effect.promise(() => child.exited)
+  const owner: QuestionOwner.Owner = { pid: child.pid, start, host: os.hostname() }
+  return owner
+})
+
+const ownerOf = (part: SessionV1.ToolPart | undefined) =>
+  part && "metadata" in part.state ? QuestionOwner.fromMetadata(part.state.metadata) : undefined
 
 const waitForIdle = (sessionID: SessionID) =>
   pollWithTimeout(
@@ -3001,5 +3033,79 @@ it.instance("a recovered question stays recoverable when its run is torn down", 
     expect((yield* question.list()).map((request) => request.id)).toEqual([orphan.requestID])
     yield* question.reject(orphan.requestID)
     yield* waitForIdle(chat.id)
+  }),
+)
+
+it.instance("recover leaves a question to its live asking process", () =>
+  Effect.gen(function* () {
+    yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const question = yield* Question.Service
+    const status = yield* SessionStatus.Service
+    const chat = yield* sessions.create({ title: "Pinned" })
+    // A CLI command bootstrapping the directory while the server still waits on the answer.
+    const { owner } = yield* otherProcess
+    const orphan = yield* orphanQuestion(chat.id, owner)
+
+    yield* prompt.recover()
+    expect(yield* question.list()).toEqual([])
+    expect((yield* status.get(chat.id)).type).toBe("idle")
+    const turn = yield* turnOf(chat.id, orphan.assistant.id)
+    expect(toolPart(turn.parts)?.state.status).toBe("running")
+    expect(ownerOf(toolPart(turn.parts))).toEqual(owner)
+    expect(turn.info.role === "assistant" && turn.info.time.completed).toBeUndefined()
+  }),
+)
+
+it.instance("recover takes over a question whose asking process died", () =>
+  Effect.gen(function* () {
+    yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const question = yield* Question.Service
+    const chat = yield* sessions.create({ title: "Pinned" })
+    const orphan = yield* orphanQuestion(chat.id, yield* deadProcess)
+
+    yield* prompt.recover()
+    expect((yield* question.list()).map((request) => request.id)).toEqual([orphan.requestID])
+    // Claimed, so that processes bootstrapping later leave it to this one.
+    const tool = toolPart((yield* turnOf(chat.id, orphan.assistant.id)).parts)
+    expect(ownerOf(tool)).toEqual(QuestionOwner.current)
+    expect(tool && "metadata" in tool.state && tool.state.metadata?.requestID).toBe(orphan.requestID)
+
+    yield* question.reject(orphan.requestID)
+    yield* waitForIdle(chat.id)
+  }),
+)
+
+it.instance("a recovered question stays recoverable when its instance is disposed", () =>
+  Effect.gen(function* () {
+    yield* useServerConfig(providerCfg)
+    const test = yield* TestInstance
+    const store = yield* InstanceStore.Service
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const question = yield* Question.Service
+    const chat = yield* sessions.create({ title: "Pinned" })
+    const orphan = yield* orphanQuestion(chat.id)
+
+    yield* prompt.recover()
+    expect((yield* question.list()).map((request) => request.id)).toEqual([orphan.requestID])
+    // What a short-lived CLI command does on exit: the pending request goes away with it.
+    yield* store.reload({ directory: test.directory })
+
+    // A dismissal would settle the part; give the recovered turn time to react.
+    yield* Effect.sleep("300 millis")
+    const turn = yield* turnOf(chat.id, orphan.assistant.id)
+    expect(toolPart(turn.parts)?.state.status).toBe("running")
+    expect(turn.info.role === "assistant" && turn.info.time.completed).toBeUndefined()
+
+    yield* Effect.gen(function* () {
+      yield* prompt.recover()
+      expect((yield* question.list()).map((request) => request.id)).toEqual([orphan.requestID])
+      yield* question.reject(orphan.requestID)
+      yield* waitForIdle(chat.id)
+    }).pipe(provideInstance(test.directory))
   }),
 )
