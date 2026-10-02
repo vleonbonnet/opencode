@@ -192,9 +192,12 @@ const layer = Layer.effect(
       step: number
       processor: Pick<SessionProcessor.Handle, "message" | "updateToolCall" | "completeToolCall">
       onStructured: (output: unknown) => void
+      /** Consent from the user for dropping stale thinking on step 1. */
+      acceptThinkingLoss?: boolean
     }) {
       const { session, msgs, lastUser, agent, model } = input
       const isLastStep = input.step >= (agent.steps ?? Infinity)
+      if (input.acceptThinkingLoss) CacheLedger.acceptThinkingLoss(session.id)
       const lastUserMsg = msgs.findLast((m) => m.info.role === "user")
       const bypassAgentCheck = lastUserMsg?.parts.some((p) => p.type === "agent") ?? false
       const promptOps = yield* ops()
@@ -377,9 +380,19 @@ const layer = Layer.effect(
         return unknown(`dry run did not reach the network layer: ${why}`, targetInfo)
       }
       const report = CacheLedger.predict(sessionID, captured)
+      const stale = CacheLedger.checkThinking(sessionID, captured)
       return {
         ...report,
         reasons: pendingTask?.type === "subtask" ? [...report.reasons, "a pending subtask runs first"] : report.reasons,
+        ...(stale
+          ? {
+              staleThinking: {
+                count: stale.signatures.length,
+                reason: stale.reason,
+                ...(stale.divergence?.previousPath ? { path: stale.divergence.previousPath } : {}),
+              },
+            }
+          : {}),
         ...preflightTarget(targetInfo),
       } satisfies PreflightResult
     })
@@ -1480,6 +1493,7 @@ const layer = Layer.effect(
                 onStructured(output) {
                   structured = output
                 },
+                ...(lastUser.acceptThinkingLoss && step === 1 ? { acceptThinkingLoss: true } : {}),
               }),
             )
 
@@ -1856,6 +1870,7 @@ const layer = Layer.effect(
         agent: userAgent,
         parts,
         variant: input.variant,
+        acceptThinkingLoss: input.acceptThinkingLoss,
       })
       yield* events.publish(Command.Event.Executed, {
         name: input.command,
@@ -1955,12 +1970,21 @@ export const PreflightResult = Schema.Struct({
     }),
   ),
   verification: Schema.optional(Schema.Array(CacheVerification)),
+  staleThinking: Schema.optional(
+    Schema.Struct({
+      count: Schema.Number,
+      reason: Schema.String,
+      path: Schema.optional(Schema.String),
+    }),
+  ),
 }).annotate({ identifier: "SessionPreflight" })
 export type PreflightResult = Schema.Schema.Type<typeof PreflightResult>
 
 export const PromptInput = Schema.Struct({
   sessionID: SessionID,
   messageID: Schema.optional(MessageID),
+  /** The user accepted dropping thinking blocks this turn invalidates. */
+  acceptThinkingLoss: Schema.optional(Schema.Boolean),
   model: Schema.optional(ModelRef),
   agent: Schema.optional(Schema.String),
   noReply: Schema.optional(Schema.Boolean),
@@ -1997,6 +2021,8 @@ export type ShellInput = Schema.Schema.Type<typeof ShellInput>
 
 export const CommandInput = Schema.Struct({
   messageID: Schema.optional(MessageID),
+  /** The user accepted dropping thinking blocks this turn invalidates. */
+  acceptThinkingLoss: Schema.optional(Schema.Boolean),
   sessionID: SessionID,
   agent: Schema.optional(Schema.String),
   model: Schema.optional(Schema.String),

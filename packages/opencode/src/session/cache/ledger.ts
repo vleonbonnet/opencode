@@ -46,12 +46,18 @@ type Verification = {
 type SessionRecord = {
   last?: Snapshot & { usage: Usage; prompt: number }
   verifications: Verification[]
+  /**
+   * Signatures of thinking blocks still replayable, with the binding key each
+   * was signed under (tool set + thinking config, and messages up to it).
+   */
+  thinking: Map<string, { head: string; message: number; messages: string }>
 }
 
 type Pending = {
   normalized: CacheModel.Normalized
   predicted: Match | undefined
   time: number
+  body: Captured | undefined
 }
 
 type Match = {
@@ -88,6 +94,10 @@ export type Report = {
   readonly verification?: readonly Verification[]
 }
 
+// Expired entries are kept this long so a miss can say why ("expired after
+// N idle minutes") instead of looking like a prefix that never existed.
+const RETAIN_EXPIRED = 24 * 60 * 60_000
+
 // Allow for provider rounding (e.g. Fireworks reports cache in 16k pages) and,
 // for estimated entries, for the byte-to-token spread.
 const tolerance = (value: number, exact = true) => Math.max(4096, Math.round(value * (exact ? 0.1 : 0.25)))
@@ -104,7 +114,7 @@ let loaded = false
 function session(id: string) {
   let record = sessions.get(id)
   if (!record) {
-    record = { verifications: [] }
+    record = { verifications: [], thinking: new Map() }
     sessions.set(id, record)
   }
   return record
@@ -135,6 +145,12 @@ export function reset() {
   loaded = true
 }
 
+/** Binding keys per thinking signature, for the wire send-check. */
+export function thinking(sessionID: string): ReadonlyMap<string, { head: string; message: number; messages: string }> {
+  load()
+  return session(sessionID).thinking
+}
+
 function load() {
   if (loaded) return
   loaded = true
@@ -146,9 +162,11 @@ function load() {
     }
     const now = Date.now()
     for (const [ns, map] of Object.entries(data.entries ?? {})) {
-      for (const [key, entry] of Object.entries(map)) if (entry.expires > now) namespace(ns).set(key, entry)
+      for (const [key, entry] of Object.entries(map))
+        if (entry.expires > now - RETAIN_EXPIRED) namespace(ns).set(key, entry)
     }
-    for (const [id, record] of Object.entries(data.sessions ?? {})) sessions.set(id, record)
+    for (const [id, record] of Object.entries(data.sessions ?? {}))
+      sessions.set(id, { ...record, thinking: new Map(Object.entries(record.thinking ?? {})) })
   } catch {
     // Missing or corrupt ledger: predictions start from nothing (fail-safe).
   }
@@ -166,7 +184,7 @@ function flush() {
     }
     for (const [ns, map] of entries) {
       for (const [key, entry] of map) {
-        if (entry.expires <= now) {
+        if (entry.expires <= now - RETAIN_EXPIRED) {
           map.delete(key)
           continue
         }
@@ -374,6 +392,10 @@ export function predict(sessionID: string, request: Captured): Report {
       `a cached prefix exists at ${normalized.blocks[unreachable.index].path} but is more than ${CacheModel.ANTHROPIC_LOOKBACK} blocks before the request's cache breakpoints`,
     )
   }
+  if (previous && reusable === 0 && !reasons.length && !diff)
+    reasons.push("no cached prefix of this request is known: the provider never confirmed one, or evicted it")
+  else if (previous && !reasons.length && lost > tolerance(previous.prompt))
+    reasons.push("the previous request's full prompt is not cached: only an earlier prefix is known")
   const recent = record?.verifications.slice(-3) ?? []
   const unreliable = recent.filter((item) => !item.ok).length
   if (unreliable) {
@@ -437,6 +459,7 @@ function recordSend(tag: Tag, request: Captured) {
     normalized,
     predicted: best ? { index: best.index, tokens: best.entry.tokens, exact: best.entry.exact } : undefined,
     time: request.time,
+    body: request,
   })
   const map = new Map<string, string>()
   for (const block of normalized.blocks) map.set(block.own, block.excerpt)
@@ -470,6 +493,22 @@ export function observe(sessionID: string, usage: Usage) {
   })
   record.verifications = record.verifications.slice(-20)
   record.last = { ...snapshot(normalized, sent.time), usage, prompt }
+  // Remember each thinking signature with the binding key it was signed
+  // under, so a later request can tell which blocks are still replayable.
+  if (sent.body) {
+    const { key } = CacheModel.bindingKey(sent.body)
+    const signed = CacheModel.signedThinking(sent.body)
+    if (key) {
+      record.thinking.clear()
+      for (const blocks of signed.values())
+        for (const block of blocks)
+          record.thinking.set(block.id, {
+            head: key.head,
+            message: block.message,
+            messages: key.messages[block.message] ?? "",
+          })
+    }
+  }
 
   if (normalized.format !== "unknown" && normalized.blocks.length > 0) {
     const map = namespace(normalized.namespace)
@@ -525,11 +564,86 @@ export function observe(sessionID: string, usage: Usage) {
   flush()
 }
 
+export type StaleThinking = {
+  /** Signatures the request would invalidate. */
+  readonly signatures: readonly string[]
+  /** First divergence against the recorded binding, for the message. */
+  readonly reason: "no binding recorded" | "tools or thinking config changed" | "earlier messages changed"
+  readonly divergence?: Divergence
+}
+
+/**
+ * Which thinking signatures of REQUEST (about to be sent) are no longer bound
+ * to the prefix they were created under. Empty when every block is replayable
+ * or the request carries none.
+ */
+export function checkThinking(sessionID: string, request: Captured): StaleThinking | undefined {
+  load()
+  const record = sessions.get(sessionID)
+  if (!record || record.thinking.size === 0) return
+  const { key } = CacheModel.bindingKey(request)
+  if (!key) return
+  const signed = CacheModel.signedThinking(request)
+  if (signed.size === 0) return
+  const stale: string[] = []
+  for (const blocks of signed.values())
+    for (const block of blocks) {
+      const bound = record.thinking.get(block.id)
+      if (!bound) continue
+      if (bound.head === key.head && bound.messages === key.messages[block.message]) continue
+      stale.push(block.id)
+    }
+  if (stale.length === 0) return
+  const reason = [...record.thinking.values()].some((bound) => bound.head !== key.head)
+    ? ("tools or thinking config changed" as const)
+    : ("earlier messages changed" as const)
+  const diff = record.last ? divergence(CacheModel.normalize(request), record.last, sessionID) : undefined
+  return { signatures: stale, reason, ...(diff ? { divergence: diff } : {}) }
+}
+
 /** Drop the pending request of SESSIONID (the request failed before usage). */
 export function discard(sessionID: string) {
   pending.delete(sessionID)
 }
 
+/** Test hook: drop all recorded binding keys, so the next send looks stale. */
+export function rewindThinking(sessionID: string) {
+  load()
+  session(sessionID).thinking.clear()
+  flush()
+}
+
+/** Forget THINKING signatures (they were dropped with the user's consent). */
+export function forgetThinking(sessionID: string, signatures: readonly string[]) {
+  load()
+  const record = sessions.get(sessionID)
+  if (!record) return
+  for (const signature of signatures) record.thinking.delete(signature)
+  flush()
+}
+
 Wire.onSend(recordSend)
+
+// Consent for dropping stale thinking, set by the prompt loop when the user
+// accepted the loss; cleared when the request is observed or discarded.
+const consented = new Set<string>()
+
+/** Accept stale thinking on SESSIONID's next request (the user agreed). */
+export function acceptThinkingLoss(sessionID: string) {
+  consented.add(sessionID)
+}
+
+Wire.guard((tag, request) => {
+  load()
+  const stale = checkThinking(tag.sessionID, request)
+  if (!stale) return
+  if (consented.delete(tag.sessionID)) {
+    forgetThinking(tag.sessionID, stale.signatures)
+    return
+  }
+  throw new Error(
+    `stale thinking: ${stale.signatures.length} thinking block${stale.signatures.length === 1 ? "" : "s"} no longer match the conversation (${stale.reason})`,
+  )
+})
 
 export * as CacheLedger from "./ledger"

@@ -919,7 +919,7 @@ describe("ProviderTransform.providerOptions", () => {
   })
 
   describe("anthropic thinking block binding", () => {
-    const binding = { prefixMismatchBehavior: "drop_block" }
+    const binding = { prefixMismatchBehavior: "error" }
     // Adaptive thinking on Claude asks for the summarized display (see anthropicThinkingDisplay).
     const shown = (option: string) => (option === "thinking" ? { display: "summarized" } : {})
     const claude = (npm: string, id: string) =>
@@ -1184,7 +1184,7 @@ describe("ProviderTransform.providerOptions", () => {
       expect(sent?.body.thinking).toEqual({
         type: "adaptive",
         display: "summarized",
-        block_binding: { prefix_mismatch_behavior: "drop_block" },
+        block_binding: { prefix_mismatch_behavior: "error" },
       })
       expect(sent?.headers.get("anthropic-beta")?.split(",")).toContain("thinking-binding-controls-2026-08-01")
       expect(result.providerMetadata?.anthropic?.inputTransformations).toEqual([
@@ -1234,7 +1234,7 @@ describe("ProviderTransform.providerOptions", () => {
       expect(sent?.body.thinking).toEqual({
         type: "adaptive",
         display: "summarized",
-        block_binding: { prefix_mismatch_behavior: "drop_block" },
+        block_binding: { prefix_mismatch_behavior: "error" },
       })
       expect(sent?.headers.get("anthropic-beta")?.split(",")).toContain("thinking-binding-controls-2026-08-01")
     })
@@ -1266,7 +1266,7 @@ describe("ProviderTransform.providerOptions", () => {
       })
       expect(body.additionalModelRequestFields.thinking).toEqual({
         type: "adaptive",
-        block_binding: { prefix_mismatch_behavior: "drop_block" },
+        block_binding: { prefix_mismatch_behavior: "error" },
       })
       expect(body.additionalModelRequestFields.anthropic_beta).toContain("thinking-binding-controls-2026-08-01")
     })

@@ -85,6 +85,11 @@ function exponential(attempt: number, random: number) {
 export function retryable(error: Err, provider: string) {
   // context overflow errors should not be retried
   if (SessionV1.ContextOverflowError.isInstance(error)) return undefined
+  // Stale thinking needs the user's consent, not a retry.
+  if (typeof error.data === "object" && error.data !== null && "message" in error.data) {
+    const message = (error.data as { message?: unknown }).message
+    if (typeof message === "string" && message.includes("stale thinking")) return undefined
+  }
   if (SessionV1.APIError.isInstance(error)) {
     const status = error.data.statusCode
     // 5xx errors are transient server failures and should always be retried,

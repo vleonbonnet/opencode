@@ -703,6 +703,7 @@ const layer = Layer.effect(
             Effect.ensuring(cleanup()),
           )
 
+          CacheLedger.discard(ctx.sessionID)
           if (ctx.needsCompaction) return "compact"
           if (ctx.blocked || ctx.assistantMessage.error) return "stop"
           return "continue"

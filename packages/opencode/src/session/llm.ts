@@ -57,10 +57,39 @@ export type StreamInput = {
    * before it reaches the network (see SessionPrompt.preflight).
    */
   wire?: { mode: Wire.Mode; id: string }
+  /**
+   * The user accepted that thinking blocks from earlier turns are dropped:
+   * the stale blocks are omitted from this and later requests.
+   */
+  acceptThinkingLoss?: boolean
 }
 
 export type StreamRequest = StreamInput & {
   abort: AbortSignal
+}
+
+/**
+ * A request carried thinking blocks that are no longer bound to the prefix
+ * they were created under (the system prompt, tools or earlier messages
+ * changed). With block binding set to "error", every gateway rejects the
+ * request, so the caller must either replay the turn with consent
+ * (`acceptThinkingLoss`) or surface the error.
+ */
+export class StaleThinkingError extends Error {
+  readonly _tag = "StaleThinkingError"
+  constructor(
+    readonly sessionID: string,
+    readonly count: number,
+    readonly reason: string,
+    readonly detail?: string,
+  ) {
+    super(
+      `${count} thinking block${count === 1 ? "" : "s"} no longer match the conversation (${reason})` +
+        (detail ? `: ${detail}` : "") +
+        ". Confirm dropping them to send this turn.",
+    )
+    this.name = "StaleThinkingError"
+  }
 }
 
 export interface Interface {
@@ -136,6 +165,11 @@ const live: Layer.Layer<
               id: input.wire?.id ?? Wire.nextID(),
               sessionID: input.sessionID,
             })
+
+      // With prefix_mismatch_behavior "error", every gateway rejects a request
+      // whose signed thinking no longer matches the prefix it was created
+      // under. Check before anything is sent, so the failure is a visible
+      // session error on every provider and the client can ask for consent.
 
       // Wire up toolExecutor for DWS workflow models so that tool calls
       // from the workflow service are executed via opencode's tool system

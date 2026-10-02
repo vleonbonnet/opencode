@@ -354,6 +354,12 @@ export const User = Schema.Struct({
   }),
   system: Schema.optional(Schema.String),
   tools: Schema.optional(Schema.Record(Schema.String, Schema.Boolean)),
+  /**
+   * The user accepted that this turn drops thinking blocks whose signatures
+   * no longer match the conversation (the system prompt, tools or earlier
+   * messages changed since they were created).
+   */
+  acceptThinkingLoss: Schema.optional(Schema.Boolean),
 }).annotate({ identifier: "UserMessage" })
 export type User = Types.DeepMutable<Schema.Schema.Type<typeof User>>
 

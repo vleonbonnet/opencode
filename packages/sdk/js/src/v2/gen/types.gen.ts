@@ -263,6 +263,7 @@ export type UserMessage = {
   tools?: {
     [key: string]: boolean
   }
+  acceptThinkingLoss?: boolean
 }
 
 export type ProviderAuthError = {
@@ -2650,6 +2651,11 @@ export type SessionPreflight = {
     prompt: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
     ok: boolean
   }>
+  staleThinking?: {
+    count: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+    reason: string
+    path?: string
+  }
 }
 
 export type SessionBusyError = {
@@ -9879,6 +9885,7 @@ export type SessionMessagesResponse2 = SessionMessagesResponses[keyof SessionMes
 export type SessionPromptData = {
   body?: {
     messageID?: string
+    acceptThinkingLoss?: boolean
     model?: {
       providerID: string
       modelID: string
@@ -10226,6 +10233,7 @@ export type SessionSummarizeResponse = SessionSummarizeResponses[keyof SessionSu
 export type SessionPromptAsyncData = {
   body?: {
     messageID?: string
+    acceptThinkingLoss?: boolean
     model?: {
       providerID: string
       modelID: string
@@ -10322,6 +10330,7 @@ export type SessionPreflightResponse = SessionPreflightResponses[keyof SessionPr
 export type SessionCommandData = {
   body?: {
     messageID?: string
+    acceptThinkingLoss?: boolean
     agent?: string
     model?: string
     arguments: string

@@ -3747,6 +3747,7 @@ export class Session2 extends HeyApiClient {
       directory?: string
       workspace?: string
       messageID?: string
+      acceptThinkingLoss?: boolean
       model?: {
         providerID: string
         modelID: string
@@ -3772,6 +3773,7 @@ export class Session2 extends HeyApiClient {
             { in: "query", key: "directory" },
             { in: "query", key: "workspace" },
             { in: "body", key: "messageID" },
+            { in: "body", key: "acceptThinkingLoss" },
             { in: "body", key: "model" },
             { in: "body", key: "agent" },
             { in: "body", key: "noReply" },
@@ -4100,6 +4102,7 @@ export class Session2 extends HeyApiClient {
       directory?: string
       workspace?: string
       messageID?: string
+      acceptThinkingLoss?: boolean
       model?: {
         providerID: string
         modelID: string
@@ -4125,6 +4128,7 @@ export class Session2 extends HeyApiClient {
             { in: "query", key: "directory" },
             { in: "query", key: "workspace" },
             { in: "body", key: "messageID" },
+            { in: "body", key: "acceptThinkingLoss" },
             { in: "body", key: "model" },
             { in: "body", key: "agent" },
             { in: "body", key: "noReply" },
@@ -4216,6 +4220,7 @@ export class Session2 extends HeyApiClient {
       directory?: string
       workspace?: string
       messageID?: string
+      acceptThinkingLoss?: boolean
       agent?: string
       model?: string
       arguments?: string
@@ -4241,6 +4246,7 @@ export class Session2 extends HeyApiClient {
             { in: "query", key: "directory" },
             { in: "query", key: "workspace" },
             { in: "body", key: "messageID" },
+            { in: "body", key: "acceptThinkingLoss" },
             { in: "body", key: "agent" },
             { in: "body", key: "model" },
             { in: "body", key: "arguments" },

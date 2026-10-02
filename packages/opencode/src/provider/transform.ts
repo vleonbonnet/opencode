@@ -706,12 +706,14 @@ function anthropicBindsThinking(apiId: string) {
 }
 
 // Fable 5.1 binds each thinking signature to the system prompt, tool list, and
-// messages above it, and rejects the request when any of that changes. opencode
-// re-renders parts of that prefix between turns (system prompt, tools, compaction),
-// so ask the API to drop the affected blocks instead of failing the request.
+// messages above it, and rejects the request when any of that changes. Sending
+// "error" makes every gateway fail loudly on a mismatch instead of silently
+// dropping the affected blocks (Copilot's and Grove's default was to keep
+// going without saying anything). opencode checks the binding itself before
+// sending, and asks the user before a turn that invalidates thinking.
 // Older model deployments may reject this field, even with thinking enabled.
 // The patched AI SDK adds the thinking-binding-controls beta whenever it is set.
-const ANTHROPIC_BLOCK_BINDING = { prefixMismatchBehavior: "drop_block" }
+const ANTHROPIC_BLOCK_BINDING = { prefixMismatchBehavior: "error" }
 
 function anthropicBlockBinding(model: Provider.Model, options: { [x: string]: any }) {
   const sdk = sdkKey(model.api.npm)

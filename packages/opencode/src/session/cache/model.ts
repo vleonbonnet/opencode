@@ -449,3 +449,73 @@ export function normalize(request: Captured): Normalized {
 }
 
 export * as CacheModel from "./model"
+
+// Thinking-signature binding ------------------------------------------------
+
+// What an Anthropic thinking signature is bound to, from measurements on
+// direct Anthropic and Copilot (claude-opus-5-5): the tool set (order does not
+// matter), the system prompt, and every message before the block. Ignored:
+// max_tokens, output_config.effort, thinking.display, tool_choice, sampling.
+// `thinking` itself must be present in the replayed request or the block is
+// rejected, so it is keyed too.
+
+/** Which messages are bound to signatures at MESSAGE index I. */
+export type BoundMessages = readonly (readonly number[])[]
+
+const THINKING_BOUND_TYPES = new Set(["thinking", "redacted_thinking"])
+
+export type BindingKey = {
+  /** Hash of the tool set (sorted) and the thinking config. */
+  readonly head: string
+  /** Hash of messages 0..i inclusive, chained, at each message index. */
+  readonly messages: string[]
+}
+
+export function bindingKey(request: Captured): { format: Format; key: BindingKey | undefined } {
+  let body: unknown
+  try {
+    body = request.body === undefined ? undefined : JSON.parse(request.body)
+  } catch {
+    body = undefined
+  }
+  if (!isRecord(body) || detect(request, body) !== "anthropic") return { format: detect(request, body), key: undefined }
+  const tools = (Array.isArray(body.tools) ? body.tools : []).map((tool) => stable(stripMarkers(tool))).sort()
+  const thinking = isRecord(body.thinking) ? { ...body.thinking, display: undefined } : undefined
+  const head = hash("tools:" + stable(tools) + "\nthinking:" + stable(thinking))
+  const messages: string[] = []
+  let previous = head
+  const list = Array.isArray(body.messages) ? body.messages : []
+  list.forEach((message, index) => {
+    previous = hash(
+      previous +
+        "\u0000" +
+        stable(stripMarkers(isRecord(message) ? { role: message.role, content: message.content } : message)),
+    )
+    messages.push(previous)
+  })
+  return { format: "anthropic", key: { head, messages } }
+}
+
+/** Extract the signed thinking blocks of an Anthropic request, per message. */
+export function signedThinking(request: Captured): ReadonlyMap<number, { id: string; message: number }[]> {
+  let body: unknown
+  try {
+    body = request.body === undefined ? undefined : JSON.parse(request.body)
+  } catch {
+    return new Map()
+  }
+  const out = new Map<number, { id: string; message: number }[]>()
+  const format = detect(request, body)
+  if (!isRecord(body) || format !== "anthropic" || !Array.isArray(body.messages)) return out
+  body.messages.forEach((message: unknown, index: number) => {
+    if (!isRecord(message) || !Array.isArray(message.content)) return
+    for (const block of message.content) {
+      if (!isRecord(block) || !THINKING_BOUND_TYPES.has(String(block.type))) continue
+      const signature = block.signature
+      if (typeof signature !== "string" || !signature) continue
+      const item = { id: signature, message: index }
+      out.set(index, [...(out.get(index) ?? []), item])
+    }
+  })
+  return out
+}

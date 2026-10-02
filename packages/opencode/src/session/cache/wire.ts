@@ -48,6 +48,7 @@ export function isDryRunCaptured(error: unknown): boolean {
 const SENTINEL = Symbol.for("opencode.wire-capture")
 const captured = new Map<string, Captured>()
 const senders = new Set<(tag: Tag, request: Captured) => void>()
+const guards = new Set<(tag: Tag, request: Captured) => void>()
 const observers = new Set<(tag: Tag, request: Captured) => void>()
 let counter = 0
 
@@ -73,6 +74,16 @@ function parse(value: string): Tag | undefined {
 export function onSend(listener: (tag: Tag, request: Captured) => void) {
   senders.add(listener)
   return () => senders.delete(listener)
+}
+
+/**
+ * Register a guard for tagged "send" requests: throw to stop the request
+ * before it reaches the network. Listeners run in registration order ahead
+ * of `onSend` accounting.
+ */
+export function guard(listener: (tag: Tag, request: Captured) => void) {
+  guards.add(listener)
+  return () => guards.delete(listener)
 }
 
 /** Observe every tagged request, dry runs included (diagnostics and tests). */
@@ -156,6 +167,8 @@ export function install() {
       if (captured.size > 64) captured.delete(captured.keys().next().value!)
       throw new DryRunCaptured(tag.id)
     }
+    // Guards run ahead of accounting and may throw to stop the request.
+    for (const guard of guards) guard(tag, request)
     notify(senders, tag, request)
     return original(input, forward)
   }

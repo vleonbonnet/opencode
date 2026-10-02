@@ -85,7 +85,9 @@ const layer = Layer.effect(
             `  Workspace root folder: ${ctx.worktree}`,
             `  Is directory a git repo: ${ctx.project.vcs === "git" ? "yes" : "no"}`,
             `  Platform: ${process.platform}`,
-            `  Today's date: ${new Date().toDateString()}`,
+            // No date: the system prompt is re-rendered for every request, so a
+            // date here changes it at midnight, which discards the prompt cache
+            // and invalidates every earlier thinking signature in the session.
             `</env>`,
           ].join("\n"),
           references.length === 0

@@ -278,6 +278,39 @@ describe("CacheLedger", () => {
     expect(report.reasons[0]).toContain("cache namespace changed (credential, endpoint)")
   })
 
+  test("a miss long after expiry reports the idle time", async () => {
+    // The previous request must be recent enough to be the session's `last`
+    // (older sessions cannot have a live cache), while the entry it wrote
+    // must be old enough to have expired.
+    setSystemTime(new Date(Date.now() - 70 * 60_000))
+    try {
+      await wire(sessionID, request(ANTHROPIC, anthropicBody(turn1)))
+      CacheLedger.observe(sessionID, { input: 3, read: 0, write: 120_000 })
+    } finally {
+      setSystemTime()
+    }
+    const n = CacheModel.normalize(request(ANTHROPIC, anthropicBody(turn2)))
+    const report = CacheLedger.predict(sessionID, request(ANTHROPIC, anthropicBody(turn2)))
+    expect(report.status).toBe("miss")
+    expect(report.reasons.some((reason) => reason.startsWith("cached prefix expired: idle ~70m"))).toBe(true)
+  })
+
+  test("a miss without a known reason still explains itself", async () => {
+    const report = CacheLedger.predict(sessionID, request(ANTHROPIC, anthropicBody(turn1)))
+    // No previous request: the unknown reason is there anyway.
+    expect(report.reasons).not.toHaveLength(0)
+    await wire(sessionID, request(ANTHROPIC, anthropicBody(turn1)))
+    CacheLedger.observe(sessionID, { input: 3, read: 0, write: 120_000 })
+    // A namespace that never saw this prefix (evicted server-side).
+    const other = "ses_other2"
+    await wire(other, request(ANTHROPIC, anthropicBody(turn1)))
+    CacheLedger.observe(other, { input: 3, read: 0, write: 120_000 })
+    const probe = request(ANTHROPIC, anthropicBody(turn2), { "x-api-key": "key-c" })
+    const report2 = CacheLedger.predict(sessionID, probe)
+    expect(report2.status).toBe("miss")
+    expect(report2.reasons.some((reason) => reason.startsWith("cache namespace changed"))).toBe(true)
+  })
+
   test("a namespace switch can hit a prefix another session cached there", async () => {
     const copilot = (body: Body) =>
       request("https://api.githubcopilot.com/v1/messages", body, { "x-api-key": "", authorization: "Bearer c" })
@@ -361,6 +394,109 @@ describe("CacheLedger", () => {
     const report = CacheLedger.unknown(sessionID, "compaction")
     expect(report.lostTokens).toBe(120_003)
     expect(report.reasons).toEqual(["compaction"])
+  })
+})
+
+describe("CacheLedger thinking binding", () => {
+  const sessionID = "ses_think"
+  const turn1 = [user("hello " + "x".repeat(4000))]
+  const turn2 = [...turn1, assistant("hi " + "y".repeat(4000)), user("second")]
+
+  const think = (id: string) => ({ type: "thinking", thinking: "hmm " + id, signature: id })
+  const bodyWithThinking = (messages: Body[]) => {
+    const body = anthropicBody(messages, { thinking: { type: "adaptive" } })
+    const first = body.messages[0].content
+    body.messages[0] = { ...body.messages[0], content: [think("sig-1"), ...first] }
+    return body
+  }
+
+  test("replaying the same messages keeps the block valid", async () => {
+    await wire(sessionID, request(ANTHROPIC, bodyWithThinking(turn1)))
+    CacheLedger.observe(sessionID, { input: 3, read: 0, write: 120_000 })
+    const report = CacheLedger.checkThinking(sessionID, request(ANTHROPIC, bodyWithThinking(turn2)))
+    expect(report?.signatures ?? []).toEqual([])
+  })
+
+  test("an edited earlier message invalidates the block, with the divergence", async () => {
+    await wire(sessionID, request(ANTHROPIC, bodyWithThinking(turn1)))
+    CacheLedger.observe(sessionID, { input: 3, read: 0, write: 120_000 })
+    const edited = [user("hello " + "x".repeat(4000) + " EDITED"), ...turn2.slice(1)]
+    const report = CacheLedger.checkThinking(sessionID, request(ANTHROPIC, bodyWithThinking(edited)))
+    expect(report?.signatures).toEqual(["sig-1"])
+    expect(report?.reason).toBe("earlier messages changed")
+    expect(report?.divergence?.previousPath).toBe("messages[0].content[1] (user text)")
+  })
+
+  test("a changed tool list invalidates the block", async () => {
+    await wire(sessionID, request(ANTHROPIC, bodyWithThinking(turn1)))
+    CacheLedger.observe(sessionID, { input: 3, read: 0, write: 120_000 })
+    const report = CacheLedger.checkThinking(
+      sessionID,
+      request(ANTHROPIC, bodyWithThinking(turn2), { "x-api-key": "k" }) as any,
+    )
+    expect(report).toBeUndefined()
+    const body = bodyWithThinking(turn2)
+    body.tools = [tool("read")]
+    const changed = CacheLedger.checkThinking(sessionID, request(ANTHROPIC, body))
+    expect(changed?.signatures).toEqual(["sig-1"])
+    expect(changed?.reason).toBe("tools or thinking config changed")
+  })
+
+  test("the thinking config itself keys the binding, its display does not", async () => {
+    await wire(sessionID, request(ANTHROPIC, bodyWithThinking(turn1)))
+    CacheLedger.observe(sessionID, { input: 3, read: 0, write: 120_000 })
+    const omitted = bodyWithThinking(turn2)
+    omitted.thinking = undefined
+    expect(CacheLedger.checkThinking(sessionID, request(ANTHROPIC, omitted))?.signatures).toEqual(["sig-1"])
+    const display = bodyWithThinking(turn2)
+    display.thinking = { type: "adaptive", display: "summarized" }
+    expect(CacheLedger.checkThinking(sessionID, request(ANTHROPIC, display))?.signatures ?? []).toEqual([])
+  })
+
+  test("forgetting a dropped signature stops reporting it", async () => {
+    await wire(sessionID, request(ANTHROPIC, bodyWithThinking(turn1)))
+    CacheLedger.observe(sessionID, { input: 3, read: 0, write: 120_000 })
+    const edited = [user("hello " + "x".repeat(4000) + " EDITED"), ...turn2.slice(1)]
+    expect(CacheLedger.checkThinking(sessionID, request(ANTHROPIC, bodyWithThinking(edited)))?.signatures).toEqual([
+      "sig-1",
+    ])
+    CacheLedger.forgetThinking(sessionID, ["sig-1"])
+    expect(CacheLedger.checkThinking(sessionID, request(ANTHROPIC, bodyWithThinking(edited)))).toBeUndefined()
+  })
+
+  test("the wire guard refuses stale thinking and accepts it once consented", async () => {
+    await wire(sessionID, request(ANTHROPIC, bodyWithThinking(turn1)))
+    CacheLedger.observe(sessionID, { input: 3, read: 0, write: 120_000 })
+    const edited = [user("hello " + "x".repeat(4000) + " EDITED"), ...turn2.slice(1)]
+    const captured = request(ANTHROPIC, bodyWithThinking(edited))
+    const original = globalThis.fetch
+    try {
+      globalThis.fetch = (async () => new Response("{}")) as unknown as typeof fetch
+      Wire.install()
+      await expect(
+        globalThis.fetch(captured.url, {
+          method: "POST",
+          headers: { ...captured.headers, ...Wire.header({ mode: "send", id: Wire.nextID(), sessionID }) },
+          body: captured.body,
+        }),
+      ).rejects.toThrow("stale thinking")
+      CacheLedger.acceptThinkingLoss(sessionID)
+      // Consent drops the stale signature, so the request goes out and later
+      // requests with the same history pass without consent.
+      await globalThis.fetch(captured.url, {
+        method: "POST",
+        headers: { ...captured.headers, ...Wire.header({ mode: "send", id: Wire.nextID(), sessionID }) },
+        body: captured.body,
+      })
+      expect(CacheLedger.thinking(sessionID).has("sig-1")).toBe(false)
+      await globalThis.fetch(captured.url, {
+        method: "POST",
+        headers: { ...captured.headers, ...Wire.header({ mode: "send", id: Wire.nextID(), sessionID }) },
+        body: captured.body,
+      })
+    } finally {
+      globalThis.fetch = original
+    }
   })
 })
 
