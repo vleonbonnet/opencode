@@ -270,6 +270,61 @@ description: A skill in the .claude/skills directory.
     ),
   )
 
+  it.live("prefers opencode's own skill over .claude and .agents duplicates, however long they take to parse", () =>
+    provideTmpdirInstance(
+      (dir) =>
+        Effect.gen(function* () {
+          const write = (root: string, description: string, body: string) =>
+            Bun.write(
+              path.join(dir, root, "shared-skill", "SKILL.md"),
+              `---\nname: shared-skill\ndescription: ${description}\n---\n\n${body}\n`,
+            )
+          // The external copies parse last, which used to let them win.
+          const slow = "# Slow\n\n" + "Lorem ipsum dolor sit amet. ".repeat(400_000)
+          yield* Effect.promise(() =>
+            Promise.all([
+              write(path.join(".claude", "skills"), "From .claude.", slow),
+              write(path.join(".agents", "skills"), "From .agents.", slow),
+              write(path.join(".opencode", "skill"), "From .opencode.", "# Fast"),
+            ]),
+          )
+
+          const skill = yield* Skill.Service
+          const list = (yield* skill.all()).filter((s) => s.location !== "<built-in>")
+          expect(list.length).toBe(1)
+          expect(list[0].description).toBe("From .opencode.")
+          expect(list[0].location).toBe(path.join(dir, ".opencode", "skill", "shared-skill", "SKILL.md"))
+          expect(list[0].content.trim()).toBe("# Fast")
+        }),
+      { git: true },
+    ),
+  )
+
+  it.live("resolves duplicates within one directory by path, not by parse order", () =>
+    provideTmpdirInstance(
+      (dir) =>
+        Effect.gen(function* () {
+          const write = (folder: string, body: string) =>
+            Bun.write(
+              path.join(dir, ".opencode", "skill", folder, "SKILL.md"),
+              `---\nname: twin-skill\ndescription: From ${folder}.\n---\n\n${body}\n`,
+            )
+          yield* Effect.promise(() =>
+            Promise.all([
+              write("a", "# Slow\n\n" + "Lorem ipsum dolor sit amet. ".repeat(400_000)),
+              write("b", "# Fast"),
+            ]),
+          )
+
+          const skill = yield* Skill.Service
+          const list = (yield* skill.all()).filter((s) => s.location !== "<built-in>")
+          expect(list.length).toBe(1)
+          expect(list[0].description).toBe("From b.")
+        }),
+      { git: true },
+    ),
+  )
+
   it.live("discovers global skills from ~/.claude/skills/ directory", () =>
     Effect.gen(function* () {
       const tmp = yield* Effect.acquireRelease(

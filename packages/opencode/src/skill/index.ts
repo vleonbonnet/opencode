@@ -104,7 +104,7 @@ export interface Interface {
   readonly available: (agent?: Agent.Info, exposure?: readonly PermissionV1.Ruleset[]) => Effect.Effect<Info[]>
 }
 
-const add = Effect.fnUntraced(function* (state: State, match: string, events: EventV2Bridge.Service["Service"]) {
+const parse = Effect.fnUntraced(function* (match: string, events: EventV2Bridge.Service["Service"]) {
   const md = yield* Effect.tryPromise({
     try: () => ConfigMarkdown.parse(match),
     catch: (err) => err,
@@ -124,21 +124,12 @@ const add = Effect.fnUntraced(function* (state: State, match: string, events: Ev
 
   if (!isSkillFrontmatter(md.data)) return
 
-  if (state.skills[md.data.name]) {
-    yield* Effect.logWarning("duplicate skill name", {
-      name: md.data.name,
-      existing: state.skills[md.data.name].location,
-      duplicate: match,
-    })
-  }
-
-  state.dirs.add(path.dirname(match))
-  state.skills[md.data.name] = {
+  return {
     name: md.data.name,
     description: md.data.description,
     location: match,
     content: md.content,
-  }
+  } satisfies Info
 })
 
 const scan = Effect.fnUntraced(function* (
@@ -166,7 +157,8 @@ const scan = Effect.fnUntraced(function* (
     }),
   )
 
-  for (const match of matches) {
+  // Glob order depends on the filesystem; sort so duplicates in one root resolve the same way every time.
+  for (const match of matches.toSorted()) {
     state.matches.add(match)
     state.dirs.add(path.dirname(match))
   }
@@ -239,10 +231,26 @@ const loadSkills = Effect.fnUntraced(function* (
   discovered: DiscoveryState,
   events: EventV2Bridge.Service["Service"],
 ) {
-  yield* Effect.forEach(discovered.matches, (match) => add(state, match, events), {
+  // Parse in parallel, but register in discovery order, which runs from the lowest precedence
+  // (~/.claude, ~/.agents, then the project's .claude and .agents) to opencode's own skill
+  // directories and configured paths: a later skill replaces an earlier one with the same name.
+  // Registering as parses finish made the winner, and so the system prompt, random.
+  const parsed = yield* Effect.forEach(discovered.matches, (match) => parse(match, events), {
     concurrency: "unbounded",
-    discard: true,
   })
+  for (const skill of parsed) {
+    if (!skill) continue
+    const shadowed = state.skills[skill.name]
+    if (shadowed) {
+      yield* Effect.logWarning("duplicate skill name", {
+        name: skill.name,
+        kept: skill.location,
+        ignored: shadowed.location,
+      })
+    }
+    state.dirs.add(path.dirname(skill.location))
+    state.skills[skill.name] = skill
+  }
 
   yield* Effect.logInfo("init", { count: Object.keys(state.skills).length })
 })
