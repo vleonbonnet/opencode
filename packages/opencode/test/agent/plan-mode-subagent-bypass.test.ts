@@ -2,6 +2,8 @@ import { PermissionV1 } from "@opencode-ai/core/v1/permission"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { expect } from "bun:test"
 import { Effect } from "effect"
+import path from "path"
+import { Global } from "@opencode-ai/core/global"
 import { Agent } from "../../src/agent/agent"
 import { deriveSubagentSessionPermission } from "../../src/agent/subagent-permissions"
 import { Permission } from "../../src/permission"
@@ -180,5 +182,108 @@ it.effect("plan-mode subagent inherits parent approval and protected-path rules"
     expect(Permission.evaluate("edit", "secret.pem", effective).action).toBe("deny")
     expect(Permission.evaluate("bash", "rm -rf src", effective).action).toBe("deny")
     expect(Permission.evaluate("bash", "git status", effective).action).toBe("allow")
+  }),
+)
+
+it.effect("plan-mode subagent does not resurrect parent restrictions the parent overrides", () =>
+  Effect.sync(() => {
+    const explore = testAgent({
+      name: "explore",
+      mode: "subagent",
+      permission: {
+        "*": "deny",
+        read: "allow",
+        external_directory: { "*": "ask", "/tmp/tool-output/*": "allow" },
+      },
+    })
+    const parent = Permission.merge(
+      Permission.fromConfig({
+        "*": "allow",
+        question: "deny",
+        external_directory: { "*": "ask", "/tmp/tool-output/*": "allow" },
+      }),
+      Permission.fromConfig({
+        question: "allow",
+        external_directory: { "/data/plans/*": "allow" },
+        edit: { "*": "deny", ".opencode/plans/*.md": "allow" },
+      }),
+      Permission.fromConfig({ external_directory: "allow" }),
+    )
+    const effective = Permission.merge(
+      Permission.merge(explore.permission, Permission.fromConfig({ external_directory: "allow" })),
+      deriveSubagentSessionPermission({ parentSessionPermission: [], parentAgentPermission: parent, subagent: explore }),
+    )
+
+    expect(Permission.evaluate("external_directory", "/elsewhere/*", parent).action).toBe("allow")
+    expect(Permission.evaluate("external_directory", "/elsewhere/*", effective).action).toBe("allow")
+    // Parent allows that override a parent deny must not widen the subagent.
+    expect(Permission.evaluate("question", "*", effective).action).toBe("deny")
+    expect(Permission.evaluate("edit", ".opencode/plans/x.md", effective).action).toBe("deny")
+  }),
+)
+
+it.effect("plan-mode subagent keeps parent exceptions only where the subagent allows them", () =>
+  Effect.sync(() => {
+    const explore = testAgent({
+      name: "explore",
+      mode: "subagent",
+      permission: {
+        "*": "deny",
+        external_directory: { "*": "ask", "/tmp/tool-output/*": "allow" },
+      },
+    })
+    const parent = Permission.fromConfig({
+      external_directory: { "*": "ask", "/tmp/tool-output/*": "allow", "/data/plans/*": "allow" },
+    })
+    const effective = Permission.merge(
+      explore.permission,
+      deriveSubagentSessionPermission({ parentSessionPermission: [], parentAgentPermission: parent, subagent: explore }),
+    )
+
+    expect(Permission.evaluate("external_directory", "/elsewhere/*", effective).action).toBe("ask")
+    expect(Permission.evaluate("external_directory", "/tmp/tool-output/x", effective).action).toBe("allow")
+    expect(Permission.evaluate("external_directory", "/data/plans/x", effective).action).toBe("ask")
+  }),
+)
+
+it.instance(
+  "plan-delegated explore honours user external_directory allow",
+  () =>
+    Effect.gen(function* () {
+      const plan = yield* Agent.use.get("plan")
+      const explore = yield* Agent.use.get("explore")
+      const effective = Permission.merge(
+        explore!.permission,
+        deriveSubagentSessionPermission({
+          parentSessionPermission: [],
+          parentAgentPermission: plan!.permission,
+          subagent: explore!,
+        }),
+      )
+
+      expect(Permission.evaluate("external_directory", "/elsewhere/project/*", effective).action).toBe("allow")
+      expect(Permission.evaluate("edit", "/elsewhere/project/x.ts", effective).action).toBe("deny")
+      expect(Permission.evaluate("question", "*", effective).action).toBe("deny")
+    }),
+  { config: { permission: { external_directory: "allow" } } },
+)
+
+it.instance("plan-delegated explore still asks for external directories by default", () =>
+  Effect.gen(function* () {
+    const plan = yield* Agent.use.get("plan")
+    const explore = yield* Agent.use.get("explore")
+    const effective = Permission.merge(
+      explore!.permission,
+      deriveSubagentSessionPermission({
+        parentSessionPermission: [],
+        parentAgentPermission: plan!.permission,
+        subagent: explore!,
+      }),
+    )
+
+    expect(Permission.evaluate("external_directory", "/elsewhere/project/*", effective).action).toBe("ask")
+    expect(Permission.evaluate("external_directory", path.join(Global.Path.tmp, "x"), effective).action).toBe(
+      "allow",
+    )
   }),
 )
