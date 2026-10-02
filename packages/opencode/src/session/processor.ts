@@ -443,17 +443,24 @@ const layer = Layer.effect(
             const completedSnapshot = yield* snapshot.track()
             yield* Effect.forEach(Object.keys(ctx.reasoningMap), finishReasoning)
             // Anthropic reports thinking blocks it removed before the model saw the
-            // prompt. Prefix mismatches mean opencode changed history behind a signed
-            // block; log them so the churn can be tracked down.
-            const dropped = isRecord(value.providerMetadata?.anthropic)
+            // prompt: on a turn the user consented to lose stale thinking, or on a
+            // gateway that drops without being asked.
+            const transformations = isRecord(value.providerMetadata?.anthropic)
               ? value.providerMetadata.anthropic.inputTransformations
               : undefined
-            if (Array.isArray(dropped) && dropped.length > 0) {
+            const dropped = Array.isArray(transformations)
+              ? transformations.flatMap((item) =>
+                  isRecord(item) && item.type === "thinking_dropped" && typeof item.path === "string"
+                    ? [item.path]
+                    : [],
+                )
+              : []
+            if (dropped.length > 0) {
               yield* Effect.logWarning("thinking blocks dropped by provider", {
                 sessionID: ctx.sessionID,
                 messageID: ctx.assistantMessage.id,
                 model: ctx.model.id,
-                transformations: JSON.stringify(dropped),
+                transformations: JSON.stringify(transformations),
               })
             }
             const usage = Session.getUsage({
@@ -462,11 +469,18 @@ const layer = Layer.effect(
               metadata: value.providerMetadata,
             })
             // Confirm what the provider actually cached for this request.
-            CacheLedger.observe(ctx.sessionID, {
-              input: usage.tokens.input,
-              read: usage.tokens.cache.read,
-              write: usage.tokens.cache.write,
-            })
+            const lost = CacheLedger.observe(
+              ctx.sessionID,
+              {
+                input: usage.tokens.input,
+                read: usage.tokens.cache.read,
+                write: usage.tokens.cache.write,
+              },
+              dropped,
+            )
+            // Mark the lost blocks so later requests leave them out instead of
+            // replaying thinking the provider no longer accepts.
+            if (lost.length > 0) yield* markThinkingDropped(lost)
             ctx.assistantMessage.finish = value.reason
             ctx.assistantMessage.cost += usage.cost
             ctx.assistantMessage.tokens = usage.tokens
@@ -623,6 +637,31 @@ const layer = Layer.effect(
         yield* session.updateMessage(ctx.assistantMessage)
       })
 
+      const markThinkingDropped = Effect.fn("SessionProcessor.markThinkingDropped")(function* (
+        lost: readonly CacheLedger.DroppedThinking[],
+      ) {
+        const reasons = new Map(lost.map((item) => [item.signature, item.reason]))
+        const time = Date.now()
+        let marked = 0
+        for (const message of yield* session.messages({ sessionID: ctx.sessionID })) {
+          for (const part of message.parts) {
+            if (part.type !== "reasoning" || part.metadata?.thinkingDropped) continue
+            const anthropic = isRecord(part.metadata?.anthropic) ? part.metadata.anthropic : undefined
+            const signature = anthropic?.signature ?? anthropic?.redactedData
+            const reason = typeof signature === "string" ? reasons.get(signature) : undefined
+            if (!reason) continue
+            yield* session.updatePart({ ...part, metadata: { ...part.metadata, thinkingDropped: { time, reason } } })
+            marked++
+          }
+        }
+        yield* Effect.logWarning("thinking blocks marked dropped", {
+          sessionID: ctx.sessionID,
+          messageID: ctx.assistantMessage.id,
+          lost: lost.length,
+          marked,
+        })
+      })
+
       const halt = Effect.fn("SessionProcessor.halt")(function* (e: unknown) {
         yield* Effect.logError("process", {
           "session.id": input.sessionID,
@@ -631,6 +670,10 @@ const layer = Layer.effect(
           stack: e instanceof Error ? e.stack : undefined,
         })
         const error = parse(e)
+        // A thinking block the ledger could not predict was rejected: remember
+        // it, so the next preflight reports it and the user can accept the loss.
+        if (SessionV1.APIError.isInstance(error) && CacheLedger.isThinkingRefusal(error.data.message))
+          CacheLedger.refuseThinking(ctx.sessionID, error.data.message)
         if (SessionV1.ContextOverflowError.isInstance(error)) {
           if ((yield* config.get()).compaction?.auto === false && !ctx.assistantMessage.summary) {
             ctx.assistantMessage.error = error

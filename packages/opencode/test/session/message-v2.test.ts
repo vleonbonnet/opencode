@@ -1047,6 +1047,36 @@ describe("session.message-v2.toModelMessage", () => {
     ])
   })
 
+  test("dropped thinking stays out of the producing model's requests, other models still read it", async () => {
+    const assistantID = "m-dropped"
+    const parts = [
+      {
+        ...basePart(assistantID, "r1"),
+        type: "reasoning",
+        text: "stale reasoning",
+        time: { start: 0 },
+        metadata: { anthropic: { signature: "sig" }, thinkingDropped: { time: 1, reason: "dropped with consent" } },
+      },
+      { ...basePart(assistantID, "t1"), type: "text", text: "answer" },
+    ] as SessionV1.Part[]
+    const same = [{ info: assistantInfo(assistantID, "m-parent"), parts }]
+    expect(await MessageV2.toModelMessages(same, model)).toStrictEqual([
+      { role: "assistant", content: [{ type: "text", text: "answer" }] },
+    ])
+    const other = [
+      { info: assistantInfo(assistantID, "m-parent", undefined, { providerID: "anthropic", modelID: "opus" }), parts },
+    ]
+    expect(await MessageV2.toModelMessages(other, model)).toStrictEqual([
+      {
+        role: "assistant",
+        content: [
+          { type: "text", text: "stale reasoning" },
+          { type: "text", text: "answer" },
+        ],
+      },
+    ])
+  })
+
   test("a failed step stays out for the model that produced it, and when it produced nothing", async () => {
     const refused = new SessionV1.ContentFilterError({ message: "blocked" }).toObject() as SessionV1.Assistant["error"]
     const reasoning = (id: string, text: string) =>

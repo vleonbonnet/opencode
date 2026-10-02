@@ -575,6 +575,65 @@ export function httpError(status: number, body: unknown): Item {
   }
 }
 
+/**
+ * An Anthropic Messages stream: optional signed thinking, then text. TRANSFORMATIONS
+ * are reported on message_start like the API's `input_transformations`.
+ */
+export function anthropicReply(input: {
+  thinking?: { text: string; signature: string }
+  text: string
+  usage?: { input: number; output: number; read?: number; write?: number }
+  transformations?: unknown[]
+}): Item {
+  const usage = input.usage ?? { input: 10, output: 5 }
+  const blocks: unknown[] = []
+  let index = 0
+  if (input.thinking) {
+    blocks.push(
+      { type: "content_block_start", index, content_block: { type: "thinking", thinking: "", signature: "" } },
+      { type: "content_block_delta", index, delta: { type: "thinking_delta", thinking: input.thinking.text } },
+      { type: "content_block_delta", index, delta: { type: "signature_delta", signature: input.thinking.signature } },
+      { type: "content_block_stop", index },
+    )
+    index++
+  }
+  blocks.push(
+    { type: "content_block_start", index, content_block: { type: "text", text: "" } },
+    { type: "content_block_delta", index, delta: { type: "text_delta", text: input.text } },
+    { type: "content_block_stop", index },
+  )
+  return raw({
+    head: [
+      {
+        type: "message_start",
+        message: {
+          id: "msg_test",
+          type: "message",
+          role: "assistant",
+          model: "claude-opus-5-5",
+          content: [],
+          stop_reason: null,
+          stop_sequence: null,
+          usage: {
+            input_tokens: usage.input,
+            output_tokens: 0,
+            cache_read_input_tokens: usage.read ?? 0,
+            cache_creation_input_tokens: usage.write ?? 0,
+          },
+          ...(input.transformations ? { input_transformations: input.transformations } : {}),
+        },
+      },
+      ...blocks,
+      {
+        type: "message_delta",
+        delta: { stop_reason: "end_turn", stop_sequence: null },
+        usage: { output_tokens: usage.output },
+      },
+      { type: "message_stop" },
+    ],
+  })
+}
+
 export function raw(input: {
   chunks?: unknown[]
   head?: unknown[]
@@ -672,13 +731,14 @@ export class TestLLMServer extends Context.Service<TestLLMServer, TestLLMServer.
         return first.item
       }
 
-      const handle = Effect.fn("TestLLMServer.handle")(function* (mode: "chat" | "responses") {
+      const handle = Effect.fn("TestLLMServer.handle")(function* (mode: "chat" | "responses" | "anthropic") {
         const req = yield* HttpServerRequest.HttpServerRequest
         const body = yield* req.json.pipe(Effect.orElseSucceed(() => ({})))
         const current = hit(req.originalUrl, body, { ...req.headers })
         if (isTitleRequest(body)) {
           hits = [...hits, current]
           yield* notify()
+          if (mode === "anthropic") return send(anthropicReply({ text: "E2E Title" }) as Sse)
           const auto: Sse = { type: "sse", head: [role()], tail: [textLine("E2E Title"), finishLine("stop")] }
           if (mode === "responses") return send(responses(auto, modelFrom(body)))
           return send(auto)
@@ -687,6 +747,7 @@ export class TestLLMServer extends Context.Service<TestLLMServer, TestLLMServer.
         if (!next) {
           hits = [...hits, current]
           yield* notify()
+          if (mode === "anthropic") return send(anthropicReply({ text: "ok" }) as Sse)
           const auto: Sse = { type: "sse", head: [role()], tail: [textLine("ok"), finishLine("stop")] }
           if (mode === "responses") return send(responses(auto, modelFrom(body)))
           return send(auto)
@@ -704,6 +765,7 @@ export class TestLLMServer extends Context.Service<TestLLMServer, TestLLMServer.
 
       yield* router.add("POST", "/v1/chat/completions", handle("chat"))
       yield* router.add("POST", "/v1/responses", handle("responses"))
+      yield* router.add("POST", "/v1/messages", handle("anthropic"))
 
       yield* server.serve(router.asHttpEffect())
 

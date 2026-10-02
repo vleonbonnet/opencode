@@ -47,17 +47,24 @@ type SessionRecord = {
   last?: Snapshot & { usage: Usage; prompt: number }
   verifications: Verification[]
   /**
-   * Signatures of thinking blocks still replayable, with the binding key each
-   * was signed under (tool set + thinking config, and messages up to it).
+   * What each thinking block of the last successful request was bound to,
+   * keyed by its identity (`SignedThinking.id`): [system, tools, prefix].
+   * A block whose binding changes since is no longer replayable.
    */
-  thinking: Map<string, { head: string; message: number; messages: string }>
+  thinking: Record<string, Bound>
+  /** The provider rejected a thinking block the ledger could not predict. */
+  refused?: { id: string; path: string; detail: string; time: number }
 }
+
+type Bound = [system: string, tools: string, prefix: string]
 
 type Pending = {
   normalized: CacheModel.Normalized
   predicted: Match | undefined
   time: number
-  body: Captured | undefined
+  body: Captured
+  /** Stale blocks a consented request (drop_block) lets the provider drop. */
+  consented: readonly CacheModel.SignedThinking[]
 }
 
 type Match = {
@@ -98,6 +105,9 @@ export type Report = {
 // N idle minutes") instead of looking like a prefix that never existed.
 const RETAIN_EXPIRED = 24 * 60 * 60_000
 
+// Thinking bindings kept per session, most recently accepted first to stay.
+const THINKING_LIMIT = 500
+
 // Allow for provider rounding (e.g. Fireworks reports cache in 16k pages) and,
 // for estimated entries, for the byte-to-token spread.
 const tolerance = (value: number, exact = true) => Math.max(4096, Math.round(value * (exact ? 0.1 : 0.25)))
@@ -114,7 +124,7 @@ let loaded = false
 function session(id: string) {
   let record = sessions.get(id)
   if (!record) {
-    record = { verifications: [], thinking: new Map() }
+    record = { verifications: [], thinking: {} }
     sessions.set(id, record)
   }
   return record
@@ -145,12 +155,6 @@ export function reset() {
   loaded = true
 }
 
-/** Binding keys per thinking signature, for the wire send-check. */
-export function thinking(sessionID: string): ReadonlyMap<string, { head: string; message: number; messages: string }> {
-  load()
-  return session(sessionID).thinking
-}
-
 function load() {
   if (loaded) return
   loaded = true
@@ -166,7 +170,7 @@ function load() {
         if (entry.expires > now - RETAIN_EXPIRED) namespace(ns).set(key, entry)
     }
     for (const [id, record] of Object.entries(data.sessions ?? {}))
-      sessions.set(id, { ...record, thinking: new Map(Object.entries(record.thinking ?? {})) })
+      sessions.set(id, { ...record, thinking: Array.isArray(record.thinking) ? {} : (record.thinking ?? {}) })
   } catch {
     // Missing or corrupt ledger: predictions start from nothing (fail-safe).
   }
@@ -460,6 +464,7 @@ function recordSend(tag: Tag, request: Captured) {
     predicted: best ? { index: best.index, tokens: best.entry.tokens, exact: best.entry.exact } : undefined,
     time: request.time,
     body: request,
+    consented: bindingBehavior(request) === "drop_block" ? (staleThinking(tag.sessionID, request)?.blocks ?? []) : [],
   })
   const map = new Map<string, string>()
   for (const block of normalized.blocks) map.set(block.own, block.excerpt)
@@ -468,14 +473,20 @@ function recordSend(tag: Tag, request: Captured) {
   while (excerpts.size > 16) excerpts.delete(excerpts.keys().next().value!)
 }
 
+/** A thinking block left out of a request, and why. */
+export type DroppedThinking = { readonly signature: string; readonly reason: string }
+
 /**
  * Confirm the pending request of SESSIONID with the provider-reported usage.
  * `input` excludes cached tokens; `read` and `write` are cache tokens.
+ * DROPPED lists the content paths of thinking blocks the provider removed
+ * (`input_transformations`). Returns every thinking block this request lost:
+ * those, and the stale blocks a consented request let the provider drop.
  */
-export function observe(sessionID: string, usage: Usage) {
+export function observe(sessionID: string, usage: Usage, dropped: readonly string[] = []): DroppedThinking[] {
   load()
   const sent = pending.get(sessionID)
-  if (!sent) return
+  if (!sent) return []
   pending.delete(sessionID)
   const normalized = sent.normalized
   const prompt = usage.input + usage.read + usage.write
@@ -493,22 +504,33 @@ export function observe(sessionID: string, usage: Usage) {
   })
   record.verifications = record.verifications.slice(-20)
   record.last = { ...snapshot(normalized, sent.time), usage, prompt }
-  // Remember each thinking signature with the binding key it was signed
-  // under, so a later request can tell which blocks are still replayable.
-  if (sent.body) {
-    const { key } = CacheModel.bindingKey(sent.body)
-    const signed = CacheModel.signedThinking(sent.body)
-    if (key) {
-      record.thinking.clear()
-      for (const blocks of signed.values())
-        for (const block of blocks)
-          record.thinking.set(block.id, {
-            head: key.head,
-            message: block.message,
-            messages: key.messages[block.message] ?? "",
-          })
-    }
+  // The provider accepted every thinking block it did not drop, so each was
+  // valid under this request's binding; later requests are checked against it.
+  const signed = CacheModel.signedThinking(sent.body)
+  const removed = new Set(dropped)
+  const lost: DroppedThinking[] = []
+  const seen = new Set<string>()
+  for (const block of sent.consented) {
+    seen.add(block.id)
+    lost.push({ signature: block.signature, reason: "dropped with consent: no longer matches the conversation" })
   }
+  // Merge rather than replace: a request to another gateway or model carries
+  // none of these blocks, and they stay replayable when the session returns.
+  for (const id of seen) delete record.thinking[id]
+  for (const block of signed) {
+    delete record.thinking[block.id]
+    if (removed.has(block.path)) {
+      if (!seen.has(block.id))
+        lost.push({ signature: block.signature, reason: "dropped by the provider: no longer matches the conversation" })
+      continue
+    }
+    if (seen.has(block.id)) continue
+    record.thinking[block.id] = [block.binding.system, block.binding.tools, block.binding.prefix]
+  }
+  const ids = Object.keys(record.thinking)
+  for (const id of ids.slice(0, Math.max(0, ids.length - THINKING_LIMIT))) delete record.thinking[id]
+  // The refused block was carried again: accepted (the change was undone) or dropped.
+  if (record.refused && signed.some((block) => block.id === record.refused?.id)) record.refused = undefined
 
   if (normalized.format !== "unknown" && normalized.blocks.length > 0) {
     const map = namespace(normalized.namespace)
@@ -562,43 +584,92 @@ export function observe(sessionID: string, usage: Usage) {
     }
   }
   flush()
+  return lost
 }
 
 export type StaleThinking = {
-  /** Signatures the request would invalidate. */
-  readonly signatures: readonly string[]
-  /** First divergence against the recorded binding, for the message. */
-  readonly reason: "no binding recorded" | "tools or thinking config changed" | "earlier messages changed"
-  readonly divergence?: Divergence
+  /** The blocks of the request that can no longer be replayed. */
+  readonly blocks: readonly CacheModel.SignedThinking[]
+  /** Why, for the user: what changed since the blocks were last accepted. */
+  readonly reason: string
+  /** First request path where the prompt diverges from the previous one. */
+  readonly path?: string
+}
+
+/** The block binding behaviour REQUEST asks for, if any. */
+function bindingBehavior(request: Captured): string | undefined {
+  try {
+    const body = request.body === undefined ? undefined : JSON.parse(request.body)
+    const value = body?.thinking?.block_binding?.prefix_mismatch_behavior
+    return typeof value === "string" ? value : undefined
+  } catch {
+    return
+  }
 }
 
 /**
- * Which thinking signatures of REQUEST (about to be sent) are no longer bound
- * to the prefix they were created under. Empty when every block is replayable
- * or the request carries none.
+ * The thinking blocks of REQUEST (about to be sent) that are no longer bound
+ * to what they were last accepted under, plus a block the provider already
+ * rejected. Blocks the ledger has never seen accepted are assumed valid.
  */
-export function checkThinking(sessionID: string, request: Captured): StaleThinking | undefined {
+export function staleThinking(sessionID: string, request: Captured): StaleThinking | undefined {
   load()
   const record = sessions.get(sessionID)
-  if (!record || record.thinking.size === 0) return
-  const { key } = CacheModel.bindingKey(request)
-  if (!key) return
+  if (!record) return
   const signed = CacheModel.signedThinking(request)
-  if (signed.size === 0) return
-  const stale: string[] = []
-  for (const blocks of signed.values())
-    for (const block of blocks) {
-      const bound = record.thinking.get(block.id)
-      if (!bound) continue
-      if (bound.head === key.head && bound.messages === key.messages[block.message]) continue
-      stale.push(block.id)
+  const stale: CacheModel.SignedThinking[] = []
+  const reasons = new Set<string>()
+  for (const block of signed) {
+    if (record.refused?.id === block.id) {
+      stale.push(block)
+      reasons.add(`the provider rejected the block at ${record.refused.path}: ${record.refused.detail}`)
+      continue
     }
+    const bound = record.thinking[block.id]
+    if (!bound) continue
+    const reason =
+      bound[0] !== block.binding.system
+        ? "the system prompt changed"
+        : bound[1] !== block.binding.tools
+          ? "the tool list changed"
+          : bound[2] !== block.binding.prefix
+            ? "earlier messages changed"
+            : undefined
+    if (!reason) continue
+    stale.push(block)
+    reasons.add(reason)
+  }
   if (stale.length === 0) return
-  const reason = [...record.thinking.values()].some((bound) => bound.head !== key.head)
-    ? ("tools or thinking config changed" as const)
-    : ("earlier messages changed" as const)
   const diff = record.last ? divergence(CacheModel.normalize(request), record.last, sessionID) : undefined
-  return { signatures: stale, reason, ...(diff ? { divergence: diff } : {}) }
+  const path = diff?.previousPath ?? diff?.path
+  return { blocks: stale, reason: [...reasons].join("; "), ...(path ? { path } : {}) }
+}
+
+/**
+ * Record that the provider rejected SESSIONID's pending request because a
+ * thinking block no longer matches (MESSAGE is the provider's error), so the
+ * next preflight reports it and the user can accept dropping it.
+ */
+export function refuseThinking(sessionID: string, message: string) {
+  load()
+  const sent = pending.get(sessionID)
+  const path = /(messages\.\d+\.content\.\d+):/.exec(message)?.[1]
+  if (!sent || !path) return
+  const block = CacheModel.signedThinking(sent.body).find((item) => item.path === path)
+  if (!block) return
+  const detail = /bound to a different conversation\.(?:.*?drop_block"?\.)?\s*(.*)$/s.exec(message)?.[1]?.trim()
+  session(sessionID).refused = {
+    id: block.id,
+    path,
+    detail: detail || "it no longer matches the conversation",
+    time: Date.now(),
+  }
+  flush()
+}
+
+/** True when MESSAGE is the provider rejecting a thinking block's binding. */
+export function isThinkingRefusal(message: string | undefined) {
+  return !!message && /Invalid `signature` in `(?:redacted_)?thinking` block/.test(message)
 }
 
 /** Drop the pending request of SESSIONID (the request failed before usage). */
@@ -606,44 +677,31 @@ export function discard(sessionID: string) {
   pending.delete(sessionID)
 }
 
-/** Test hook: drop all recorded binding keys, so the next send looks stale. */
-export function rewindThinking(sessionID: string) {
-  load()
-  session(sessionID).thinking.clear()
-  flush()
-}
+export const STALE_THINKING = "Stale thinking"
 
-/** Forget THINKING signatures (they were dropped with the user's consent). */
-export function forgetThinking(sessionID: string, signatures: readonly string[]) {
-  load()
-  const record = sessions.get(sessionID)
-  if (!record) return
-  for (const signature of signatures) record.thinking.delete(signature)
-  flush()
+/** Refusal to send thinking blocks that no longer match, without the user's consent. */
+export class StaleThinkingError extends Error {
+  constructor(readonly stale: StaleThinking) {
+    const count = stale.blocks.length
+    super(
+      `${STALE_THINKING}: ${count} thinking block${count === 1 ? "" : "s"} from earlier turns no longer ` +
+        `match${count === 1 ? "es" : ""} the conversation (${stale.reason}). ` +
+        "Send again and accept dropping them, or undo the change.",
+    )
+    this.name = "StaleThinkingError"
+  }
 }
 
 Wire.onSend(recordSend)
 
-// Consent for dropping stale thinking, set by the prompt loop when the user
-// accepted the loss; cleared when the request is observed or discarded.
-const consented = new Set<string>()
-
-/** Accept stale thinking on SESSIONID's next request (the user agreed). */
-export function acceptThinkingLoss(sessionID: string) {
-  consented.add(sessionID)
-}
-
+// A request whose thinking no longer matches would be rejected (block binding
+// "error") on every gateway, or silently stripped where "error" is not
+// honoured. Refuse it here, on the exact body, unless it asks the provider to
+// drop stale blocks: only a turn the user consented to does.
 Wire.guard((tag, request) => {
-  load()
-  const stale = checkThinking(tag.sessionID, request)
-  if (!stale) return
-  if (consented.delete(tag.sessionID)) {
-    forgetThinking(tag.sessionID, stale.signatures)
-    return
-  }
-  throw new Error(
-    `stale thinking: ${stale.signatures.length} thinking block${stale.signatures.length === 1 ? "" : "s"} no longer match the conversation (${stale.reason})`,
-  )
+  if (bindingBehavior(request) === "drop_block") return
+  const stale = staleThinking(tag.sessionID, request)
+  if (stale) throw new StaleThinkingError(stale)
 })
 
 export * as CacheLedger from "./ledger"

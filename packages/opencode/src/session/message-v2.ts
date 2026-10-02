@@ -386,6 +386,9 @@ export const toModelMessagesEffect = Effect.fnUntraced(function* (
               })
             continue
           }
+          // Thinking the provider no longer accepts (dropped with the user's
+          // consent, or by the provider) stays out of every later request.
+          if (part.metadata?.thinkingDropped) continue
           assistantMessage.parts.push({
             type: "reasoning",
             text: part.text,

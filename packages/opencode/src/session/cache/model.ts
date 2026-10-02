@@ -448,74 +448,80 @@ export function normalize(request: Captured): Normalized {
   return { ...shape, namespace, namespaceParts: parts }
 }
 
-export * as CacheModel from "./model"
-
 // Thinking-signature binding ------------------------------------------------
+//
+// What an Anthropic thinking signature is bound to, measured on direct
+// Anthropic and Copilot (claude-opus-5-5, thinking-binding-controls): the
+// system prompt, the tool set (order does not matter) and every content block
+// before the thinking block, its own message included. Not bound: cache
+// markers, max_tokens, output_config.effort, the thinking config (even its
+// absence), tool_choice, content after the block, and other thinking blocks
+// (removing an earlier thinking block leaves later ones valid).
 
-// What an Anthropic thinking signature is bound to, from measurements on
-// direct Anthropic and Copilot (claude-opus-5-5): the tool set (order does not
-// matter), the system prompt, and every message before the block. Ignored:
-// max_tokens, output_config.effort, thinking.display, tool_choice, sampling.
-// `thinking` itself must be present in the replayed request or the block is
-// rejected, so it is keyed too.
+const THINKING_TYPES = new Set(["thinking", "redacted_thinking"])
 
-/** Which messages are bound to signatures at MESSAGE index I. */
-export type BoundMessages = readonly (readonly number[])[]
-
-const THINKING_BOUND_TYPES = new Set(["thinking", "redacted_thinking"])
-
-export type BindingKey = {
-  /** Hash of the tool set (sorted) and the thinking config. */
-  readonly head: string
-  /** Hash of messages 0..i inclusive, chained, at each message index. */
-  readonly messages: string[]
+export type SignedThinking = {
+  /** Hash of the signature (or redacted data): the block's identity. */
+  readonly id: string
+  /** The signature or redacted data itself, as replayed. */
+  readonly signature: string
+  readonly path: string
+  /** Hashes of what the block is bound to. */
+  readonly binding: Binding
 }
 
-export function bindingKey(request: Captured): { format: Format; key: BindingKey | undefined } {
+export type Binding = {
+  readonly system: string
+  readonly tools: string
+  /** Every non-thinking content block before this one, roles included. */
+  readonly prefix: string
+}
+
+function parseAnthropic(request: Captured): Record<string, unknown> | undefined {
   let body: unknown
   try {
     body = request.body === undefined ? undefined : JSON.parse(request.body)
   } catch {
-    body = undefined
+    return
   }
-  if (!isRecord(body) || detect(request, body) !== "anthropic") return { format: detect(request, body), key: undefined }
-  const tools = (Array.isArray(body.tools) ? body.tools : []).map((tool) => stable(stripMarkers(tool))).sort()
-  const thinking = isRecord(body.thinking) ? { ...body.thinking, display: undefined } : undefined
-  const head = hash("tools:" + stable(tools) + "\nthinking:" + stable(thinking))
-  const messages: string[] = []
-  let previous = head
-  const list = Array.isArray(body.messages) ? body.messages : []
-  list.forEach((message, index) => {
-    previous = hash(
-      previous +
-        "\u0000" +
-        stable(stripMarkers(isRecord(message) ? { role: message.role, content: message.content } : message)),
-    )
-    messages.push(previous)
-  })
-  return { format: "anthropic", key: { head, messages } }
+  if (!isRecord(body) || detect(request, body) !== "anthropic") return
+  return body
 }
 
-/** Extract the signed thinking blocks of an Anthropic request, per message. */
-export function signedThinking(request: Captured): ReadonlyMap<number, { id: string; message: number }[]> {
-  let body: unknown
-  try {
-    body = request.body === undefined ? undefined : JSON.parse(request.body)
-  } catch {
-    return new Map()
-  }
-  const out = new Map<number, { id: string; message: number }[]>()
-  const format = detect(request, body)
-  if (!isRecord(body) || format !== "anthropic" || !Array.isArray(body.messages)) return out
+function contentBlocks(content: unknown): unknown[] {
+  if (typeof content === "string") return [{ type: "text", text: content }]
+  return Array.isArray(content) ? content : []
+}
+
+/** The signed thinking blocks of an Anthropic REQUEST, with their binding. Empty for other formats. */
+export function signedThinking(request: Captured): SignedThinking[] {
+  const body = parseAnthropic(request)
+  if (!body || !Array.isArray(body.messages)) return []
+  const system = hash("system:" + stable(stripMarkers(contentBlocks(body.system))))
+  const tools = hash(
+    "tools:" + stable((Array.isArray(body.tools) ? body.tools : []).map((tool) => stable(stripMarkers(tool))).sort()),
+  )
+  const out: SignedThinking[] = []
+  let prefix = hash("messages:")
   body.messages.forEach((message: unknown, index: number) => {
-    if (!isRecord(message) || !Array.isArray(message.content)) return
-    for (const block of message.content) {
-      if (!isRecord(block) || !THINKING_BOUND_TYPES.has(String(block.type))) continue
-      const signature = block.signature
-      if (typeof signature !== "string" || !signature) continue
-      const item = { id: signature, message: index }
-      out.set(index, [...(out.get(index) ?? []), item])
-    }
+    if (!isRecord(message)) return
+    prefix = hash(prefix + "\u0000role:" + String(message.role))
+    contentBlocks(message.content).forEach((block, position) => {
+      if (isRecord(block) && THINKING_TYPES.has(String(block.type))) {
+        const signature = block.type === "thinking" ? block.signature : block.data
+        if (typeof signature === "string" && signature)
+          out.push({
+            id: hash("thinking:" + signature),
+            signature,
+            path: `messages.${index}.content.${position}`,
+            binding: { system, tools, prefix },
+          })
+        return
+      }
+      prefix = hash(prefix + "\u0001" + stable(stripMarkers(block)))
+    })
   })
   return out
 }
+
+export * as CacheModel from "./model"

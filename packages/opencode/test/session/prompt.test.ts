@@ -53,7 +53,7 @@ import { Ripgrep } from "@opencode-ai/core/ripgrep"
 import { Format } from "../../src/format"
 import { TestInstance } from "../fixture/fixture"
 import { awaitWithTimeout, pollWithTimeout, testEffect } from "../lib/effect"
-import { reply, TestLLMServer } from "../lib/llm-server"
+import { anthropicReply, reply, TestLLMServer } from "../lib/llm-server"
 import { Wire } from "../../src/session/cache/wire"
 import { CacheLedger } from "../../src/session/cache/ledger"
 import { RuntimeFlags } from "@/effect/runtime-flags"
@@ -632,6 +632,187 @@ it.instance("preflight dry-runs the exact next request without sending or storin
     expect(next.status).toBe("hit")
   }).pipe(Effect.ensuring(Effect.sync(off)))
 })
+
+// Anthropic Messages model with thinking bound to its prefix (Claude 5.1+).
+const claudeRef = { providerID: ProviderV2.ID.make("claude"), modelID: ModelV2.ID.make("claude-opus-5-5") }
+const claudeCfg = (url: string) => ({
+  provider: {
+    claude: {
+      name: "Claude",
+      id: "claude",
+      env: [],
+      npm: "@ai-sdk/anthropic",
+      models: {
+        "claude-opus-5-5": {
+          id: "claude-opus-5-5",
+          name: "Claude Opus 5.5",
+          attachment: false,
+          reasoning: true,
+          temperature: false,
+          tool_call: true,
+          release_date: "2026-01-01",
+          limit: { context: 200000, output: 10000 },
+          cost: { input: 0, output: 0 },
+          options: {},
+        },
+      },
+      options: { apiKey: "test-key", baseURL: url },
+    },
+  },
+})
+
+it.instance("stale thinking is refused, then dropped with consent, and stays out of later requests", () =>
+  Effect.gen(function* () {
+    CacheLedger.reset()
+    const { llm } = yield* useServerConfig(claudeCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const chat = yield* sessions.create({
+      title: "Pinned",
+      permission: [{ permission: "*", pattern: "*", action: "allow" }],
+    })
+    const turn = Effect.fn("test.thinkingTurn")(function* (
+      text: string,
+      extra: { tools?: Record<string, boolean>; acceptThinkingLoss?: boolean } = {},
+    ) {
+      yield* prompt.prompt({
+        sessionID: chat.id,
+        agent: "build",
+        model: claudeRef,
+        noReply: true,
+        parts: [{ type: "text", text }],
+        ...extra,
+      })
+      return yield* prompt.loop({ sessionID: chat.id })
+    })
+    const bodies = () => Effect.map(llm.hits, (hits) => mainHits(hits).map((hit) => hit.body as Record<string, any>))
+    const signatures = (body: Record<string, any>) =>
+      (body.messages as Record<string, any>[]).flatMap((message, index) =>
+        (Array.isArray(message.content) ? message.content : []).flatMap(
+          (block: Record<string, any>, position: number) =>
+            block.type === "thinking" ? [`${block.signature}@messages.${index}.content.${position}`] : [],
+        ),
+      )
+
+    yield* llm.push(anthropicReply({ thinking: { text: "first thoughts", signature: "sig-1" }, text: "one" }))
+    yield* turn("first")
+    yield* llm.push(anthropicReply({ thinking: { text: "second thoughts", signature: "sig-2" }, text: "two" }))
+    yield* turn("second")
+    expect(signatures((yield* bodies()).at(-1)!)).toEqual(["sig-1@messages.1.content.0"])
+    expect((yield* bodies()).at(-1)!.thinking.block_binding).toEqual({ prefix_mismatch_behavior: "error" })
+
+    // Disabling a tool changes the tool list every signature is bound to. Only
+    // sig-1 has been accepted under a known binding; sig-2 is not yet known.
+    const report = yield* prompt.preflight({
+      sessionID: chat.id,
+      agent: "build",
+      model: claudeRef,
+      tools: { glob: false },
+    })
+    expect(report.staleThinking).toMatchObject({ count: 1, reason: "the tool list changed" })
+
+    // Without consent nothing is sent: the turn ends with a visible error.
+    const sent = (yield* bodies()).length
+    const refused = yield* turn("third", { tools: { glob: false } })
+    expect((yield* bodies()).length).toBe(sent)
+    const error = refused.info.role === "assistant" ? refused.info.error : undefined
+    expect(JSON.stringify(error)).toContain(
+      "Stale thinking: 1 thinking block from earlier turns no longer matches the conversation (the tool list changed)",
+    )
+
+    // With consent the request asks the provider to drop stale blocks. The
+    // provider reports sig-2; sig-1 is dropped on the ledger's prediction.
+    yield* llm.push(
+      anthropicReply({
+        thinking: { text: "fresh thoughts", signature: "sig-3" },
+        text: "four",
+        transformations: [
+          { type: "thinking_dropped", path: "messages.3.content.0", reason: "prefix_binding_mismatch" },
+        ],
+      }),
+    )
+    const consented = yield* turn("fourth", { tools: { glob: false }, acceptThinkingLoss: true })
+    expect(consented.info.role === "assistant" && consented.info.error).toBeFalsy()
+    const consentBody = (yield* bodies()).at(-1)!
+    expect(consentBody.thinking.block_binding).toEqual({ prefix_mismatch_behavior: "drop_block" })
+    expect(signatures(consentBody)).toEqual(["sig-1@messages.1.content.0", "sig-2@messages.3.content.0"])
+    const users = (yield* sessions.messages({ sessionID: chat.id })).filter((message) => message.info.role === "user")
+    expect(users.at(-1)!.info).toMatchObject({ acceptThinkingLoss: true })
+
+    const reasoning = (yield* sessions.messages({ sessionID: chat.id }))
+      .flatMap((message) => message.parts)
+      .filter((part) => part.type === "reasoning")
+    const dropped = Object.fromEntries(
+      reasoning.map((part) => [part.metadata?.anthropic?.signature, part.metadata?.thinkingDropped?.reason]),
+    )
+    expect(dropped).toEqual({
+      "sig-1": "dropped with consent: no longer matches the conversation",
+      "sig-2": "dropped by the provider: no longer matches the conversation",
+      "sig-3": undefined,
+    })
+
+    // Later turns leave the dropped blocks out, so they need no consent and
+    // fail nowhere.
+    yield* llm.push(anthropicReply({ text: "five" }))
+    const later = yield* turn("fifth", { tools: { glob: false } })
+    expect(later.info.role === "assistant" && later.info.error).toBeFalsy()
+    const laterBody = (yield* bodies()).at(-1)!
+    expect(laterBody.thinking.block_binding).toEqual({ prefix_mismatch_behavior: "error" })
+    expect(signatures(laterBody).map((item) => item.split("@")[0])).toEqual(["sig-3"])
+    expect(
+      (yield* prompt.preflight({ sessionID: chat.id, agent: "build", model: claudeRef, tools: { glob: false } }))
+        .staleThinking,
+    ).toBeUndefined()
+  }),
+)
+
+it.instance("a thinking block the provider rejects is reported for consent, not retried", () =>
+  Effect.gen(function* () {
+    CacheLedger.reset()
+    const { llm } = yield* useServerConfig(claudeCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const chat = yield* sessions.create({
+      title: "Pinned",
+      permission: [{ permission: "*", pattern: "*", action: "allow" }],
+    })
+    const turn = Effect.fn("test.rejectedTurn")(function* (text: string) {
+      yield* prompt.prompt({
+        sessionID: chat.id,
+        agent: "build",
+        model: claudeRef,
+        noReply: true,
+        parts: [{ type: "text", text }],
+      })
+      return yield* prompt.loop({ sessionID: chat.id })
+    })
+    yield* llm.push(anthropicReply({ thinking: { text: "thoughts", signature: "sig-1" }, text: "one" }))
+    yield* turn("first")
+    // The ledger has never seen sig-1 accepted, so only the provider can tell.
+    yield* llm.error(400, {
+      type: "error",
+      error: {
+        type: "invalid_request_error",
+        message:
+          "messages.1.content.0: Invalid `signature` in `thinking` block. The block is bound to a different conversation. " +
+          'Remove the block, or set `thinking.block_binding.prefix_mismatch_behavior` to "drop_block". ' +
+          "The `system` prompt differs from when this block was created.",
+      },
+    })
+    const before = mainHits(yield* llm.hits).length
+    const rejected = yield* turn("second")
+    expect(mainHits(yield* llm.hits).length).toBe(before + 1)
+    expect(JSON.stringify(rejected.info.role === "assistant" ? rejected.info.error : undefined)).toContain(
+      "Invalid `signature`",
+    )
+    const report = yield* prompt.preflight({ sessionID: chat.id, agent: "build", model: claudeRef })
+    expect(report.staleThinking).toMatchObject({
+      count: 1,
+      reason:
+        "the provider rejected the block at messages.1.content.0: The `system` prompt differs from when this block was created.",
+    })
+  }),
+)
 
 it.instance("mode reminders stay on the user message they were sent with", () =>
   Effect.gen(function* () {

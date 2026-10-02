@@ -192,12 +192,11 @@ const layer = Layer.effect(
       step: number
       processor: Pick<SessionProcessor.Handle, "message" | "updateToolCall" | "completeToolCall">
       onStructured: (output: unknown) => void
-      /** Consent from the user for dropping stale thinking on step 1. */
+      /** The user accepted losing stale thinking on this request. */
       acceptThinkingLoss?: boolean
     }) {
       const { session, msgs, lastUser, agent, model } = input
       const isLastStep = input.step >= (agent.steps ?? Infinity)
-      if (input.acceptThinkingLoss) CacheLedger.acceptThinkingLoss(session.id)
       const lastUserMsg = msgs.findLast((m) => m.info.role === "user")
       const bypassAgentCheck = lastUserMsg?.parts.some((p) => p.type === "agent") ?? false
       const promptOps = yield* ops()
@@ -257,6 +256,7 @@ const layer = Layer.effect(
         tools,
         model,
         toolChoice: format.type === "json_schema" ? ("required" as const) : undefined,
+        ...(input.acceptThinkingLoss ? { acceptThinkingLoss: true } : {}),
       } satisfies LLM.StreamInput
     })
 
@@ -380,16 +380,16 @@ const layer = Layer.effect(
         return unknown(`dry run did not reach the network layer: ${why}`, targetInfo)
       }
       const report = CacheLedger.predict(sessionID, captured)
-      const stale = CacheLedger.checkThinking(sessionID, captured)
+      const stale = CacheLedger.staleThinking(sessionID, captured)
       return {
         ...report,
         reasons: pendingTask?.type === "subtask" ? [...report.reasons, "a pending subtask runs first"] : report.reasons,
         ...(stale
           ? {
               staleThinking: {
-                count: stale.signatures.length,
+                count: stale.blocks.length,
                 reason: stale.reason,
-                ...(stale.divergence?.previousPath ? { path: stale.divergence.previousPath } : {}),
+                ...(stale.path ? { path: stale.path } : {}),
               },
             }
           : {}),
@@ -931,6 +931,7 @@ const layer = Layer.effect(
         },
         system: input.system,
         format: input.format,
+        ...(input.acceptThinkingLoss ? { acceptThinkingLoss: true } : {}),
       }
 
       const current = yield* sessions.get(input.sessionID).pipe(Effect.orDie)
@@ -1347,6 +1348,8 @@ const layer = Layer.effect(
         const ctx = yield* InstanceState.context
         let structured: unknown
         let step = 0
+        // User messages whose thinking-loss consent this run already applied.
+        const consentUsed = new Set<string>()
         const session = yield* sessions.get(sessionID).pipe(Effect.orDie)
 
         while (true) {
@@ -1481,6 +1484,10 @@ const layer = Layer.effect(
             if (step === 1)
               yield* summary.summarize({ sessionID, messageID: lastUser.id }).pipe(Effect.ignore, Effect.forkIn(scope))
 
+            // Consent covers the first request answering that message: the
+            // provider drops the stale blocks, and later steps no longer carry them.
+            const consent = lastUser.acceptThinkingLoss === true && !consentUsed.has(lastUser.id)
+            if (consent) consentUsed.add(lastUser.id)
             const result = yield* handle.process(
               yield* turnRequest({
                 session,
@@ -1493,7 +1500,7 @@ const layer = Layer.effect(
                 onStructured(output) {
                   structured = output
                 },
-                ...(lastUser.acceptThinkingLoss && step === 1 ? { acceptThinkingLoss: true } : {}),
+                acceptThinkingLoss: consent,
               }),
             )
 

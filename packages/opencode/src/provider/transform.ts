@@ -706,16 +706,19 @@ function anthropicBindsThinking(apiId: string) {
 }
 
 // Fable 5.1 binds each thinking signature to the system prompt, tool list, and
-// messages above it, and rejects the request when any of that changes. Sending
-// "error" makes every gateway fail loudly on a mismatch instead of silently
-// dropping the affected blocks (Copilot's and Grove's default was to keep
-// going without saying anything). opencode checks the binding itself before
-// sending, and asks the user before a turn that invalidates thinking.
+// content above it, and rejects the request when any of that changes. Sending
+// "error" makes every gateway fail loudly on a mismatch: Copilot otherwise
+// keeps going without saying anything. opencode checks the binding itself
+// before sending (CacheLedger) and asks the user before a turn that loses
+// thinking; only a turn the user consented to sends "drop_block", which lets
+// the provider remove the stale blocks and report them.
 // Older model deployments may reject this field, even with thinking enabled.
 // The patched AI SDK adds the thinking-binding-controls beta whenever it is set.
 const ANTHROPIC_BLOCK_BINDING = { prefixMismatchBehavior: "error" }
+const ANTHROPIC_BLOCK_BINDING_DROP = { prefixMismatchBehavior: "drop_block" }
 
-function anthropicBlockBinding(model: Provider.Model, options: { [x: string]: any }) {
+function anthropicBlockBinding(model: Provider.Model, options: { [x: string]: any }, dropStaleThinking = false) {
+  const binding = dropStaleThinking ? ANTHROPIC_BLOCK_BINDING_DROP : ANTHROPIC_BLOCK_BINDING
   const sdk = sdkKey(model.api.npm)
   const key = sdk === "bedrock" ? "reasoningConfig" : sdk === "anthropic" ? "thinking" : undefined
   // Consume the OpenCode-only opt-out even on models outside the default scope.
@@ -733,13 +736,13 @@ function anthropicBlockBinding(model: Provider.Model, options: { [x: string]: an
       const thinking = options.thinking ?? { type: "adaptive" }
       if (thinking.type !== "adaptive" && thinking.type !== "enabled") return options
       if (thinking.blockBinding !== undefined) return options
-      return { ...options, thinking: { ...thinking, blockBinding: ANTHROPIC_BLOCK_BINDING } }
+      return { ...options, thinking: { ...thinking, blockBinding: binding } }
     }
     case "@ai-sdk/amazon-bedrock": {
       const reasoningConfig = options.reasoningConfig ?? { type: "adaptive" }
       if (reasoningConfig.type !== "adaptive" && reasoningConfig.type !== "enabled") return options
       if (reasoningConfig.blockBinding !== undefined) return options
-      return { ...options, reasoningConfig: { ...reasoningConfig, blockBinding: ANTHROPIC_BLOCK_BINDING } }
+      return { ...options, reasoningConfig: { ...reasoningConfig, blockBinding: binding } }
     }
   }
   return options
@@ -1439,7 +1442,11 @@ const SLUG_OVERRIDES: Record<string, string> = {
   amazon: "bedrock",
 }
 
-export function providerOptions(model: Provider.Model, options: { [x: string]: any }) {
+export function providerOptions(
+  model: Provider.Model,
+  options: { [x: string]: any },
+  request: { dropStaleThinking?: boolean } = {},
+) {
   const usesOpenAIReasoningGate =
     model.api.npm === "@ai-sdk/openai" ||
     model.api.npm === "@ai-sdk/azure" ||
@@ -1448,7 +1455,7 @@ export function providerOptions(model: Provider.Model, options: { [x: string]: a
     usesOpenAIReasoningGate &&
     (model.capabilities.reasoning || options.reasoningEffort !== undefined || options.reasoningSummary !== undefined)
       ? { ...options, forceReasoning: true }
-      : anthropicThinkingDisplay(model, anthropicBlockBinding(model, options))
+      : anthropicThinkingDisplay(model, anthropicBlockBinding(model, options, request.dropStaleThinking))
 
   if (model.api.npm === "@ai-sdk/gateway") {
     // Gateway providerOptions are split across two namespaces:

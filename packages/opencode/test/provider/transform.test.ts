@@ -937,6 +937,24 @@ describe("ProviderTransform.providerOptions", () => {
       })
     })
 
+    test("asks the provider to drop stale blocks only on a request the user consented to", () => {
+      for (const sdk of sdks) {
+        const model = claude(sdk.npm, "claude-opus-5-5")
+        expect(ProviderTransform.providerOptions(model, {}, { dropStaleThinking: true })).toEqual({
+          [sdk.key]: {
+            [sdk.option]: {
+              type: "adaptive",
+              blockBinding: { prefixMismatchBehavior: "drop_block" },
+              ...shown(sdk.option),
+            },
+          },
+        })
+        expect(ProviderTransform.providerOptions(model, {}, { dropStaleThinking: false })).toEqual({
+          [sdk.key]: { [sdk.option]: { type: "adaptive", blockBinding: binding, ...shown(sdk.option) } },
+        })
+      }
+    })
+
     test("leaves explicit enabled thinking on older models alone", () => {
       const model = claude("@ai-sdk/anthropic", "claude-haiku-4-5")
       expect(ProviderTransform.providerOptions(model, { thinking: { type: "enabled", budgetTokens: 4000 } })).toEqual({

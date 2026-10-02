@@ -8,6 +8,7 @@ import { Effect, Schedule, Schema } from "effect"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { SessionRetry } from "../../src/session/retry"
 import { MessageV2 } from "../../src/session/message-v2"
+import { CacheLedger } from "../../src/session/cache/ledger"
 import { ProviderError } from "../../src/provider/error"
 import { SessionID } from "../../src/session/schema"
 import { SessionStatus } from "../../src/session/status"
@@ -162,6 +163,21 @@ describe("session.retry.retryable", () => {
   test("retries serialized rate_limit messages", () => {
     const message = JSON.stringify({ type: "error", error: { code: "rate_limit_exceeded" } })
     expect(SessionRetry.retryable(wrap(message), retryProvider)).toEqual({ message })
+  })
+
+  test("stale thinking waits for consent instead of retrying", () => {
+    const refused = MessageV2.fromError(
+      new CacheLedger.StaleThinkingError({ blocks: [], reason: "the system prompt changed" }),
+      { providerID },
+    )
+    expect(SessionRetry.retryable(refused, retryProvider)).toBeUndefined()
+    const rejected = new SessionV1.APIError({
+      message:
+        "messages.1.content.0: Invalid `signature` in `thinking` block. The block is bound to a different conversation. Rate limit wording must not matter.",
+      statusCode: 400,
+      isRetryable: true,
+    }).toObject()
+    expect(SessionRetry.retryable(rejected, retryProvider)).toBeUndefined()
   })
 
   test("does not retry unknown json messages", () => {

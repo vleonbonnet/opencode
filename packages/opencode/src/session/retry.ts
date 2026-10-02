@@ -2,6 +2,7 @@ import type { NamedError } from "@opencode-ai/core/util/error"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { Cause, Clock, Duration, Effect, Schedule } from "effect"
 import { MessageV2 } from "./message-v2"
+import { CacheLedger } from "./cache/ledger"
 import { iife } from "@/util/iife"
 import { isRecord } from "@/util/record"
 
@@ -85,11 +86,14 @@ function exponential(attempt: number, random: number) {
 export function retryable(error: Err, provider: string) {
   // context overflow errors should not be retried
   if (SessionV1.ContextOverflowError.isInstance(error)) return undefined
-  // Stale thinking needs the user's consent, not a retry.
-  if (typeof error.data === "object" && error.data !== null && "message" in error.data) {
-    const message = (error.data as { message?: unknown }).message
-    if (typeof message === "string" && message.includes("stale thinking")) return undefined
-  }
+  // Stale thinking needs the user's consent, not a retry: opencode refused to
+  // send it, or the provider rejected a block's binding.
+  const message = isRecord(error.data) ? error.data.message : undefined
+  if (
+    typeof message === "string" &&
+    (message.startsWith(CacheLedger.STALE_THINKING) || CacheLedger.isThinkingRefusal(message))
+  )
+    return undefined
   if (SessionV1.APIError.isInstance(error)) {
     const status = error.data.statusCode
     // 5xx errors are transient server failures and should always be retried,
@@ -150,7 +154,6 @@ export function retryable(error: Err, provider: string) {
     return { message: error.data.message.includes("Overloaded") ? "Provider is overloaded" : error.data.message }
   }
 
-  const message = isRecord(error.data) ? error.data.message : undefined
   if (typeof message !== "string") return undefined
   const lower = message.toLowerCase()
   if (lower.includes("too_many_requests")) return { message: "Too Many Requests" }

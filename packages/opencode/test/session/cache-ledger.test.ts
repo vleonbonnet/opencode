@@ -2,6 +2,9 @@ import { afterEach, beforeEach, describe, expect, setSystemTime, test } from "bu
 import { CacheModel } from "../../src/session/cache/model"
 import { CacheLedger } from "../../src/session/cache/ledger"
 import { Wire } from "../../src/session/cache/wire"
+import fs from "fs/promises"
+import os from "os"
+import path from "path"
 
 // Request shapes mirror what @ai-sdk/anthropic and @ai-sdk/openai-compatible
 // put on the wire for opencode sessions.
@@ -398,97 +401,32 @@ describe("CacheLedger", () => {
 })
 
 describe("CacheLedger thinking binding", () => {
+  // Every case below mirrors a measurement against direct Anthropic and
+  // Copilot (claude-opus-5-5, prefix_mismatch_behavior "error").
   const sessionID = "ses_think"
-  const turn1 = [user("hello " + "x".repeat(4000))]
-  const turn2 = [...turn1, assistant("hi " + "y".repeat(4000)), user("second")]
+  const think = (signature: string) => ({ type: "thinking", thinking: "hmm " + signature, signature })
+  const u1 = user("hello " + "x".repeat(4000))
+  const a1 = { role: "assistant", content: [think("sig-a"), text("answer a")] }
+  const u2 = user("second")
+  const a2 = { role: "assistant", content: [think("sig-b"), text("answer b")] }
+  const u3 = user("third")
+  const history = [u1, a1, u2, a2, u3]
+  const next = [...history, { role: "assistant", content: [think("sig-c"), text("answer c")] }, user("fourth")]
+  const send = (body: Body) => request(ANTHROPIC, body)
+  const ids = (stale: CacheLedger.StaleThinking | undefined) =>
+    (stale?.blocks ?? []).map((block) => block.signature).sort()
 
-  const think = (id: string) => ({ type: "thinking", thinking: "hmm " + id, signature: id })
-  const bodyWithThinking = (messages: Body[]) => {
-    const body = anthropicBody(messages, { thinking: { type: "adaptive" } })
-    const first = body.messages[0].content
-    body.messages[0] = { ...body.messages[0], content: [think("sig-1"), ...first] }
-    return body
+  async function accepted(body: Body, dropped: string[] = []) {
+    await wire(sessionID, send(body))
+    return CacheLedger.observe(sessionID, { input: 3, read: 0, write: 120_000 }, dropped)
   }
 
-  test("replaying the same messages keeps the block valid", async () => {
-    await wire(sessionID, request(ANTHROPIC, bodyWithThinking(turn1)))
-    CacheLedger.observe(sessionID, { input: 3, read: 0, write: 120_000 })
-    const report = CacheLedger.checkThinking(sessionID, request(ANTHROPIC, bodyWithThinking(turn2)))
-    expect(report?.signatures ?? []).toEqual([])
-  })
-
-  test("an edited earlier message invalidates the block, with the divergence", async () => {
-    await wire(sessionID, request(ANTHROPIC, bodyWithThinking(turn1)))
-    CacheLedger.observe(sessionID, { input: 3, read: 0, write: 120_000 })
-    const edited = [user("hello " + "x".repeat(4000) + " EDITED"), ...turn2.slice(1)]
-    const report = CacheLedger.checkThinking(sessionID, request(ANTHROPIC, bodyWithThinking(edited)))
-    expect(report?.signatures).toEqual(["sig-1"])
-    expect(report?.reason).toBe("earlier messages changed")
-    expect(report?.divergence?.previousPath).toBe("messages[0].content[1] (user text)")
-  })
-
-  test("a changed tool list invalidates the block", async () => {
-    await wire(sessionID, request(ANTHROPIC, bodyWithThinking(turn1)))
-    CacheLedger.observe(sessionID, { input: 3, read: 0, write: 120_000 })
-    const report = CacheLedger.checkThinking(
-      sessionID,
-      request(ANTHROPIC, bodyWithThinking(turn2), { "x-api-key": "k" }) as any,
-    )
-    expect(report).toBeUndefined()
-    const body = bodyWithThinking(turn2)
-    body.tools = [tool("read")]
-    const changed = CacheLedger.checkThinking(sessionID, request(ANTHROPIC, body))
-    expect(changed?.signatures).toEqual(["sig-1"])
-    expect(changed?.reason).toBe("tools or thinking config changed")
-  })
-
-  test("the thinking config itself keys the binding, its display does not", async () => {
-    await wire(sessionID, request(ANTHROPIC, bodyWithThinking(turn1)))
-    CacheLedger.observe(sessionID, { input: 3, read: 0, write: 120_000 })
-    const omitted = bodyWithThinking(turn2)
-    omitted.thinking = undefined
-    expect(CacheLedger.checkThinking(sessionID, request(ANTHROPIC, omitted))?.signatures).toEqual(["sig-1"])
-    const display = bodyWithThinking(turn2)
-    display.thinking = { type: "adaptive", display: "summarized" }
-    expect(CacheLedger.checkThinking(sessionID, request(ANTHROPIC, display))?.signatures ?? []).toEqual([])
-  })
-
-  test("forgetting a dropped signature stops reporting it", async () => {
-    await wire(sessionID, request(ANTHROPIC, bodyWithThinking(turn1)))
-    CacheLedger.observe(sessionID, { input: 3, read: 0, write: 120_000 })
-    const edited = [user("hello " + "x".repeat(4000) + " EDITED"), ...turn2.slice(1)]
-    expect(CacheLedger.checkThinking(sessionID, request(ANTHROPIC, bodyWithThinking(edited)))?.signatures).toEqual([
-      "sig-1",
-    ])
-    CacheLedger.forgetThinking(sessionID, ["sig-1"])
-    expect(CacheLedger.checkThinking(sessionID, request(ANTHROPIC, bodyWithThinking(edited)))).toBeUndefined()
-  })
-
-  test("the wire guard refuses stale thinking and accepts it once consented", async () => {
-    await wire(sessionID, request(ANTHROPIC, bodyWithThinking(turn1)))
-    CacheLedger.observe(sessionID, { input: 3, read: 0, write: 120_000 })
-    const edited = [user("hello " + "x".repeat(4000) + " EDITED"), ...turn2.slice(1)]
-    const captured = request(ANTHROPIC, bodyWithThinking(edited))
+  async function guarded(body: Body) {
+    const captured = send(body)
     const original = globalThis.fetch
     try {
       globalThis.fetch = (async () => new Response("{}")) as unknown as typeof fetch
       Wire.install()
-      await expect(
-        globalThis.fetch(captured.url, {
-          method: "POST",
-          headers: { ...captured.headers, ...Wire.header({ mode: "send", id: Wire.nextID(), sessionID }) },
-          body: captured.body,
-        }),
-      ).rejects.toThrow("stale thinking")
-      CacheLedger.acceptThinkingLoss(sessionID)
-      // Consent drops the stale signature, so the request goes out and later
-      // requests with the same history pass without consent.
-      await globalThis.fetch(captured.url, {
-        method: "POST",
-        headers: { ...captured.headers, ...Wire.header({ mode: "send", id: Wire.nextID(), sessionID }) },
-        body: captured.body,
-      })
-      expect(CacheLedger.thinking(sessionID).has("sig-1")).toBe(false)
       await globalThis.fetch(captured.url, {
         method: "POST",
         headers: { ...captured.headers, ...Wire.header({ mode: "send", id: Wire.nextID(), sessionID }) },
@@ -496,6 +434,151 @@ describe("CacheLedger thinking binding", () => {
       })
     } finally {
       globalThis.fetch = original
+    }
+  }
+
+  test("blocks are bound by content before them, never by what follows", () => {
+    const blocks = CacheModel.signedThinking(send(anthropicBody(history)))
+    expect(blocks.map((block) => [block.signature, block.path])).toEqual([
+      ["sig-a", "messages.1.content.0"],
+      ["sig-b", "messages.3.content.0"],
+    ])
+    const later = CacheModel.signedThinking(send(anthropicBody(next)))
+    expect(later[0].binding).toEqual(blocks[0].binding)
+  })
+
+  test("unchanged history, cache markers, tool order and the thinking config keep blocks valid", async () => {
+    await accepted(anthropicBody(history))
+    expect(CacheLedger.staleThinking(sessionID, send(anthropicBody(next)))).toBeUndefined()
+    const variants: Body[] = [
+      { ...anthropicBody(history), tools: [tool("edit"), tool("read")] },
+      { ...anthropicBody(history), thinking: undefined },
+      { ...anthropicBody(history), thinking: { type: "adaptive", display: "summarized" } },
+      { ...anthropicBody(history), system: [text("You are opencode. ".repeat(200))] },
+    ]
+    for (const body of variants) expect(CacheLedger.staleThinking(sessionID, send(body))).toBeUndefined()
+  })
+
+  test("a changed system prompt or tool list invalidates every block", async () => {
+    await accepted(anthropicBody(history))
+    const system = CacheLedger.staleThinking(
+      sessionID,
+      send({ ...anthropicBody(history), system: [text("You are opencode. ".repeat(200) + "Today.")] }),
+    )
+    expect(ids(system)).toEqual(["sig-a", "sig-b"])
+    expect(system?.reason).toBe("the system prompt changed")
+    const tools = CacheLedger.staleThinking(sessionID, send({ ...anthropicBody(history), tools: [tool("read")] }))
+    expect(ids(tools)).toEqual(["sig-a", "sig-b"])
+    expect(tools?.reason).toBe("the tool list changed")
+  })
+
+  test("an edit invalidates only the blocks after it, and says where", async () => {
+    await accepted(anthropicBody(history))
+    const edited = [u1, a1, user("second, edited"), a2, u3]
+    const stale = CacheLedger.staleThinking(sessionID, send(anthropicBody(edited)))
+    expect(ids(stale)).toEqual(["sig-b"])
+    expect(stale?.reason).toBe("earlier messages changed")
+    expect(stale?.path).toBe("messages[2].content[0] (user text)")
+    // The block's own later content is not bound to it.
+    const own = [u1, { ...a1, content: [think("sig-a"), text("answer a, edited")] }, u2, a2, u3]
+    expect(ids(CacheLedger.staleThinking(sessionID, send(anthropicBody(own))))).toEqual(["sig-b"])
+  })
+
+  test("removing an earlier thinking block leaves later ones valid", async () => {
+    await accepted(anthropicBody(history))
+    const without = [u1, { ...a1, content: [text("answer a")] }, u2, a2, u3]
+    expect(CacheLedger.staleThinking(sessionID, send(anthropicBody(without)))).toBeUndefined()
+  })
+
+  test("blocks never seen accepted are assumed valid", async () => {
+    await accepted(anthropicBody([u1]))
+    expect(CacheLedger.staleThinking(sessionID, send(anthropicBody(history)))).toBeUndefined()
+  })
+
+  test("the guard refuses stale thinking unless the request asks the provider to drop it", async () => {
+    await accepted(anthropicBody(history))
+    const changed = { ...anthropicBody(history), tools: [tool("read")] }
+    await expect(guarded(changed)).rejects.toThrow(
+      "Stale thinking: 2 thinking blocks from earlier turns no longer match the conversation (the tool list changed)",
+    )
+    const consented = {
+      ...changed,
+      thinking: { type: "adaptive", block_binding: { prefix_mismatch_behavior: "drop_block" } },
+    }
+    await guarded(consented)
+    // The consented request's stale blocks are lost even if the provider does
+    // not report them, and are no longer tracked.
+    const lost = CacheLedger.observe(sessionID, { input: 3, read: 0, write: 120_000 })
+    expect(lost.map((item) => item.signature).sort()).toEqual(["sig-a", "sig-b"])
+    expect(lost[0].reason).toBe("dropped with consent: no longer matches the conversation")
+    expect(CacheLedger.staleThinking(sessionID, send(changed))).toBeUndefined()
+  })
+
+  test("blocks the provider drops are lost and no longer tracked", async () => {
+    await accepted(anthropicBody(history))
+    const lost = await accepted(anthropicBody(next), ["messages.3.content.0"])
+    expect(lost).toEqual([
+      { signature: "sig-b", reason: "dropped by the provider: no longer matches the conversation" },
+    ])
+    const changed = { ...anthropicBody(history), tools: [tool("read")] }
+    expect(ids(CacheLedger.staleThinking(sessionID, send(changed)))).toEqual(["sig-a"])
+  })
+
+  test("a provider rejection the ledger missed is reported until a request succeeds", async () => {
+    await accepted(anthropicBody([u1]))
+    await wire(sessionID, send(anthropicBody(history)))
+    const message =
+      "messages.1.content.0: Invalid `signature` in `thinking` block. The block is bound to a different conversation. " +
+      'Remove the block, or set `thinking.block_binding.prefix_mismatch_behavior` to "drop_block". ' +
+      "The `system` prompt differs from when this block was created."
+    expect(CacheLedger.isThinkingRefusal(message)).toBe(true)
+    CacheLedger.refuseThinking(sessionID, message)
+    CacheLedger.discard(sessionID)
+    const stale = CacheLedger.staleThinking(sessionID, send(anthropicBody(history)))
+    expect(ids(stale)).toEqual(["sig-a"])
+    expect(stale?.reason).toBe(
+      "the provider rejected the block at messages.1.content.0: The `system` prompt differs from when this block was created.",
+    )
+    await expect(guarded(anthropicBody(history))).rejects.toThrow("Stale thinking: 1 thinking block")
+    CacheLedger.discard(sessionID)
+    // A turn on another model does not carry the block: still refused.
+    await wire(sessionID, request(FIREWORKS, { model: "glm", messages: [{ role: "user", content: "hi" }] }))
+    CacheLedger.observe(sessionID, { input: 3, read: 0, write: 0 })
+    expect(ids(CacheLedger.staleThinking(sessionID, send(anthropicBody(history))))).toEqual(["sig-a"])
+    // The consented turn lets the provider drop it.
+    const lost = await accepted(
+      {
+        ...anthropicBody(history),
+        thinking: { type: "adaptive", block_binding: { prefix_mismatch_behavior: "drop_block" } },
+      },
+      ["messages.1.content.0"],
+    )
+    expect(lost.map((item) => item.signature)).toEqual(["sig-a"])
+    expect(CacheLedger.staleThinking(sessionID, send(anthropicBody(history)))).toBeUndefined()
+  })
+
+  test("other request formats are never checked", async () => {
+    await accepted(anthropicBody(history))
+    const chat = request(FIREWORKS, { model: "glm", messages: [{ role: "user", content: "hi" }] })
+    expect(CacheLedger.staleThinking(sessionID, chat)).toBeUndefined()
+    expect(CacheModel.signedThinking(chat)).toEqual([])
+  })
+
+  test("bindings and expired entries survive a restart", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "ledger-"))
+    const file = path.join(dir, "cache-ledger.json")
+    try {
+      CacheLedger.configure({ file })
+      await accepted(anthropicBody(history))
+      await Bun.sleep(1200)
+      CacheLedger.reset()
+      CacheLedger.configure({ file })
+      const changed = { ...anthropicBody(history), tools: [tool("read")] }
+      expect(ids(CacheLedger.staleThinking(sessionID, send(changed)))).toEqual(["sig-a", "sig-b"])
+      expect(CacheLedger.predict(sessionID, send(anthropicBody(next))).status).toBe("hit")
+    } finally {
+      CacheLedger.configure({})
+      await fs.rm(dir, { recursive: true, force: true })
     }
   })
 })
