@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
-import { APICallError } from "ai"
+import { APICallError, type ModelMessage } from "ai"
 import { MessageV2 } from "../../src/session/message-v2"
 import { ProviderTransform } from "@/provider/transform"
 import type { Provider } from "@/provider/provider"
@@ -660,7 +660,7 @@ describe("session.message-v2.toModelMessage", () => {
         role: "assistant",
         content: [
           { type: "text", text: "done" },
-          { type: "text", text: "thinking" },
+          { type: "text", text: "<earlier-reasoning>\nthinking\n</earlier-reasoning>" },
           {
             type: "tool-call",
             toolCallId: "call-1",
@@ -1022,7 +1022,7 @@ describe("session.message-v2.toModelMessage", () => {
       {
         role: "assistant",
         content: [
-          { type: "text", text: "The guard must run at the wire layer." },
+          { type: "text", text: "<earlier-reasoning>\nThe guard must run at the wire layer.\n</earlier-reasoning>" },
           { type: "text", text: "Starting with the guard." },
           {
             type: "tool-call",
@@ -1047,34 +1047,49 @@ describe("session.message-v2.toModelMessage", () => {
     ])
   })
 
-  test("dropped thinking stays out of the producing model's requests, other models still read it", async () => {
+  test("dropped thinking replays as text only when converted with consent; other models always read it", async () => {
     const assistantID = "m-dropped"
-    const parts = [
-      {
-        ...basePart(assistantID, "r1"),
-        type: "reasoning",
-        text: "stale reasoning",
-        time: { start: 0 },
-        metadata: { anthropic: { signature: "sig" }, thinkingDropped: { time: 1, reason: "dropped with consent" } },
-      },
-      { ...basePart(assistantID, "t1"), type: "text", text: "answer" },
-    ] as SessionV1.Part[]
-    const same = [{ info: assistantInfo(assistantID, "m-parent"), parts }]
-    expect(await MessageV2.toModelMessages(same, model)).toStrictEqual([
+    const parts = (thinkingDropped: Record<string, unknown>) =>
+      [
+        {
+          ...basePart(assistantID, "r1"),
+          type: "reasoning",
+          text: "stale reasoning",
+          time: { start: 0 },
+          metadata: { anthropic: { signature: "sig" }, thinkingDropped },
+        },
+        {
+          ...basePart(assistantID, "r2"),
+          type: "reasoning",
+          text: " ",
+          time: { start: 0 },
+          metadata: { anthropic: { redactedData: "redacted" }, thinkingDropped },
+        },
+        { ...basePart(assistantID, "t1"), type: "text", text: "answer" },
+      ] as SessionV1.Part[]
+    const byProvider = parts({ time: 1, reason: "dropped by the provider" })
+    const kept = parts({ time: 1, reason: "dropped with consent", asText: true })
+    const same = (input: SessionV1.Part[]) => [{ info: assistantInfo(assistantID, "m-parent"), parts: input }]
+    expect(await MessageV2.toModelMessages(same(byProvider), model)).toStrictEqual([
       { role: "assistant", content: [{ type: "text", text: "answer" }] },
     ])
-    const other = [
-      { info: assistantInfo(assistantID, "m-parent", undefined, { providerID: "anthropic", modelID: "opus" }), parts },
-    ]
-    expect(await MessageV2.toModelMessages(other, model)).toStrictEqual([
+    const asText: ModelMessage[] = [
       {
         role: "assistant",
         content: [
-          { type: "text", text: "stale reasoning" },
+          { type: "text", text: "<earlier-reasoning>\nstale reasoning\n</earlier-reasoning>" },
           { type: "text", text: "answer" },
         ],
       },
-    ])
+    ]
+    expect(await MessageV2.toModelMessages(same(kept), model)).toStrictEqual(asText)
+    const other = [
+      {
+        info: assistantInfo(assistantID, "m-parent", undefined, { providerID: "anthropic", modelID: "opus" }),
+        parts: byProvider,
+      },
+    ]
+    expect(await MessageV2.toModelMessages(other, model)).toStrictEqual(asText)
   })
 
   test("a failed step stays out for the model that produced it, and when it produced nothing", async () => {

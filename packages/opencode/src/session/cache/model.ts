@@ -493,6 +493,11 @@ function contentBlocks(content: unknown): unknown[] {
   return Array.isArray(content) ? content : []
 }
 
+/** The identity of a thinking block, from its signature (or redacted data). */
+export function thinkingID(signature: string) {
+  return hash("thinking:" + signature)
+}
+
 /** The signed thinking blocks of an Anthropic REQUEST, with their binding. Empty for other formats. */
 export function signedThinking(request: Captured): SignedThinking[] {
   const body = parseAnthropic(request)
@@ -511,7 +516,7 @@ export function signedThinking(request: Captured): SignedThinking[] {
         const signature = block.type === "thinking" ? block.signature : block.data
         if (typeof signature === "string" && signature)
           out.push({
-            id: hash("thinking:" + signature),
+            id: thinkingID(signature),
             signature,
             path: `messages.${index}.content.${position}`,
             binding: { system, tools, prefix },

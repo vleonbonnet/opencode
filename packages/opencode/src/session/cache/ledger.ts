@@ -495,6 +495,8 @@ function recordSend(tag: Tag, request: Captured) {
 /** A thinking block left out of a request, and why. */
 export type DroppedThinking = { readonly signature: string; readonly reason: string }
 
+export const DROPPED_WITH_CONSENT = "dropped with consent: no longer matches the conversation"
+
 /**
  * Confirm the pending request of SESSIONID with the provider-reported usage.
  * `input` excludes cached tokens; `read` and `write` are cache tokens.
@@ -532,7 +534,7 @@ export function observe(sessionID: string, usage: Usage, dropped: readonly strin
   const seen = new Set<string>()
   for (const block of sent.consented) {
     seen.add(block.id)
-    lost.push({ signature: block.signature, reason: "dropped with consent: no longer matches the conversation" })
+    lost.push({ signature: block.signature, reason: DROPPED_WITH_CONSENT })
   }
   // Merge rather than replace: a request to another gateway or model carries
   // none of these blocks, and they stay replayable when the session returns.
@@ -672,6 +674,35 @@ export function staleThinking(sessionID: string, request: Captured): StaleThinki
   const diff = record.last ? divergence(CacheModel.normalize(request), record.last, sessionID) : undefined
   const path = diff?.previousPath ?? diff?.path
   return { blocks: stale, reason: [...reasons].join("; "), ...(path ? { path } : {}) }
+}
+
+/**
+ * The thinking blocks a request the user consented to lose stale thinking on
+ * should replay as text instead (REQUEST is its dry run): every signed block
+ * from the first stale one on. Text takes the place of the first, so it
+ * precedes every later block and changes what each is bound to; those were
+ * already behind whatever made the first one stale anyway.
+ */
+export function consentedThinking(sessionID: string, request: Captured): DroppedThinking[] {
+  const stale = staleThinking(sessionID, request)
+  if (!stale) return []
+  const signed = CacheModel.signedThinking(request)
+  const first = signed.findIndex((block) => block.id === stale.blocks[0].id)
+  return signed.slice(first).map((block) => ({ signature: block.signature, reason: DROPPED_WITH_CONSENT }))
+}
+
+/**
+ * Forget the thinking blocks of SESSIONID that will never be replayed again
+ * (SIGNATURES): their bindings, and the provider's refusal of one of them.
+ */
+export function forgetThinking(sessionID: string, signatures: readonly string[]) {
+  load()
+  const record = sessions.get(sessionID)
+  if (!record) return
+  const ids = new Set(signatures.map((signature) => CacheModel.thinkingID(signature)))
+  for (const id of ids) delete record.thinking[id]
+  if (record.refused && ids.has(record.refused.id)) record.refused = undefined
+  flush()
 }
 
 /**

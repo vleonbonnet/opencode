@@ -261,6 +261,60 @@ const layer = Layer.effect(
       } satisfies LLM.StreamInput
     })
 
+    // On the request the user consented to lose stale thinking on, mark the
+    // blocks it would drop (CacheLedger.consentedThinking) before building it,
+    // so that request already replays them as text, like every later one: the
+    // provider caches one prompt, and the thinking it produces is bound to it.
+    // drop_block still covers blocks the dry run could not foresee.
+    const keepStaleThinkingAsText = Effect.fn("SessionPrompt.keepStaleThinkingAsText")(function* (
+      input: Parameters<typeof turnRequest>[0],
+    ) {
+      // The dry run gets its own copy: plugins may transform messages in place.
+      const request = yield* turnRequest({ ...input, msgs: structuredClone(input.msgs), onStructured: () => {} })
+      const id = Wire.nextID()
+      const exit = yield* llm.stream({ ...request, wire: { mode: "dryrun", id } }).pipe(Stream.runDrain, Effect.exit)
+      const captured = Wire.take(id)
+      if (!captured) {
+        yield* Effect.logWarning("stale thinking dry run did not reach the network layer", {
+          sessionID: input.session.id,
+          cause: Exit.isFailure(exit) ? Cause.pretty(exit.cause) : "completed without fetch",
+        })
+        return input.msgs
+      }
+      const kept = CacheLedger.consentedThinking(input.session.id, captured)
+      if (kept.length === 0) return input.msgs
+      const reasons = new Map(kept.map((item) => [item.signature, item.reason]))
+      const time = Date.now()
+      const marked: string[] = []
+      const msgs: SessionV1.WithParts[] = []
+      for (const message of input.msgs) {
+        const parts: SessionV1.Part[] = []
+        for (const part of message.parts) {
+          const signature = part.type === "reasoning" ? MessageV2.thinkingSignature(part) : undefined
+          const reason = signature ? reasons.get(signature) : undefined
+          if (part.type !== "reasoning" || part.metadata?.thinkingDropped || !signature || !reason) {
+            parts.push(part)
+            continue
+          }
+          const updated: SessionV1.ReasoningPart = {
+            ...part,
+            metadata: { ...part.metadata, thinkingDropped: { time, reason, asText: true } },
+          }
+          yield* sessions.updatePart(updated)
+          parts.push(updated)
+          marked.push(signature)
+        }
+        msgs.push({ ...message, parts })
+      }
+      CacheLedger.forgetThinking(input.session.id, marked)
+      yield* Effect.logWarning("stale thinking kept as text", {
+        sessionID: input.session.id,
+        stale: kept.length,
+        marked: marked.length,
+      })
+      return msgs
+    })
+
     const preflight = Effect.fn("SessionPrompt.preflight")(function* (input: PreflightInput) {
       const sessionID = input.sessionID
       const unknown = (reason: string, extra?: { agent?: string; model?: { providerID: string; modelID: string } }) =>
@@ -1486,24 +1540,25 @@ const layer = Layer.effect(
               yield* summary.summarize({ sessionID, messageID: lastUser.id }).pipe(Effect.ignore, Effect.forkIn(scope))
 
             // Consent covers the first request answering that message: the
-            // provider drops the stale blocks, and later steps no longer carry them.
+            // stale blocks are replayed as text from it on, and the provider
+            // drops any stale block the ledger could not foresee.
             const consent = lastUser.acceptThinkingLoss === true && !consentUsed.has(lastUser.id)
             if (consent) consentUsed.add(lastUser.id)
-            const result = yield* handle.process(
-              yield* turnRequest({
-                session,
-                msgs,
-                lastUser,
-                agent,
-                model,
-                step,
-                processor: handle,
-                onStructured(output) {
-                  structured = output
-                },
-                acceptThinkingLoss: consent,
-              }),
-            )
+            const turn = {
+              session,
+              msgs,
+              lastUser,
+              agent,
+              model,
+              step,
+              processor: handle,
+              onStructured(output: unknown) {
+                structured = output
+              },
+              acceptThinkingLoss: consent,
+            }
+            if (consent) turn.msgs = yield* keepStaleThinkingAsText(turn)
+            const result = yield* handle.process(yield* turnRequest(turn))
 
             if (structured !== undefined) {
               handle.message.structured = structured

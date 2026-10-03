@@ -558,6 +558,34 @@ describe("CacheLedger thinking binding", () => {
     expect(CacheLedger.staleThinking(sessionID, send(anthropicBody(history)))).toBeUndefined()
   })
 
+  test("a consented request keeps every block from the first stale one on as text", async () => {
+    await accepted(anthropicBody(history))
+    expect(CacheLedger.consentedThinking(sessionID, send(anthropicBody(next)))).toEqual([])
+    // sig-c was never seen accepted, but text in place of sig-b precedes it.
+    const edited = [u1, a1, user("second, edited"), a2, u3, { role: "assistant", content: [think("sig-c")] }, user("4")]
+    expect(ids(CacheLedger.staleThinking(sessionID, send(anthropicBody(edited))))).toEqual(["sig-b"])
+    expect(CacheLedger.consentedThinking(sessionID, send(anthropicBody(edited)))).toEqual([
+      { signature: "sig-b", reason: CacheLedger.DROPPED_WITH_CONSENT },
+      { signature: "sig-c", reason: CacheLedger.DROPPED_WITH_CONSENT },
+    ])
+  })
+
+  test("blocks kept as text are forgotten, with a refusal of one of them", async () => {
+    await accepted(anthropicBody(history))
+    CacheLedger.forgetThinking(sessionID, ["sig-a"])
+    const changed = { ...anthropicBody(history), tools: [tool("read")] }
+    expect(ids(CacheLedger.staleThinking(sessionID, send(changed)))).toEqual(["sig-b"])
+    await wire(sessionID, send(anthropicBody(history)))
+    CacheLedger.refuseThinking(
+      sessionID,
+      "messages.3.content.0: Invalid `signature` in `thinking` block. The block is bound to a different conversation.",
+    )
+    CacheLedger.discard(sessionID)
+    expect(ids(CacheLedger.staleThinking(sessionID, send(anthropicBody(history))))).toEqual(["sig-b"])
+    CacheLedger.forgetThinking(sessionID, ["sig-b"])
+    expect(CacheLedger.staleThinking(sessionID, send(changed))).toBeUndefined()
+  })
+
   test("blocks after a refused one are stale too, earlier unknown ones are not", async () => {
     const a0 = { role: "assistant", content: [think("sig-0"), text("answer 0")] }
     const longer = [u1, a0, user("between"), a1, u2, a2, u3]

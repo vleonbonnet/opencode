@@ -664,7 +664,7 @@ const claudeCfg = (url: string) => ({
   },
 })
 
-it.instance("stale thinking is refused, then dropped with consent, and stays out of later requests", () =>
+it.instance("stale thinking is refused, then kept as text with consent from the consented request on", () =>
   Effect.gen(function* () {
     CacheLedger.reset()
     const { llm } = yield* useServerConfig(claudeCfg)
@@ -696,6 +696,19 @@ it.instance("stale thinking is refused, then dropped with consent, and stays out
             block.type === "thinking" ? [`${block.signature}@messages.${index}.content.${position}`] : [],
         ),
       )
+    const earlier = (body: Record<string, any>) =>
+      (body.messages as Record<string, any>[]).flatMap((message, index) =>
+        (Array.isArray(message.content) ? message.content : []).flatMap(
+          (block: Record<string, any>, position: number) => {
+            const text =
+              block.type === "text" ? /^<earlier-reasoning>\n(.*)\n<\/earlier-reasoning>$/s.exec(block.text) : null
+            return text ? [`${text[1]}@messages.${index}.content.${position}`] : []
+          },
+        ),
+      )
+    // Cache markers move with the end of the request; they bind nothing.
+    const unmarked = (value: unknown) =>
+      JSON.parse(JSON.stringify(value, (key, item) => (key === "cache_control" ? undefined : item)))
 
     yield* llm.push(anthropicReply({ thinking: { text: "first thoughts", signature: "sig-1" }, text: "one" }))
     yield* turn("first")
@@ -723,49 +736,76 @@ it.instance("stale thinking is refused, then dropped with consent, and stays out
       "Stale thinking: 1 thinking block from earlier turns no longer matches the conversation (the tool list changed)",
     )
 
-    // With consent the request asks the provider to drop stale blocks. The
-    // provider reports sig-2; sig-1 is dropped on the ledger's prediction.
-    yield* llm.push(
-      anthropicReply({
-        thinking: { text: "fresh thoughts", signature: "sig-3" },
-        text: "four",
-        transformations: [
-          { type: "thinking_dropped", path: "messages.3.content.0", reason: "prefix_binding_mismatch" },
-        ],
-      }),
-    )
+    // With consent, the stale block and every signed block after it (sig-2,
+    // whose binding is unknown but follows sig-1) replay as text from the
+    // consented request on. drop_block still covers what the ledger missed.
+    yield* llm.push(anthropicReply({ thinking: { text: "fresh thoughts", signature: "sig-3" }, text: "four" }))
     const consented = yield* turn("fourth", { tools: { glob: false }, acceptThinkingLoss: true })
     expect(consented.info.role === "assistant" && consented.info.error).toBeFalsy()
     const consentBody = (yield* bodies()).at(-1)!
     expect(consentBody.thinking.block_binding).toEqual({ prefix_mismatch_behavior: "drop_block" })
-    expect(signatures(consentBody)).toEqual(["sig-1@messages.1.content.0", "sig-2@messages.3.content.0"])
+    expect(signatures(consentBody)).toEqual([])
+    expect(earlier(consentBody)).toEqual([
+      "first thoughts@messages.1.content.0",
+      "second thoughts@messages.3.content.0",
+    ])
     const users = (yield* sessions.messages({ sessionID: chat.id })).filter((message) => message.info.role === "user")
     expect(users.at(-1)!.info).toMatchObject({ acceptThinkingLoss: true })
 
-    const reasoning = (yield* sessions.messages({ sessionID: chat.id }))
-      .flatMap((message) => message.parts)
-      .filter((part) => part.type === "reasoning")
-    const dropped = Object.fromEntries(
-      reasoning.map((part) => [part.metadata?.anthropic?.signature, part.metadata?.thinkingDropped?.reason]),
-    )
-    expect(dropped).toEqual({
-      "sig-1": "dropped with consent: no longer matches the conversation",
-      "sig-2": "dropped by the provider: no longer matches the conversation",
-      "sig-3": undefined,
-    })
+    const dropped = () =>
+      Effect.map(sessions.messages({ sessionID: chat.id }), (messages) =>
+        Object.fromEntries(
+          messages
+            .flatMap((message) => message.parts)
+            .filter((part) => part.type === "reasoning")
+            .map((part) => [
+              part.metadata?.anthropic?.signature,
+              part.metadata?.thinkingDropped && {
+                reason: part.metadata.thinkingDropped.reason,
+                asText: part.metadata.thinkingDropped.asText,
+              },
+            ]),
+        ),
+      )
+    const kept = { reason: "dropped with consent: no longer matches the conversation", asText: true }
+    expect(yield* dropped()).toEqual({ "sig-1": kept, "sig-2": kept, "sig-3": undefined })
 
-    // Later turns leave the dropped blocks out, so they need no consent and
-    // fail nowhere.
-    yield* llm.push(anthropicReply({ text: "five" }))
+    // Later turns replay the same text, so they reuse the consented request's
+    // prompt, need no consent, and the thinking it produced stays valid.
+    yield* llm.push(anthropicReply({ thinking: { text: "later thoughts", signature: "sig-4" }, text: "five" }))
     const later = yield* turn("fifth", { tools: { glob: false } })
     expect(later.info.role === "assistant" && later.info.error).toBeFalsy()
     const laterBody = (yield* bodies()).at(-1)!
     expect(laterBody.thinking.block_binding).toEqual({ prefix_mismatch_behavior: "error" })
     expect(signatures(laterBody).map((item) => item.split("@")[0])).toEqual(["sig-3"])
+    expect(unmarked(laterBody.messages.slice(0, consentBody.messages.length))).toEqual(unmarked(consentBody.messages))
     expect(
       (yield* prompt.preflight({ sessionID: chat.id, agent: "build", model: claudeRef, tools: { glob: false } }))
         .staleThinking,
     ).toBeUndefined()
+
+    // A block the provider drops unasked stays out of later requests: the
+    // thinking that request produced (sig-5) is bound to a prompt without it.
+    const sig3 = signatures(laterBody)[0].split("@")[1]
+    yield* llm.push(
+      anthropicReply({
+        thinking: { text: "newest thoughts", signature: "sig-5" },
+        text: "six",
+        transformations: [{ type: "thinking_dropped", path: sig3, reason: "prefix_binding_mismatch" }],
+      }),
+    )
+    yield* turn("sixth", { tools: { glob: false } })
+    expect(yield* dropped()).toMatchObject({
+      "sig-3": { reason: "dropped by the provider: no longer matches the conversation", asText: undefined },
+      "sig-4": undefined,
+      "sig-5": undefined,
+    })
+    yield* llm.push(anthropicReply({ text: "seven" }))
+    const last = yield* turn("seventh", { tools: { glob: false } })
+    expect(last.info.role === "assistant" && last.info.error).toBeFalsy()
+    const lastBody = (yield* bodies()).at(-1)!
+    expect(signatures(lastBody).map((item) => item.split("@")[0])).toEqual(["sig-4", "sig-5"])
+    expect(JSON.stringify(lastBody.messages)).not.toContain("fresh thoughts")
   }),
 )
 

@@ -46,6 +46,23 @@ interface FetchDecompressionError extends Error {
 export const SYNTHETIC_ATTACHMENT_PROMPT = "Attached media from tool result:"
 export { isMedia }
 
+/**
+ * Reasoning replayed as plain text, when its signed form cannot be: it came
+ * from another model, or its signature no longer matches the conversation.
+ * The tag keeps the model from reading it as something it told the user.
+ */
+export function earlierReasoning(text: string) {
+  return `<earlier-reasoning>\n${text}\n</earlier-reasoning>`
+}
+
+/** The signature (or redacted data) identifying an Anthropic reasoning part. */
+export function thinkingSignature(part: SessionV1.ReasoningPart): string | undefined {
+  const anthropic = part.metadata?.anthropic
+  if (!anthropic || typeof anthropic !== "object") return undefined
+  const signature = anthropic.signature ?? anthropic.redactedData
+  return typeof signature === "string" && signature ? signature : undefined
+}
+
 function truncateToolOutput(text: string, maxChars?: number) {
   if (!maxChars || text.length <= maxChars) return text
   const omitted = text.length - maxChars
@@ -378,17 +395,20 @@ export const toModelMessagesEffect = Effect.fnUntraced(function* (
             })
         }
         if (part.type === "reasoning") {
-          if (differentModel) {
-            if (part.text.trim().length > 0)
+          const dropped = part.metadata?.thinkingDropped
+          // Signed thinking the provider no longer accepts is replayed as text
+          // when the user consented to drop it: it was converted before the
+          // request that dropped it, so every later request carries the same
+          // text. Thinking the provider dropped unasked stays out: the thinking
+          // that request produced is bound to a prompt without it.
+          if (differentModel || dropped) {
+            if ((differentModel || dropped.asText === true) && part.text.trim().length > 0)
               assistantMessage.parts.push({
                 type: "text",
-                text: part.text,
+                text: earlierReasoning(part.text),
               })
             continue
           }
-          // Thinking the provider no longer accepts (dropped with the user's
-          // consent, or by the provider) stays out of every later request.
-          if (part.metadata?.thinkingDropped) continue
           assistantMessage.parts.push({
             type: "reasoning",
             text: part.text,

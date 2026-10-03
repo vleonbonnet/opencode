@@ -656,9 +656,8 @@ const layer = Layer.effect(
         for (const message of yield* session.messages({ sessionID: ctx.sessionID })) {
           for (const part of message.parts) {
             if (part.type !== "reasoning" || part.metadata?.thinkingDropped) continue
-            const anthropic = isRecord(part.metadata?.anthropic) ? part.metadata.anthropic : undefined
-            const signature = anthropic?.signature ?? anthropic?.redactedData
-            const reason = typeof signature === "string" ? reasons.get(signature) : undefined
+            const signature = MessageV2.thinkingSignature(part)
+            const reason = signature ? reasons.get(signature) : undefined
             if (!reason) continue
             yield* session.updatePart({ ...part, metadata: { ...part.metadata, thinkingDropped: { time, reason } } })
             marked++
