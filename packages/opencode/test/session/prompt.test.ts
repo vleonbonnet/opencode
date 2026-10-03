@@ -718,14 +718,15 @@ it.instance("stale thinking is refused, then kept as text with consent from the 
     expect((yield* bodies()).at(-1)!.thinking.block_binding).toEqual({ prefix_mismatch_behavior: "error" })
 
     // Disabling a tool changes the tool list every signature is bound to. Only
-    // sig-1 has been accepted under a known binding; sig-2 is not yet known.
+    // sig-1 has been accepted under a known binding; sig-2 is not yet known,
+    // but consent converts it too, since it follows sig-1.
     const report = yield* prompt.preflight({
       sessionID: chat.id,
       agent: "build",
       model: claudeRef,
       tools: { glob: false },
     })
-    expect(report.staleThinking).toMatchObject({ count: 1, reason: "the tool list changed" })
+    expect(report.staleThinking).toMatchObject({ count: 2, reason: "the tool list changed" })
 
     // Without consent nothing is sent: the turn ends with a visible error.
     const sent = (yield* bodies()).length

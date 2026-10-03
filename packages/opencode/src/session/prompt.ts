@@ -442,7 +442,8 @@ const layer = Layer.effect(
         ...(stale
           ? {
               staleThinking: {
-                count: stale.blocks.length,
+                // What consent converts: the stale blocks and every block after the first.
+                count: CacheLedger.consentedThinking(sessionID, captured).length,
                 reason: stale.reason,
                 ...(stale.path ? { path: stale.path } : {}),
               },
