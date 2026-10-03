@@ -1,4 +1,4 @@
-import { Effect, ScopedCache, Scope } from "effect"
+import { Effect, Fiber, Option, ScopedCache, Scope } from "effect"
 import type { InstanceContext } from "@/project/instance-context"
 import { InstanceRef, WorkspaceRef } from "./instance-ref"
 import { registerDisposer } from "./instance-registry"
@@ -9,6 +9,8 @@ const TypeId = "~opencode/InstanceState"
 export interface InstanceState<A, E = never, R = never> {
   readonly [TypeId]: typeof TypeId
   readonly cache: ScopedCache.ScopedCache<string, A, E, R>
+  /** Where initializations run, apart from the callers that need them. */
+  readonly scope: Scope.Scope
 }
 
 export const context = Effect.gen(function* () {
@@ -27,6 +29,7 @@ export const make = <A, E = never, R = never>(
   init: (ctx: InstanceContext) => Effect.Effect<A, E, R | Scope.Scope>,
 ): Effect.Effect<InstanceState<A, E, Exclude<R, Scope.Scope>>, never, R | Scope.Scope> =>
   Effect.gen(function* () {
+    const scope = yield* Scope.Scope
     const cache = yield* ScopedCache.make<string, A, E, R>({
       capacity: Number.POSITIVE_INFINITY,
       lookup: () =>
@@ -41,12 +44,22 @@ export const make = <A, E = never, R = never>(
     return {
       [TypeId]: TypeId,
       cache,
+      scope,
     }
   })
 
+// The cache runs an initialization in the fiber of its first caller and keeps
+// how it ended, interruption included: a first caller that went away (an HTTP
+// client abort) would leave every later one interrupted for the life of the
+// instance. Initializations run in the state's own scope instead, like instance
+// boot (InstanceStore), and callers only wait for them.
 export const get = <A, E, R>(self: InstanceState<A, E, R>) =>
   Effect.gen(function* () {
-    return yield* ScopedCache.get(self.cache, yield* directory)
+    const key = yield* directory
+    const ready = yield* ScopedCache.getSuccess(self.cache, key)
+    if (Option.isSome(ready)) return ready.value
+    const fiber = yield* ScopedCache.get(self.cache, key).pipe(Effect.forkIn(self.scope))
+    return yield* yield* Fiber.await(fiber)
   })
 
 export const use = <A, E, R, B>(self: InstanceState<A, E, R>, select: (value: A) => B) => Effect.map(get(self), select)

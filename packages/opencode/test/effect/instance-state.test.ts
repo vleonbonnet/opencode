@@ -390,3 +390,74 @@ it.live("InstanceState survives deferred resume outside ALS when InstanceRef is 
     }).pipe(Effect.provide(Test.layer))
   }),
 )
+
+it.live("InstanceState initialization outlives a caller that goes away", () =>
+  Effect.gen(function* () {
+    const dir = yield* tmpdirScoped()
+    const started = yield* Deferred.make<void>()
+    const release = yield* Deferred.make<void>()
+    let n = 0
+    const state = yield* InstanceState.make(() =>
+      Effect.gen(function* () {
+        const run = ++n
+        yield* Deferred.succeed(started, undefined)
+        yield* Deferred.await(release)
+        return { run }
+      }),
+    )
+
+    // The first caller (a request whose client went away) is interrupted
+    // mid-initialization, without waiting for it.
+    const first = yield* access(state, dir).pipe(Effect.forkScoped)
+    yield* Deferred.await(started)
+    yield* Fiber.interrupt(first)
+    expect(yield* Deferred.isDone(release)).toBe(false)
+
+    yield* Deferred.succeed(release, undefined)
+    const next = yield* access(state, dir)
+    expect(next).toEqual({ run: 1 })
+    expect(yield* access(state, dir)).toBe(next)
+    expect(n).toBe(1)
+  }),
+)
+
+it.live("InstanceState callers waiting with one that goes away still get the value", () =>
+  Effect.gen(function* () {
+    const dir = yield* tmpdirScoped()
+    const started = yield* Deferred.make<void>()
+    const release = yield* Deferred.make<void>()
+    let n = 0
+    const state = yield* InstanceState.make(() =>
+      Effect.gen(function* () {
+        const run = ++n
+        yield* Deferred.succeed(started, undefined)
+        yield* Deferred.await(release)
+        return { run }
+      }),
+    )
+
+    const first = yield* access(state, dir).pipe(Effect.forkScoped)
+    yield* Deferred.await(started)
+    const waiter = yield* access(state, dir).pipe(Effect.forkScoped)
+    yield* Effect.yieldNow
+    yield* Fiber.interrupt(first)
+    yield* Deferred.succeed(release, undefined)
+
+    const exit = yield* Fiber.await(waiter)
+    expect(Exit.isSuccess(exit)).toBe(true)
+    if (Exit.isSuccess(exit)) expect(exit.value).toEqual({ run: 1 })
+    expect(n).toBe(1)
+  }),
+)
+
+it.live("InstanceState still caches a failed initialization", () =>
+  Effect.gen(function* () {
+    const dir = yield* tmpdirScoped()
+    let n = 0
+    const state = yield* InstanceState.make(() => Effect.suspend(() => (++n, Effect.fail("broken" as const))))
+
+    expect(yield* Effect.flip(access(state, dir))).toBe("broken")
+    expect(yield* Effect.flip(access(state, dir))).toBe("broken")
+    expect(n).toBe(1)
+  }),
+)
