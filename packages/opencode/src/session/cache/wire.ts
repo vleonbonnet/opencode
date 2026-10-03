@@ -1,4 +1,4 @@
-// Wire capture: observes the exact HTTP request bodies that leave the process
+// Wire capture: observes the HTTP-equivalent request bodies that leave the process
 // for session LLM calls, after every SDK, plugin and custom-fetch layer has
 // run. Prompt-cache reuse is decided by the provider on those bytes, so this
 // is the only place where cache prediction can be grounded without modelling
@@ -135,6 +135,36 @@ function url(input: RequestInfo | URL) {
   return input.url
 }
 
+/** Capture and strip the tag before either HTTP or WebSocket transport runs. */
+export async function intercept(input: RequestInfo | URL, init?: RequestInit): Promise<RequestInit | undefined> {
+  const headers = mergedHeaders(input, init)
+  const raw = headers.get(HEADER)
+  if (!raw) return init
+  headers.delete(HEADER)
+  const tag = parse(raw)
+  const forward: RequestInit = { ...init, headers }
+  if (!tag) return forward
+
+  const request: Captured = {
+    url: url(input),
+    method: (init?.method ?? (input instanceof Request ? input.method : "GET")).toUpperCase(),
+    headers: Object.fromEntries(headers.entries()),
+    body: await bodyText(input, init),
+    time: Date.now(),
+  }
+  notify(observers, tag, request)
+  if (tag.mode === "dryrun") {
+    captured.set(tag.id, request)
+    // Bound memory if a caller never collects its capture.
+    if (captured.size > 64) captured.delete(captured.keys().next().value!)
+    throw new DryRunCaptured(tag.id)
+  }
+  // Guards run ahead of accounting and may throw to stop the request.
+  for (const guard of guards) guard(tag, request)
+  notify(senders, tag, request)
+  return forward
+}
+
 /**
  * Install the process-wide hook on `globalThis.fetch`. Idempotent. SDKs and
  * plugin fetch wrappers resolve `fetch` at call time, so every layer above
@@ -145,32 +175,7 @@ export function install() {
   if (current[SENTINEL]) return
   const original = current
   const patched = async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
-    const headers = mergedHeaders(input, init)
-    const raw = headers.get(HEADER)
-    if (!raw) return original(input, init)
-    headers.delete(HEADER)
-    const tag = parse(raw)
-    const forward: RequestInit = { ...init, headers }
-    if (!tag) return original(input, forward)
-
-    const request: Captured = {
-      url: url(input),
-      method: (init?.method ?? (input instanceof Request ? input.method : "GET")).toUpperCase(),
-      headers: Object.fromEntries(headers.entries()),
-      body: await bodyText(input, init),
-      time: Date.now(),
-    }
-    notify(observers, tag, request)
-    if (tag.mode === "dryrun") {
-      captured.set(tag.id, request)
-      // Bound memory if a caller never collects its capture.
-      if (captured.size > 64) captured.delete(captured.keys().next().value!)
-      throw new DryRunCaptured(tag.id)
-    }
-    // Guards run ahead of accounting and may throw to stop the request.
-    for (const guard of guards) guard(tag, request)
-    notify(senders, tag, request)
-    return original(input, forward)
+    return original(input, await intercept(input, init))
   }
   Object.assign(patched, original, { [SENTINEL]: true })
   globalThis.fetch = patched as typeof fetch

@@ -7,6 +7,7 @@ import { APICallError } from "ai"
 import { ProviderError } from "../../src/provider/error"
 import { OpenAIWebSocket } from "../../src/plugin/openai/ws"
 import { OpenAIWebSocketPool, TITLE_HEADER } from "../../src/plugin/openai/ws-pool"
+import { Wire } from "../../src/session/cache/wire"
 
 describe("plugin.openai.ws", () => {
   test("derives websocket URLs and sends auth plus protocol headers", async () => {
@@ -147,6 +148,110 @@ describe("plugin.openai.ws", () => {
 })
 
 describe("plugin.openai.ws-pool", () => {
+  test("captures preflight without opening a websocket or reserving its lane", async () => {
+    let connections = 0
+    const frames: unknown[] = []
+    let headers: IncomingMessage["headers"] | undefined
+    await using server = await createWebSocketServer((socket, request) => {
+      connections++
+      headers = request.headers
+      socket.on("message", (data) => {
+        frames.push(JSON.parse(data.toString()))
+        socket.send(JSON.stringify({ type: "response.completed", response: { id: "resp-wire" } }))
+      })
+    })
+    const fetch = OpenAIWebSocketPool.createWebSocketFetch()
+    const captures: Wire.Captured[] = []
+    const sends: Wire.Captured[] = []
+    const offCapture = Wire.onCapture((_tag, request) => captures.push(request))
+    const offSend = Wire.onSend((_tag, request) => sends.push(request))
+    const id = Wire.nextID()
+    try {
+      await expect(
+        fetch(server.url, streamRequest(Wire.header({ mode: "dryrun", id, sessionID: "session-1" }))),
+      ).rejects.toBeInstanceOf(Wire.DryRunCaptured)
+      expect(Wire.take(id)).toMatchObject({
+        url: server.url,
+        method: "POST",
+        body: streamRequest().body,
+      })
+      expect(connections).toBe(0)
+      expect(frames).toHaveLength(0)
+      expect(server.httpRequests).toHaveLength(0)
+      expect(sends).toHaveLength(0)
+
+      const response = await fetch(
+        server.url,
+        streamRequest(Wire.header({ mode: "send", id: Wire.nextID(), sessionID: "session-1" })),
+      )
+      expect(await response.text()).toContain("data: [DONE]")
+      expect(connections).toBe(1)
+      expect(frames).toEqual([{ type: "response.create", input: "hi" }])
+      expect(server.httpRequests).toHaveLength(0)
+      expect(captures).toHaveLength(2)
+      expect(sends).toHaveLength(1)
+      expect(sends[0]).toMatchObject({ url: server.url, body: streamRequest().body })
+      expect(sends[0].headers[Wire.HEADER]).toBeUndefined()
+      expect(headers?.[Wire.HEADER]).toBeUndefined()
+    } finally {
+      offCapture()
+      offSend()
+      fetch.close()
+      Wire.take(id)
+    }
+  })
+
+  test("wire guards stop websocket sends before connecting", async () => {
+    let connections = 0
+    await using server = await createWebSocketServer(() => connections++)
+    const fetch = OpenAIWebSocketPool.createWebSocketFetch()
+    const off = Wire.guard(() => {
+      throw new Error("wire guard refused the request")
+    })
+    try {
+      await expect(
+        fetch(server.url, streamRequest(Wire.header({ mode: "send", id: Wire.nextID(), sessionID: "session-1" }))),
+      ).rejects.toThrow("wire guard refused the request")
+      expect(connections).toBe(0)
+      expect(server.httpRequests).toHaveLength(0)
+    } finally {
+      off()
+      fetch.close()
+    }
+  })
+
+  test("captures HTTP fallback once and never sends a fallback preflight", async () => {
+    await using server = await createRejectingWebSocketServer(() => {})
+    const original = globalThis.fetch
+    Wire.install()
+    const fetch = OpenAIWebSocketPool.createWebSocketFetch({ streamRetries: 0 })
+    const sends: Wire.Captured[] = []
+    const off = Wire.onSend((_tag, request) => sends.push(request))
+    const id = Wire.nextID()
+    try {
+      const response = await fetch(
+        server.url,
+        streamRequest(Wire.header({ mode: "send", id: Wire.nextID(), sessionID: "session-1" })),
+      )
+      expect(await response.text()).toBe("http")
+      expect(sends).toHaveLength(1)
+      expect(server.httpRequests).toHaveLength(1)
+      expect(server.httpRequests[0].headers[Wire.HEADER]).toBeUndefined()
+
+      await expect(
+        fetch(server.url, streamRequest(Wire.header({ mode: "dryrun", id, sessionID: "session-1" }))),
+      ).rejects.toBeInstanceOf(Wire.DryRunCaptured)
+      expect(Wire.take(id)).toMatchObject({ body: streamRequest().body })
+      expect(server.httpRequests).toHaveLength(1)
+      expect(sends).toHaveLength(1)
+    } finally {
+      off()
+      fetch.close()
+      globalThis.fetch = original
+      Wire.take(id)
+    }
+  })
+
   test("reuses one healthy websocket for sequential requests", async () => {
     let connections = 0
     let messages = 0

@@ -132,6 +132,17 @@ const live: Layer.Layer<
         flags,
         isWorkflow,
       })
+      // Dry runs keep identical tool schemas but must never dispatch a tool.
+      if (input.wire?.mode === "dryrun") {
+        for (const name of Object.keys(prepared.tools)) {
+          prepared.tools[name] = {
+            ...prepared.tools[name],
+            execute: async () => {
+              throw new Error("preflight never executes tools")
+            },
+          }
+        }
+      }
       // Small-model utility calls (titles, summaries) do not share the
       // session prompt, so only session requests are tagged for the ledger.
       const wireHeaders =

@@ -4,6 +4,8 @@ import { afterAll, beforeAll, beforeEach, describe, expect, test } from "bun:tes
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import path from "path"
 import { tool, type ModelMessage } from "ai"
+import { convertArrayToReadableStream, MockLanguageModelV3 } from "ai/test"
+import type { LanguageModelV3StreamPart } from "@ai-sdk/provider"
 import { Cause, Effect, Exit, Fiber, Layer, Stream } from "effect"
 import { InstanceRef } from "../../src/effect/instance-ref"
 import { HttpClientRequest, HttpClientResponse } from "effect/unstable/http"
@@ -755,6 +757,83 @@ function createEventResponse(chunks: unknown[], includeDone = false) {
 describe("session.llm.stream", () => {
   const vivgridFixture = { providerID: "vivgrid", modelID: "gemini-3.1-pro-preview" }
   const opencodeFixture = { providerID: "opencode-test", modelID: vivgridFixture.modelID }
+
+  it.instance(
+    "preflight blocks tool execution even when transport bypasses wire capture, without changing normal tools",
+    () =>
+      Effect.gen(function* () {
+        const resolved = yield* Provider.use.getModel(ProviderV2.ID.openai, ModelV2.ID.make("gpt-5.2"))
+        const provider = yield* Provider.use.getProvider(ProviderV2.ID.openai)
+        const language = new MockLanguageModelV3({
+          doStream: async () => ({
+            stream: convertArrayToReadableStream<LanguageModelV3StreamPart>([
+              { type: "stream-start", warnings: [] },
+              { type: "tool-call", toolCallId: "call-preflight", toolName: "lookup", input: '{"query":"weather"}' },
+              {
+                type: "finish",
+                finishReason: { unified: "tool-calls", raw: "tool_calls" },
+                usage: {
+                  inputTokens: { total: 1, noCache: 1, cacheRead: 0, cacheWrite: 0 },
+                  outputTokens: { total: 1, text: 1, reasoning: 0 },
+                },
+              },
+            ]),
+          }),
+        })
+        const layer = AppNodeBuilder.build(LLM.node, [
+          [
+            Provider.node,
+            Layer.mock(Provider.Service, {
+              getLanguage: () => Effect.succeed(language),
+              getProvider: () => Effect.succeed(provider),
+            }),
+          ],
+          [RuntimeFlags.node, RuntimeFlags.layer({ experimentalNativeLlm: false })],
+        ])
+        let executed = 0
+        const agent = {
+          name: "test",
+          mode: "primary",
+          options: {},
+          permission: [{ permission: "*", pattern: "*", action: "allow" }],
+        } satisfies Agent.Info
+        const sessionID = SessionID.make("session-preflight-tool")
+        const input: LLM.StreamInput = {
+          user: {
+            id: MessageID.make("msg_preflight-tool"),
+            sessionID,
+            role: "user",
+            time: { created: Date.now() },
+            agent: agent.name,
+            model: { providerID: ProviderV2.ID.openai, modelID: resolved.id },
+          },
+          sessionID,
+          model: resolved,
+          agent,
+          system: [],
+          messages: [{ role: "user", content: "Use lookup" }],
+          tools: {
+            lookup: tool({
+              description: "Lookup data",
+              inputSchema: z.object({ query: z.string() }),
+              execute: async () => {
+                executed++
+                return { output: "looked up" }
+              },
+            }),
+          },
+        }
+
+        yield* drainWith(layer, { ...input, wire: { mode: "dryrun", id: "preflight-tool" } })
+        expect(executed).toBe(0)
+        expect(language.doStreamCalls).toHaveLength(1)
+        yield* drainWith(layer, input)
+        expect(executed).toBe(1)
+        expect(language.doStreamCalls).toHaveLength(2)
+        expect(language.doStreamCalls[0].tools).toEqual(language.doStreamCalls[1].tools)
+      }),
+    { config: () => openAIConfig(loadFixture("openai", "gpt-5.2").model, "https://unused-openai.test/v1") },
+  )
 
   const headerCases = [
     { providerID: opencodeFixture.providerID, child: false },

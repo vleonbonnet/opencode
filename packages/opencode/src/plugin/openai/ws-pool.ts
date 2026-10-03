@@ -1,5 +1,6 @@
 import WebSocket from "ws"
 import { ProviderError } from "@/provider/error"
+import { Wire } from "@/session/cache/wire"
 import { isRecord } from "@/util/record"
 import { OpenAIWebSocket } from "./ws"
 
@@ -43,7 +44,7 @@ export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
   async function websocketFetch(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
     const url = input instanceof URL ? input.toString() : typeof input === "string" ? input : input.url
     const internalHeaders = OpenAIWebSocket.normalizeHeaders(init?.headers)
-    const httpInit = withoutInternalHeaders(init)
+    const httpInit = await Wire.intercept(input, withoutInternalHeaders(init))
 
     if (init?.method !== "POST" || !new URL(url).pathname.endsWith("/responses")) {
       return httpFetch(input, httpInit)
