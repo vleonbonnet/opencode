@@ -220,6 +220,32 @@ describe("tool.apply_patch freeform", () => {
     }),
   )
 
+  it.instance("preserves per-file line endings and BOM when updating and moving files", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const { ctx, calls } = makeCtx()
+      const original = path.join(test.directory, "windows.org")
+      const moved = path.join(test.directory, "nested", "windows.org")
+      const unix = path.join(test.directory, "unix.txt")
+      yield* writeText(original, "\uFEFF#+name: example\r\n#+begin_src bash\r\necho old\r\n#+end_src\r\n")
+      yield* writeText(unix, "before\nold\nafter\n")
+
+      yield* execute(
+        {
+          patchText:
+            "*** Begin Patch\n*** Update File: windows.org\n*** Move to: nested/windows.org\n@@\n-echo old\n+echo new\n*** Update File: unix.txt\n@@\n-old\n+new\n*** End Patch",
+        },
+        ctx,
+      )
+
+      yield* expectReadFailure(original)
+      expect(yield* readText(moved)).toBe("\uFEFF#+name: example\r\n#+begin_src bash\r\necho new\r\n#+end_src\r\n")
+      expect(yield* readText(unix)).toBe("before\nnew\nafter\n")
+      expect(calls[0].metadata.files[0].patch).not.toContain("-#+name:")
+      expect(calls[0].metadata.files[0].patch).not.toContain("\uFEFF")
+    }),
+  )
+
   it.instance("does not invent a first-line diff for BOM files", () =>
     Effect.gen(function* () {
       const test = yield* TestInstance

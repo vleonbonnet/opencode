@@ -18,19 +18,7 @@ import { Snapshot } from "@/snapshot"
 import { assertExternalDirectoryEffect } from "./external-directory"
 import { FSUtil } from "@opencode-ai/core/fs-util"
 import * as Bom from "@/util/bom"
-
-function normalizeLineEndings(text: string): string {
-  return text.replaceAll("\r\n", "\n")
-}
-
-function detectLineEnding(text: string): "\n" | "\r\n" {
-  return text.includes("\r\n") ? "\r\n" : "\n"
-}
-
-function convertToLineEnding(text: string, ending: "\n" | "\r\n"): string {
-  if (ending === "\n") return text
-  return text.replaceAll("\n", "\r\n")
-}
+import { LineEnding } from "@/util/line-ending"
 
 const locks = new Map<string, Semaphore.Semaphore>()
 
@@ -126,9 +114,9 @@ export const EditTool = Tool.define(
               const source = yield* Bom.readFile(afs, filePath)
               contentOld = source.text
 
-              const ending = detectLineEnding(contentOld)
-              const old = convertToLineEnding(normalizeLineEndings(params.oldString), ending)
-              const replacement = convertToLineEnding(normalizeLineEndings(params.newString), ending)
+              const ending = LineEnding.detect(contentOld)
+              const old = LineEnding.convert(params.oldString, ending)
+              const replacement = LineEnding.convert(params.newString, ending)
 
               const next = Bom.split(replace(contentOld, old, replacement, params.replaceAll))
               const desiredBom = source.bom || next.bom
@@ -138,8 +126,8 @@ export const EditTool = Tool.define(
                 createTwoFilesPatch(
                   filePath,
                   filePath,
-                  normalizeLineEndings(contentOld),
-                  normalizeLineEndings(contentNew),
+                  LineEnding.normalize(contentOld),
+                  LineEnding.normalize(contentNew),
                 ),
               )
               yield* ctx.ask({
@@ -165,8 +153,8 @@ export const EditTool = Tool.define(
                 createTwoFilesPatch(
                   filePath,
                   filePath,
-                  normalizeLineEndings(contentOld),
-                  normalizeLineEndings(contentNew),
+                  LineEnding.normalize(contentOld),
+                  LineEnding.normalize(contentNew),
                 ),
               )
             }).pipe(Effect.orDie),

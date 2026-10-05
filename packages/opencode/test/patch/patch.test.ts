@@ -285,6 +285,75 @@ PATCH`
     )
   })
 
+  describe("line endings", () => {
+    test.each([
+      { name: "LF file with LF patch", file: "\n", patch: "\n" },
+      { name: "CRLF file with LF patch", file: "\r\n", patch: "\n" },
+      { name: "LF file with CRLF patch", file: "\n", patch: "\r\n" },
+      { name: "CRLF file with CRLF patch", file: "\r\n", patch: "\r\n" },
+    ])("preserves $name across multiple hunks", ({ file, patch }) => {
+      const original = ["first", "old1", "middle", "old2", "", "last", ""].join(file)
+      const parsed = Patch.parsePatch(
+        [
+          "*** Begin Patch",
+          "*** Update File: example.org",
+          "@@ first",
+          "-old1",
+          "+new1",
+          "+inserted",
+          "@@",
+          "-old2",
+          "+new2",
+          " ",
+          " last",
+          "*** End of File",
+          "*** End Patch",
+        ].join(patch),
+      )
+      const hunk = parsed.hunks[0]
+      if (hunk.type !== "update") throw new Error("Expected update hunk")
+      expect(hunk.chunks).toHaveLength(2)
+      const result = Patch.deriveNewContentsFromChunks("example.org", hunk.chunks, original)
+      expect(result.content).toBe(["first", "new1", "inserted", "middle", "new2", "", "last", ""].join(file))
+    })
+
+    test("normalizes mixed files using the edit tool's CRLF preference", () => {
+      const result = Patch.deriveNewContentsFromChunks(
+        "mixed.org",
+        [{ old_lines: ["old"], new_lines: ["changed"] }],
+        "first\r\nold\nlast\r\n",
+      )
+      expect(result.content).toBe("first\r\nchanged\r\nlast\r\n")
+    })
+
+    test("adds a missing final newline using the file's CRLF convention", () => {
+      const result = Patch.deriveNewContentsFromChunks(
+        "no-newline.org",
+        [{ old_lines: ["old"], new_lines: ["changed"] }],
+        "first\r\nold",
+      )
+      expect(result.content).toBe("first\r\nchanged\r\n")
+    })
+
+    test("keeps carriage returns inside line content", () => {
+      const result = Patch.deriveNewContentsFromChunks(
+        "literal-cr.txt",
+        [{ old_lines: ["old"], new_lines: ["changed"] }],
+        "first\rmiddle\r\nold\r\nlast\r\n",
+      )
+      expect(result.content).toBe("first\rmiddle\r\nchanged\r\nlast\r\n")
+    })
+
+    test("normalizes CRLF heredoc patches before parsing new files", () => {
+      const parsed = Patch.parsePatch(
+        ["cat <<'EOF'", "*** Begin Patch", "*** Add File: new.txt", "+first", "+second", "*** End Patch", "EOF"].join(
+          "\r\n",
+        ),
+      )
+      expect(parsed.hunks).toEqual([{ type: "add", path: "new.txt", contents: "first\nsecond" }])
+    })
+  })
+
   describe("error handling", () => {
     it.live("should fail when updating non-existent file", () =>
       Effect.gen(function* () {

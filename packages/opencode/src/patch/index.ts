@@ -2,6 +2,7 @@ import { Effect, Schema } from "effect"
 import * as path from "path"
 import { FSUtil } from "@opencode-ai/core/fs-util"
 import * as Bom from "../util/bom"
+import { LineEnding } from "../util/line-ending"
 
 export const PatchSchema = Schema.Struct({
   patchText: Schema.String.annotate({ description: "The full patch text that describes all changes to be made" }),
@@ -183,7 +184,7 @@ function stripHeredoc(input: string): string {
 }
 
 export function parsePatch(patchText: string): { hunks: Hunk[] } {
-  const cleaned = stripHeredoc(patchText.trim())
+  const cleaned = stripHeredoc(LineEnding.normalize(patchText).trim())
   const lines = cleaned.split("\n")
   const hunks: Hunk[] = []
   let i = 0
@@ -310,8 +311,9 @@ export function deriveNewContentsFromChunks(
   originalText: string,
 ): ApplyPatchFileUpdate {
   const originalContent = Bom.split(originalText)
+  const ending = LineEnding.detect(originalContent.text)
 
-  let originalLines = originalContent.text.split("\n")
+  let originalLines = LineEnding.normalize(originalContent.text).split("\n")
 
   // Drop trailing empty element for consistent line counting
   if (originalLines.length > 0 && originalLines[originalLines.length - 1] === "") {
@@ -327,7 +329,7 @@ export function deriveNewContentsFromChunks(
   }
 
   const next = Bom.split(newLines.join("\n"))
-  const newContent = next.text
+  const newContent = LineEnding.convert(next.text, ending)
 
   // Generate unified diff
   const unifiedDiff = generateUnifiedDiff(originalContent.text, newContent)
