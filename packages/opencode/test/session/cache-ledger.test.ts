@@ -5,12 +5,15 @@ import { Wire } from "../../src/session/cache/wire"
 import fs from "fs/promises"
 import os from "os"
 import path from "path"
+import { tmpdir } from "../fixture/fixture"
 
 // Request shapes mirror what @ai-sdk/anthropic and @ai-sdk/openai-compatible
 // put on the wire for opencode sessions.
 
 const ANTHROPIC = "https://api.anthropic.com/v1/messages"
 const FIREWORKS = "https://api.fireworks.ai/inference/v1/chat/completions"
+const OPENAI = "https://api.openai.com/v1/responses"
+const CODEX = "https://chatgpt.com/backend-api/codex/responses"
 const CC = { type: "ephemeral", ttl: "1h" }
 
 type Body = Record<string, any>
@@ -281,7 +284,7 @@ describe("CacheLedger", () => {
     expect(report.reasons[0]).toContain("cache namespace changed (credential, endpoint)")
   })
 
-  test("a miss long after expiry reports the idle time", async () => {
+  test("age alone makes reuse uncertain and reports the idle time", async () => {
     // The previous request must be recent enough to be the session's `last`
     // (older sessions cannot have a live cache), while the entry it wrote
     // must be old enough to have expired.
@@ -292,10 +295,11 @@ describe("CacheLedger", () => {
     } finally {
       setSystemTime()
     }
-    const n = CacheModel.normalize(request(ANTHROPIC, anthropicBody(turn2)))
     const report = CacheLedger.predict(sessionID, request(ANTHROPIC, anthropicBody(turn2)))
-    expect(report.status).toBe("miss")
-    expect(report.reasons.some((reason) => reason.startsWith("cached prefix expired: idle ~70m"))).toBe(true)
+    expect(report.status).toBe("unknown")
+    expect(report.reasons).toContain(
+      "cache may have expired: idle ~70m, retention window 60m (requested cache_control TTL)",
+    )
   })
 
   test("a miss without a known reason still explains itself", async () => {
@@ -336,8 +340,8 @@ describe("CacheLedger", () => {
       setSystemTime()
     }
     const report = CacheLedger.predict(sessionID, request(ANTHROPIC, anthropicBody(turn2)))
-    expect(report.status).toBe("miss")
-    expect(report.reasons.some((reason) => reason.startsWith("cached prefix expired"))).toBe(true)
+    expect(report.status).toBe("unknown")
+    expect(report.reasons.some((reason) => reason.startsWith("cache may have expired"))).toBe(true)
   })
 
   test("entries beyond the 20-block lookback are not reachable", async () => {
@@ -397,6 +401,139 @@ describe("CacheLedger", () => {
     const report = CacheLedger.unknown(sessionID, "compaction")
     expect(report.lostTokens).toBe(120_003)
     expect(report.reasons).toEqual(["compaction"])
+  })
+})
+
+describe("CacheLedger automatic retention", () => {
+  const sessionID = "ses_retention"
+  const body = (model: string, extra: Body = {}) => ({
+    model,
+    input: [{ role: "user", content: "hello " + "x".repeat(4000) }],
+    ...extra,
+  })
+
+  test.each([
+    { url: OPENAI, model: "gpt-6-astra" },
+    { url: CODEX, model: "gpt-6-astra" },
+    { url: OPENAI, model: "gpt-5.6" },
+    { url: CODEX, model: "gpt-5.6-luna" },
+    { url: OPENAI, model: "gpt-5.5-2026-04-23" },
+    { url: CODEX, model: "gpt-5.5" },
+    { url: OPENAI, model: "gpt-5.4", extra: { prompt_cache_retention: "24h" } },
+    { url: OPENAI, model: "future-model", extra: { prompt_cache_options: { ttl: "30m" } } },
+  ])("$url $model reuses a prefix after 29m and is uncertain after 30m", async ({ url, model, extra }) => {
+    const start = Date.now()
+    const captured = request(url, body(model, extra))
+    try {
+      setSystemTime(start)
+      await wire(sessionID, captured)
+      CacheLedger.observe(sessionID, { input: 96, read: 117_248, write: 0 })
+      setSystemTime(start + 29 * 60_000)
+      const warm = CacheLedger.predict(sessionID, captured)
+      expect(warm.status).toBe("hit")
+      expect(warm.reusableTokens).toBe(117_344)
+      setSystemTime(start + 31 * 60_000)
+      const aged = CacheLedger.predict(sessionID, captured)
+      expect(aged.status).toBe("unknown")
+      expect(aged.lostTokens).toBe(117_344)
+      expect(aged.reasons[0]).toStartWith("cache may have expired: idle ~31m, retention window 30m")
+      if (url === CODEX) expect(aged.reasons[0]).toContain("Codex model-family estimate")
+      // An uncertain prediction must not prevent real cache hits refreshing it.
+      await wire(sessionID, captured)
+      CacheLedger.observe(sessionID, { input: 96, read: 117_248, write: 0 })
+      const refreshed = CacheLedger.predict(sessionID, captured)
+      expect(refreshed.status).toBe("hit")
+      expect(refreshed.verification?.at(-1)?.actual).toBe(117_248)
+    } finally {
+      setSystemTime()
+    }
+  })
+
+  test.each([
+    { url: OPENAI, model: "gpt-5.4", extra: {} },
+    { url: OPENAI, model: "gpt-5.4", extra: { prompt_cache_retention: "in_memory" } },
+    { url: OPENAI, model: "unknown-model", extra: { prompt_cache_options: { ttl: "1h" } } },
+    { url: CODEX, model: "gpt-5.4", extra: { prompt_cache_retention: "24h" } },
+    { url: FIREWORKS, model: "gpt-6-astra", extra: { messages: [{ role: "user", content: "hello" }] } },
+    { url: "https://api.githubcopilot.com/responses", model: "gpt-6-astra", extra: {} },
+    { url: "https://api.openai.com.example/v1/responses", model: "gpt-6-astra", extra: {} },
+    { url: "https://gateway.example/v1/responses", model: "gpt-6-astra", extra: { prompt_cache_retention: "24h" } },
+    {
+      url: "https://gateway.example/v1/responses",
+      model: "gpt-6-astra",
+      extra: { prompt_cache_options: { ttl: "30m" } },
+    },
+  ])("$url $model does not infer extended retention from an API-compatible shape", async ({ url, model, extra }) => {
+    const start = Date.now()
+    const captured = request(url, body(model, extra))
+    try {
+      setSystemTime(start)
+      await wire(sessionID, captured)
+      CacheLedger.observe(sessionID, { input: 117_344, read: 0, write: 0 })
+      setSystemTime(start + 6 * 60_000)
+      const aged = CacheLedger.predict(sessionID, captured)
+      expect(aged.status).toBe("unknown")
+      expect(aged.reasons[0]).toStartWith("cache may have expired: idle ~6m, retention window 5m")
+    } finally {
+      setSystemTime()
+    }
+  })
+
+  test("a model change is still a predicted miss after the old prefix ages", async () => {
+    const start = Date.now()
+    try {
+      setSystemTime(start)
+      await wire(sessionID, request(CODEX, body("gpt-6-astra")))
+      CacheLedger.observe(sessionID, { input: 117_344, read: 0, write: 0 })
+      setSystemTime(start + 31 * 60_000)
+      const report = CacheLedger.predict(sessionID, request(CODEX, body("gpt-6-sol")))
+      expect(report.status).toBe("miss")
+      expect(report.reasons).toContain("model changed: gpt-6-astra -> gpt-6-sol")
+      expect(report.reasons.some((reason) => reason.includes("may have expired"))).toBe(false)
+    } finally {
+      setSystemTime()
+    }
+  })
+
+  test.each([
+    { url: CODEX, model: "gpt-6-astra", ttl: 5 * 60_000, extra: {} },
+    { url: OPENAI, model: "gpt-5.4", ttl: 24 * 60 * 60_000, extra: { prompt_cache_retention: "24h" } },
+  ])("old $ttl ms ledger entries adopt the policy without refreshing their age", async ({ url, model, ttl, extra }) => {
+    await using tmp = await tmpdir()
+    const file = path.join(tmp.path, "cache-ledger.json")
+    const start = Date.now()
+    const captured = request(url, body(model, extra))
+    const normalized = CacheModel.normalize(captured)
+    // Legacy ledger fixture: entries have a timestamp and TTL, but no policy source.
+    await fs.writeFile(
+      file,
+      JSON.stringify({
+        entries: {
+          [normalized.namespace]: {
+            [normalized.blocks.at(-1)!.prefix]: { tokens: 117_344, exact: true, expires: start + ttl, ttl },
+          },
+        },
+        sessions: {
+          [sessionID]: {
+            last: { ...normalized, time: start, prompt: 117_344, usage: { input: 96, read: 117_248, write: 0 } },
+            verifications: [],
+            thinking: {},
+          },
+        },
+      }),
+    )
+    try {
+      setSystemTime(start + 29 * 60_000)
+      CacheLedger.configure({ file })
+      expect(CacheLedger.predict(sessionID, captured).status).toBe("hit")
+      setSystemTime(start + 31 * 60_000)
+      const aged = CacheLedger.predict(sessionID, captured)
+      expect(aged.status).toBe("unknown")
+      expect(aged.reasons[0]).toStartWith("cache may have expired: idle ~31m, retention window 30m")
+    } finally {
+      CacheLedger.configure({})
+      setSystemTime()
+    }
   })
 })
 

@@ -19,6 +19,7 @@ type Entry = {
   exact: boolean
   expires: number
   ttl: number
+  retentionSource?: string
 }
 
 type Snapshot = {
@@ -261,8 +262,20 @@ function lookup(normalized: CacheModel.Normalized, now: number) {
   let unreachable: Candidate | undefined
   if (!map || normalized.format === "unknown") return { best, expired, unreachable }
   const consider = (index: number) => {
-    const entry = map.get(normalized.blocks[index].prefix)
-    if (!entry) return
+    const saved = map.get(normalized.blocks[index].prefix)
+    if (!saved) return
+    // Older ledgers used 5m for every automatic host (or a guaranteed 24h).
+    // Reinterpret their window without resetting when the prefix was used.
+    const retention = normalized.automaticRetention
+    const entry =
+      retention && !saved.retentionSource
+        ? {
+            ...saved,
+            ttl: retention.ttl,
+            expires: saved.expires - saved.ttl + retention.ttl,
+            retentionSource: retention.source,
+          }
+        : saved
     const live = entry.expires > now
     const candidate = { index, entry, live }
     if (live) {
@@ -406,9 +419,13 @@ export function predict(sessionID: string, request: Captured): Report {
         (diff.previousPath && diff.previousPath !== diff.path ? ` (now ${diff.path})` : ""),
     )
   }
-  if (expired && (!best || expired.index > best.index)) {
+  const aged = expired && (!best || expired.index > best.index)
+  if (aged) {
     const idle = Math.round((now - (expired.entry.expires - expired.entry.ttl)) / 60_000)
-    reasons.push(`cached prefix expired: idle ~${idle}m, provider TTL ${Math.round(expired.entry.ttl / 60_000)}m`)
+    reasons.push(
+      `cache may have expired: idle ~${idle}m, retention window ${Math.round(expired.entry.ttl / 60_000)}m` +
+        ` (${expired.entry.retentionSource ?? "requested cache_control TTL"})`,
+    )
   }
   if (unreachable) {
     reasons.push(
@@ -432,9 +449,11 @@ export function predict(sessionID: string, request: Captured): Report {
       ? "unknown"
       : lost <= tolerance(previous.prompt)
         ? "hit"
-        : reusable > 0
-          ? "partial"
-          : "miss"
+        : aged
+          ? "unknown"
+          : reusable > 0
+            ? "partial"
+            : "miss"
   return {
     ...base,
     status,
@@ -557,7 +576,8 @@ export function observe(sessionID: string, usage: Usage, dropped: readonly strin
   if (normalized.format !== "unknown" && normalized.blocks.length > 0) {
     const map = namespace(normalized.namespace)
     const last = normalized.blocks.length - 1
-    if (normalized.automatic) {
+    const retention = normalized.automaticRetention
+    if (retention) {
       // Automatic caching stores the processed prompt. Providers that do not
       // cache at all are caught by verification on the next request.
       const cachedTokens = prompt
@@ -566,8 +586,9 @@ export function observe(sessionID: string, usage: Usage, dropped: readonly strin
         map.set(block.prefix, {
           tokens,
           exact: index === last,
-          expires: sent.time + normalized.automaticTTL,
-          ttl: normalized.automaticTTL,
+          expires: sent.time + retention.ttl,
+          ttl: retention.ttl,
+          retentionSource: retention.source,
         })
       })
     } else if (usage.read + usage.write > 0) {
@@ -591,6 +612,7 @@ export function observe(sessionID: string, usage: Usage, dropped: readonly strin
             exact: exact || (existing?.exact ?? false),
             expires: sent.time + ttl,
             ttl,
+            retentionSource: "requested cache_control TTL",
           })
         }
         for (const index of breakpoints) {

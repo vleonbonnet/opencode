@@ -29,10 +29,14 @@ export type Region = "tools" | "system" | "messages"
 
 export const ANTHROPIC_LOOKBACK = 20
 export const ANTHROPIC_DEFAULT_TTL = 5 * 60_000
-// OpenAI documents 5-10 minutes of inactivity (up to an hour off-peak) for
-// automatic caching; other OpenAI-compatible hosts do not document theirs.
-// Stay conservative unless the request asks for extended retention.
+// A conservative prediction window for hosts whose retention is undocumented.
+// Crossing a window is not evidence that the provider evicted the prefix.
 export const AUTOMATIC_DEFAULT_TTL = 5 * 60_000
+
+export type Retention = {
+  readonly ttl: number
+  readonly source: string
+}
 
 export type Block = {
   /** Chained hash of the normalized request prefix ending with this block. */
@@ -58,8 +62,8 @@ export type Normalized = {
   readonly blocks: readonly Block[]
   /** Automatic formats cache every prefix; explicit formats only breakpoints. */
   readonly automatic: boolean
-  /** TTL applied to automatic entries. */
-  readonly automaticTTL: number
+  /** Prediction window for automatic entries, not a provider eviction time. */
+  readonly automaticRetention?: Retention
   readonly totalBytes: number
 }
 
@@ -263,8 +267,43 @@ function anthropic(body: Record<string, unknown>, request: Captured): Omit<Norma
     keyed: Object.fromEntries(Object.entries(seeds.fields).map(([key, value]) => [key, hash(stable(value))])),
     blocks,
     automatic: false,
-    automaticTTL: 0,
     totalBytes: total,
+  }
+}
+
+// https://developers.openai.com/api/docs/guides/prompt-caching#cache-lifetime
+// OpenAI's GPT-5.6+ minimum is 30m. Earlier models' 24h mode typically lasts
+// 30m, not a guaranteed 24h; in-memory mode typically lasts 5-10m. Its default
+// depends on the organisation's retention policy, which the wire cannot reveal.
+// Codex uses a separate backend: model-family defaults there remain estimates.
+function automaticRetention(body: Record<string, unknown>, request: Captured): Retention {
+  const fallback = { ttl: AUTOMATIC_DEFAULT_TTL, source: "undocumented provider fallback" }
+  const url = URL.parse(request.url)
+  const provider =
+    url?.origin === "https://api.openai.com" && /^\/v1\/(responses|chat\/completions)$/.test(url.pathname)
+      ? "OpenAI"
+      : url?.origin === "https://chatgpt.com" && url.pathname === "/backend-api/codex/responses"
+        ? "Codex"
+        : undefined
+  if (!provider) return fallback
+  const version = typeof body.model === "string" ? /^gpt-(\d+)(?:\.(\d+))?(?:-|$)/.exec(body.model) : null
+  const major = Number(version?.[1])
+  const minor = Number(version?.[2] ?? 0)
+  if (major > 5 || (major === 5 && minor >= 6))
+    return {
+      ttl: 30 * 60_000,
+      source: provider === "Codex" ? "Codex model-family estimate" : "OpenAI GPT-5.6+ minimum",
+    }
+  if (provider === "OpenAI" && isRecord(body.prompt_cache_options) && body.prompt_cache_options.ttl === "30m")
+    return { ttl: 30 * 60_000, source: "requested OpenAI 30m minimum" }
+  if ((major === 5 && minor === 5) || (provider === "OpenAI" && body.prompt_cache_retention === "24h"))
+    return {
+      ttl: 30 * 60_000,
+      source: provider === "Codex" ? "Codex model-family estimate" : "OpenAI extended retention estimate",
+    }
+  return {
+    ttl: AUTOMATIC_DEFAULT_TTL,
+    source: provider === "Codex" ? "undocumented Codex retention fallback" : "OpenAI in-memory estimate",
   }
 }
 
@@ -293,7 +332,10 @@ const CHAT_NON_KEYED = new Set([
   "metadata",
 ])
 
-function openaiChat(body: Record<string, unknown>): Omit<Normalized, "namespace" | "namespaceParts"> {
+function openaiChat(
+  body: Record<string, unknown>,
+  request: Captured,
+): Omit<Normalized, "namespace" | "namespaceParts"> {
   const skip = new Set([...CHAT_NON_KEYED, "messages", "tools"])
   const keyed = keyedFields(body, skip)
   const seed = hash(stable(keyed))
@@ -324,7 +366,7 @@ function openaiChat(body: Record<string, unknown>): Omit<Normalized, "namespace"
     keyed,
     blocks,
     automatic: true,
-    automaticTTL: body.prompt_cache_retention === "24h" ? 24 * 60 * 60_000 : AUTOMATIC_DEFAULT_TTL,
+    automaticRetention: automaticRetention(body, request),
     totalBytes: total,
   }
 }
@@ -343,7 +385,10 @@ const RESPONSES_NON_KEYED = new Set([
   "background",
 ])
 
-function openaiResponses(body: Record<string, unknown>): Omit<Normalized, "namespace" | "namespaceParts"> {
+function openaiResponses(
+  body: Record<string, unknown>,
+  request: Captured,
+): Omit<Normalized, "namespace" | "namespaceParts"> {
   const skip = new Set([...RESPONSES_NON_KEYED, "input", "tools", "instructions"])
   const keyed = keyedFields(body, skip)
   const seed = hash(stable(keyed))
@@ -386,7 +431,7 @@ function openaiResponses(body: Record<string, unknown>): Omit<Normalized, "names
     keyed,
     blocks,
     automatic: true,
-    automaticTTL: body.prompt_cache_retention === "24h" ? 24 * 60 * 60_000 : AUTOMATIC_DEFAULT_TTL,
+    automaticRetention: automaticRetention(body, request),
     totalBytes: total,
   }
 }
@@ -435,7 +480,6 @@ export function normalize(request: Captured): Normalized {
       keyed: {},
       blocks: [],
       automatic: false,
-      automaticTTL: 0,
       totalBytes: request.body?.length ?? 0,
     }
   }
@@ -443,8 +487,8 @@ export function normalize(request: Captured): Normalized {
     format === "anthropic"
       ? anthropic(body, request)
       : format === "openai-chat"
-        ? openaiChat(body)
-        : openaiResponses(body)
+        ? openaiChat(body, request)
+        : openaiResponses(body, request)
   return { ...shape, namespace, namespaceParts: parts }
 }
 
