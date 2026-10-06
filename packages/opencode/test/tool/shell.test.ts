@@ -1006,6 +1006,150 @@ describe("tool.shell permissions", () => {
   )
 })
 
+describe("tool.shell commands behind a prefix", () => {
+  // Stops at the shell permission request, so nothing is executed.
+  const asked = (command: string) =>
+    Effect.gen(function* () {
+      const err = new Error("stop after permission")
+      const requests: Array<Omit<PermissionV1.Request, "id" | "sessionID" | "tool">> = []
+      expect(
+        yield* fail(
+          { command },
+          {
+            ...ctx,
+            ask: (req: Omit<PermissionV1.Request, "id" | "sessionID" | "tool">) =>
+              Effect.sync(() => {
+                requests.push(req)
+                if (req.permission === "bash") throw err
+              }),
+          },
+        ),
+      ).toMatchObject({ message: err.message })
+      return {
+        bash: requests.find((r) => r.permission === "bash")!,
+        external: requests.find((r) => r.permission === "external_directory"),
+      }
+    })
+
+  const cases: Array<{ name: string; command: string; patterns: string[]; always?: string[] }> = [
+    {
+      name: "variable assignments",
+      command: "KUBECONFIG=x kubectl delete pod y",
+      patterns: ["KUBECONFIG=x kubectl delete pod y", "kubectl delete pod y"],
+      always: ["kubectl delete *"],
+    },
+    {
+      name: "env with options and assignments",
+      command: "env -u FOO A=1 kubectl delete pod y",
+      patterns: ["env -u FOO A=1 kubectl delete pod y", "kubectl delete pod y"],
+      always: ["env *", "kubectl delete *"],
+    },
+    { name: "env -S", command: "env -S 'kubectl delete pod x'", patterns: ["kubectl delete pod x"] },
+    { name: "a directory before the program", command: "/opt/bin/kubectl get pods", patterns: ["kubectl get pods"] },
+    { name: "a backslash before the program", command: "\\rm -r foo", patterns: ["rm -r foo"] },
+    { name: "command", command: "command rm d -r", patterns: ["rm d -r"] },
+    {
+      name: "timeout with its options and duration",
+      command: "timeout -s KILL 10 kubectl get pods",
+      patterns: ["kubectl get pods"],
+    },
+    { name: "nice", command: "nice -n 5 git push", patterns: ["git push"] },
+    {
+      name: "sudo with a value option ending a cluster",
+      command: "sudo -Eu root rm -rf build",
+      patterns: ["rm -rf build", "rm -r -f build"],
+    },
+    {
+      name: "xargs with value options",
+      command: "xargs -n 1 -I {} kubectl delete pod {}",
+      patterns: ["kubectl delete pod {}"],
+    },
+    { name: "nested runners", command: "sudo env A=1 nohup kubectl apply -f x", patterns: ["kubectl apply -f x"] },
+    {
+      name: "a shell's -c script",
+      command: `bash -lc "kubectl delete pod 'a b'"`,
+      patterns: ["kubectl delete pod 'a b'"],
+    },
+    { name: "eval", command: `eval "kubectl delete pod x"`, patterns: ["kubectl delete pod x"] },
+    { name: "watch", command: "watch -n 5 kubectl get pods", patterns: ["kubectl get pods"] },
+    { name: "watch -x", command: "watch -x kubectl get pods", patterns: ["kubectl get pods"] },
+    {
+      name: "find -exec",
+      command: "find . -name '*.log' -exec rm -f {} \\; -execdir kubectl delete pod {} +",
+      patterns: ["rm -f {}", "kubectl delete pod {}"],
+    },
+    {
+      name: "a script inside a runner",
+      command: `xargs sh -c 'env kubectl delete pod "$1"' _`,
+      patterns: [`kubectl delete pod "$1"`],
+    },
+    { name: "a program named at run time", command: "$cmd delete pod", patterns: ["$cmd delete pod"] },
+  ]
+
+  for (const item of cases) {
+    each(`checks the command behind ${item.name}`, () =>
+      Effect.gen(function* () {
+        const tmp = yield* tmpdirScoped()
+        yield* runIn(
+          tmp,
+          Effect.gen(function* () {
+            const req = (yield* asked(item.command)).bash
+            for (const pattern of item.patterns) expect(req.patterns).toContain(pattern)
+            for (const pattern of item.always ?? []) expect(req.always).toContain(pattern)
+          }),
+        )
+      }),
+    )
+  }
+
+  each("keeps the pattern of the command as written first", () =>
+    Effect.gen(function* () {
+      const tmp = yield* tmpdirScoped()
+      yield* runIn(
+        tmp,
+        Effect.gen(function* () {
+          const req = (yield* asked("env kubectl get pods 2>&1")).bash
+          expect(req.patterns[0]).toBe("env kubectl get pods 2>&1")
+          expect(req.always[0]).toBe("env *")
+        }),
+      )
+    }),
+  )
+
+  each("asks for external directories reached through a runner", () =>
+    Effect.gen(function* () {
+      const tmp = yield* tmpdirScoped()
+      const outside = yield* tmpdirScoped()
+      yield* runIn(
+        tmp,
+        Effect.gen(function* () {
+          const result = yield* asked(`sudo rm ${path.join(outside, "file")}`)
+          expect(result.external).toBeDefined()
+          expect(result.external!.patterns).toContain(glob(path.join(outside, "*")))
+        }),
+      )
+    }),
+  )
+
+  each("stops following scripts nested too deep", () =>
+    Effect.gen(function* () {
+      const tmp = yield* tmpdirScoped()
+      yield* runIn(
+        tmp,
+        Effect.gen(function* () {
+          const nest = (levels: number) =>
+            Array.from({ length: levels }).reduce<string>(
+              (acc) => `eval '${acc.replaceAll("'", `'\\''`)}'`,
+              "kubectl get pods",
+            )
+          expect((yield* asked(nest(2))).bash.patterns).toContain("kubectl get pods")
+          expect((yield* asked(nest(6))).bash.patterns).not.toContain("kubectl get pods")
+        }),
+      )
+    }),
+  )
+})
+
 describe("tool.shell abort", () => {
   it.live(
     "preserves output when aborted",

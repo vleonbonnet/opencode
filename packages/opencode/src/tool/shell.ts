@@ -64,10 +64,56 @@ const CMD_FILES = new Set([
 ])
 const FLAGS = new Set(["-destination", "-literalpath", "-path"])
 const SWITCHES = new Set(["-confirm", "-debug", "-force", "-nonewline", "-recurse", "-verbose", "-whatif"])
+// Commands that run the command given in their trailing words.  `values` lists
+// the options that consume the next word, so that word is not taken for the
+// command; `operands` counts the plain words that precede it (timeout's
+// duration).
+const RUNNERS: Record<string, { values: string[]; operands?: number }> = {
+  builtin: { values: [] },
+  busybox: { values: [] },
+  caffeinate: { values: ["-t", "-w"] },
+  command: { values: [] },
+  doas: { values: ["-C", "-u"] },
+  env: { values: ["-C", "-P", "-S", "-u", "--chdir", "--split-string", "--unset"] },
+  exec: { values: ["-a"] },
+  nice: { values: ["-n", "--adjustment"] },
+  nohup: { values: [] },
+  stdbuf: { values: ["-e", "-i", "-o", "--error", "--input", "--output"] },
+  sudo: {
+    values: [
+      ...["-C", "-D", "-R", "-T", "-U", "-g", "-h", "-p", "-r", "-t", "-u"],
+      ...["--chdir", "--chroot", "--close-from", "--command-timeout", "--group", "--host"],
+      ...["--other-user", "--prompt", "--role", "--type", "--user"],
+    ],
+  },
+  time: { values: ["-f", "-o", "--format", "--output"] },
+  timeout: { values: ["-k", "-s", "--kill-after", "--signal"], operands: 1 },
+  gtimeout: { values: ["-k", "-s", "--kill-after", "--signal"], operands: 1 },
+  watch: { values: ["-n", "-q", "--chgexit", "--equexit", "--interval", "--shell"] },
+  xargs: {
+    values: [
+      ...["-E", "-I", "-J", "-L", "-P", "-R", "-S", "-a", "-d", "-n", "-s"],
+      ...["--arg-file", "--delimiter", "--eof", "--max-args", "--max-chars", "--max-lines", "--max-procs"],
+      ...["--process-slot-var", "--replace"],
+    ],
+  },
+}
+// Shells that run a script string given with -c.
+const SHELLS = new Set(["ash", "bash", "dash", "fish", "ksh", "sh", "zsh"])
+const SHELL_VALUES = new Set(["-O", "+O", "-o", "+o", "--init-file", "--rcfile"])
+// A script string nested deeper than this is only checked as the text of the
+// command that carries it.
+const MAX_SCRIPT_DEPTH = 4
 
 type Part = {
   type: string
   text: string
+}
+
+// A command as it will run: the bare program name and its argument words.
+type View = {
+  name: string
+  args: Part[]
 }
 
 type Scan = {
@@ -122,6 +168,164 @@ function source(node: Node) {
 
 function commands(node: Node) {
   return node.descendantsOfType("command").filter((child): child is Node => Boolean(child))
+}
+
+// Every command a bash command node runs: the node itself, then whatever its
+// runners (`env`, `sudo`, `xargs`, …) and `find -exec` run in turn, together
+// with the script strings it hands to a shell's -c, to `eval`, to `env -S` or
+// to `watch`.  Each inner command has fewer words than the one running it, so
+// the walk ends.
+function unwrap(node: Node) {
+  const name = node.childForFieldName("name")
+  if (!name) return { views: [], scripts: [] }
+  const views: View[] = [
+    {
+      name: program(name.text),
+      args: node
+        .childrenForFieldName("argument")
+        .filter((item): item is Node => Boolean(item))
+        .map((item) => ({ type: item.type, text: item.text })),
+    },
+  ]
+  const scripts: string[] = []
+  for (let i = 0; i < views.length; i++) {
+    const next = inner(views[i])
+    views.push(...next.views)
+    scripts.push(...next.scripts)
+  }
+  return { views, scripts }
+}
+
+// The commands and script strings one command runs on behalf of its words.
+function inner(item: View): { views: View[]; scripts: string[] } {
+  if (item.name === "eval") {
+    return { views: [], scripts: item.args.length ? [item.args.map((arg) => literal(arg.text)).join(" ")] : [] }
+  }
+  if (item.name === "find") return { views: execs(item.args), scripts: [] }
+  if (SHELLS.has(item.name)) return { views: [], scripts: script(item.args) }
+  const runner = RUNNERS[item.name]
+  if (!runner) return { views: [], scripts: [] }
+
+  const scripts: string[] = []
+  const state = { operands: runner.operands ?? 0, exec: false, at: item.args.length }
+  for (let i = 0; i < item.args.length; i++) {
+    const word = literal(item.args[i].text)
+    if (word === "--") {
+      state.at = i + 1
+      break
+    }
+    if (item.name === "env" && /^[A-Za-z_][A-Za-z0-9_]*=/.test(word)) continue
+    if (word.startsWith("-") && word.length > 1) {
+      const opt = option(word, runner.values)
+      const value = opt.next ? literal(item.args[i + 1]?.text ?? "") : opt.value
+      if (opt.next) i++
+      if (item.name === "env" && (opt.flag === "-S" || opt.flag === "--split-string") && value) scripts.push(value)
+      if (item.name === "watch" && (word === "-x" || word === "--exec")) state.exec = true
+      continue
+    }
+    if (state.operands > 0) {
+      state.operands--
+      continue
+    }
+    state.at = i
+    break
+  }
+
+  const rest = item.args.slice(state.at)
+  if (!rest.length) return { views: [], scripts }
+  // Without -x, watch hands its words to `sh -c` as one script.
+  if (item.name === "watch" && !state.exec) {
+    return { views: [], scripts: [...scripts, rest.map((arg) => literal(arg.text)).join(" ")] }
+  }
+  return { views: [{ name: program(rest[0].text), args: rest.slice(1) }], scripts }
+}
+
+// How an option word takes its value, getopt style: a long option takes what
+// follows `=`, and in a short cluster the first option that wants a value takes
+// the rest of the cluster, or the next word when nothing is left of it.
+function option(word: string, values: string[]) {
+  if (word.startsWith("--")) {
+    const eq = word.indexOf("=")
+    if (eq >= 0) return { flag: word.slice(0, eq), value: word.slice(eq + 1), next: false }
+    return { flag: word, value: undefined, next: values.includes(word) }
+  }
+  const at = [...word.slice(1)].findIndex((char) => values.includes("-" + char))
+  if (at < 0) return { flag: undefined, value: undefined, next: false }
+  const rest = word.slice(at + 2)
+  return { flag: "-" + word[at + 1], value: rest || undefined, next: !rest }
+}
+
+// The commands find runs for -exec, -execdir, -ok and -okdir, each ending at a
+// `;` or `+` word.
+function execs(args: Part[]) {
+  const words = args.map((arg) => literal(arg.text))
+  const starts = words.flatMap((word, i) => (["-exec", "-execdir", "-ok", "-okdir"].includes(word) ? [i + 1] : []))
+  return starts.flatMap((start) => {
+    const end = words.findIndex((word, i) => i > start && (word === ";" || word === "+"))
+    const stop = end < 0 ? words.length : end
+    if (stop <= start) return []
+    return [{ name: program(args[start].text), args: args.slice(start + 1, stop) }]
+  })
+}
+
+// The script a shell runs with -c: its first operand after the options.
+function script(args: Part[]) {
+  const words = args.map((arg) => literal(arg.text))
+  const state = { command: false }
+  for (let i = 0; i < words.length; i++) {
+    const word = words[i]
+    if (word === "--") return state.command && i + 1 < words.length ? [words[i + 1]] : []
+    if (SHELL_VALUES.has(word)) {
+      i++
+      continue
+    }
+    if (/^[-+][A-Za-z]+$/.test(word)) {
+      if (word.startsWith("-") && word.includes("c")) state.command = true
+      continue
+    }
+    if (word.startsWith("--")) continue
+    return state.command ? [word] : []
+  }
+  return []
+}
+
+// The program a command word names, without its quoting or directory, so rules
+// written for `rm` also see `\rm`, `"rm"` and `/bin/rm`.  A name computed at
+// run time stays as written.
+function program(text: string) {
+  if (dynamic(text, false)) return text
+  return path.posix.basename(literal(text))
+}
+
+// The value of a shell word with its quoting removed: '…' verbatim, "…" with
+// its backslash escapes resolved, and a bare backslash escaping the next
+// character.
+function literal(text: string) {
+  return text.replace(
+    /'([^']*)'|"((?:[^"\\]|\\.)*)"|\\(.)/gs,
+    (_, single: string | undefined, double: string | undefined, escaped: string) => {
+      if (single !== undefined) return single
+      if (double !== undefined) return double.replace(/\\([$`"\\\n])/g, "$1")
+      return escaped
+    },
+  )
+}
+
+// The same command with its short option clusters split (`-rf` as `-r -f`), so
+// a rule can name one option whatever it is combined with.
+function split(item: View) {
+  const cluster = /^-[A-Za-z]{2,}$/
+  if (!item.args.some((arg) => cluster.test(arg.text))) return
+  return {
+    name: item.name,
+    args: item.args.flatMap((arg) =>
+      cluster.test(arg.text) ? [...arg.text.slice(1)].map((char) => ({ type: arg.type, text: "-" + char })) : [arg],
+    ),
+  }
+}
+
+function text(item: View) {
+  return [item.name, ...item.args.map((arg) => arg.text)].join(" ")
 }
 
 function unquote(text: string) {
@@ -389,24 +593,53 @@ export const ShellTool = Tool.define(
       }
       const shellKind = ShellID.toKind(Shell.name(shell))
 
-      for (const node of commands(root)) {
+      const files = Effect.fnUntraced(function* (command: Part[]) {
+        for (const arg of pathArgs(command, ps, shellKind === "cmd")) {
+          const resolved = yield* argPath(arg, cwd, ps, shell)
+          yield* Effect.logInfo("resolved path", { arg, resolved })
+          if (!resolved || containsPath(resolved, instance)) continue
+          const dir = (yield* fs.isDir(resolved)) ? resolved : path.dirname(resolved)
+          scan.dirs.add(dir)
+        }
+      })
+
+      // Script strings found on the way are parsed and their commands queued
+      // behind the rest; their trees live until the caller's scope closes.
+      const queue = commands(root).map((node) => ({ node, depth: 0 }))
+      for (let i = 0; i < queue.length; i++) {
+        const node = queue[i].node
         const command = parts(node)
         const tokens = command.map((item) => item.text)
         const cmd = ps || shellKind === "cmd" ? tokens[0]?.toLowerCase() : tokens[0]
 
-        if (cmd && (FILES.has(cmd) || (shellKind === "cmd" && CMD_FILES.has(cmd)))) {
-          for (const arg of pathArgs(command, ps, shellKind === "cmd")) {
-            const resolved = yield* argPath(arg, cwd, ps, shell)
-            yield* Effect.logInfo("resolved path", { arg, resolved })
-            if (!resolved || containsPath(resolved, instance)) continue
-            const dir = (yield* fs.isDir(resolved)) ? resolved : path.dirname(resolved)
-            scan.dirs.add(dir)
-          }
-        }
+        if (cmd && (FILES.has(cmd) || (shellKind === "cmd" && CMD_FILES.has(cmd)))) yield* files(command)
 
         if (tokens.length && (!cmd || !CWD.has(cmd))) {
           scan.patterns.add(source(node))
           scan.always.add(BashArity.prefix(tokens).join(" ") + " *")
+        }
+
+        if (ps || shellKind === "cmd") continue
+
+        // Rules match command text, so a command behind a runner, a variable
+        // assignment, a directory or quoting would be judged by that prefix
+        // alone.  Each command it runs is checked as well.  This only adds
+        // patterns: it can add a prompt or a denial, never lift one.
+        const found = unwrap(node)
+        for (const [index, item] of found.views.entries()) {
+          if (CWD.has(item.name)) continue
+          const words = [{ type: "word", text: item.name }, ...item.args]
+          if (FILES.has(item.name) && !(index === 0 && item.name === cmd)) yield* files(words)
+          scan.patterns.add(text(item))
+          scan.always.add(BashArity.prefix(words.map((word) => word.text)).join(" ") + " *")
+          const flat = split(item)
+          if (flat) scan.patterns.add(text(flat))
+        }
+
+        if (queue[i].depth >= MAX_SCRIPT_DEPTH) continue
+        for (const item of found.scripts) {
+          const tree = yield* Effect.acquireRelease(parse(item, false), (tree) => Effect.sync(() => tree.delete()))
+          queue.push(...commands(tree.rootNode).map((child) => ({ node: child, depth: queue[i].depth + 1 })))
         }
       }
 
