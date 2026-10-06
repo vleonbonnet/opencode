@@ -170,6 +170,18 @@ function commands(node: Node) {
   return node.descendantsOfType("command").filter((child): child is Node => Boolean(child))
 }
 
+// Statements that change the environment of the commands after them, which bash
+// parses apart from commands: `export`, `declare`, `local`, `readonly`,
+// `typeset`, `unset`, and `NAME=value` on its own.  An assignment prefixed to a
+// command is part of that command and is checked with it.
+function assignments(node: Node) {
+  const owners = ["command", "declaration_command", "variable_assignments"]
+  return node
+    .descendantsOfType(["declaration_command", "unset_command", "variable_assignments", "variable_assignment"])
+    .filter((child): child is Node => Boolean(child))
+    .filter((child) => child.type !== "variable_assignment" || !owners.includes(child.parent?.type ?? ""))
+}
+
 // Every command a bash command node runs: the node itself, then whatever its
 // runners (`env`, `sudo`, `xargs`, …) and `find -exec` run in turn, together
 // with the script strings it hands to a shell's -c, to `eval`, to `env -S` or
@@ -603,8 +615,24 @@ export const ShellTool = Tool.define(
         }
       })
 
+      // A statement that sets or clears a variable decides what the commands
+      // after it see (`export KUBECONFIG=…`), so its text is checked as well.
+      const declared = (node: Node) => {
+        if (ps || shellKind === "cmd") return
+        for (const item of assignments(node)) {
+          const statement = item.text.trim()
+          scan.patterns.add(statement)
+          scan.always.add(
+            item.type === "declaration_command" || item.type === "unset_command"
+              ? `${item.child(0)?.text} *`
+              : `${statement.split("=")[0]}=*`,
+          )
+        }
+      }
+
       // Script strings found on the way are parsed and their commands queued
       // behind the rest; their trees live until the caller's scope closes.
+      declared(root)
       const queue = commands(root).map((node) => ({ node, depth: 0 }))
       for (let i = 0; i < queue.length; i++) {
         const node = queue[i].node
@@ -639,6 +667,7 @@ export const ShellTool = Tool.define(
         if (queue[i].depth >= MAX_SCRIPT_DEPTH) continue
         for (const item of found.scripts) {
           const tree = yield* Effect.acquireRelease(parse(item, false), (tree) => Effect.sync(() => tree.delete()))
+          declared(tree.rootNode)
           queue.push(...commands(tree.rootNode).map((child) => ({ node: child, depth: queue[i].depth + 1 })))
         }
       }

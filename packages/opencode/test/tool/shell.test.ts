@@ -1084,6 +1084,35 @@ describe("tool.shell commands behind a prefix", () => {
       patterns: [`kubectl delete pod "$1"`],
     },
     { name: "a program named at run time", command: "$cmd delete pod", patterns: ["$cmd delete pod"] },
+    {
+      name: "an export before it",
+      command: "export KUBECONFIG=~/.kube/admin; kubectl get pods",
+      patterns: ["export KUBECONFIG=~/.kube/admin", "kubectl get pods"],
+      always: ["export *"],
+    },
+    {
+      name: "an assignment statement before it",
+      command: "KUBECONFIG=x; kubectl get pods",
+      patterns: ["KUBECONFIG=x"],
+      always: ["KUBECONFIG=*"],
+    },
+    { name: "assignments grouped before it", command: "A=1 B=2; ls", patterns: ["A=1 B=2"] },
+    {
+      name: "an unset before it",
+      command: "unset KUBECONFIG; ls",
+      patterns: ["unset KUBECONFIG"],
+      always: ["unset *"],
+    },
+    {
+      name: "a declaration inside a script",
+      command: `bash -c 'declare -x KUBECONFIG=x; kubectl get pods'`,
+      patterns: ["declare -x KUBECONFIG=x"],
+    },
+    {
+      name: "a declaration in a compound statement",
+      command: "if true; then local K=x; fi",
+      patterns: ["local K=x"],
+    },
   ]
 
   for (const item of cases) {
@@ -1111,6 +1140,19 @@ describe("tool.shell commands behind a prefix", () => {
           const req = (yield* asked("env kubectl get pods 2>&1")).bash
           expect(req.patterns[0]).toBe("env kubectl get pods 2>&1")
           expect(req.always[0]).toBe("env *")
+        }),
+      )
+    }),
+  )
+
+  each("checks an assignment prefixed to a command only with that command", () =>
+    Effect.gen(function* () {
+      const tmp = yield* tmpdirScoped()
+      yield* runIn(
+        tmp,
+        Effect.gen(function* () {
+          const req = (yield* asked("FOO=1 ls")).bash
+          expect(req.patterns).toEqual(["FOO=1 ls", "ls"])
         }),
       )
     }),
