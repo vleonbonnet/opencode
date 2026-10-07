@@ -227,6 +227,13 @@ export interface Hooks {
     [key: string]: ToolDefinition
   }
   auth?: AuthHook
+  /**
+   * Credentials keyed by provider ID, held in memory for the lifetime of the
+   * plugin.  Unlike `/connect`, they are never written to auth.json and, unlike
+   * environment variables, never reach child processes.  They take precedence
+   * over stored credentials.  Called once, after every plugin's `config` hook.
+   */
+  "auth.credentials"?: () => Promise<Record<string, Auth>>
   provider?: ProviderHook
   /**
    * Called when a new message is received

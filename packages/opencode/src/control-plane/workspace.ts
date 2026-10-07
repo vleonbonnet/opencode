@@ -527,7 +527,8 @@ const layer = Layer.effect(
         .pipe(Effect.orDie)
 
       const env = {
-        OPENCODE_AUTH_CONTENT: JSON.stringify(yield* auth.all()),
+        // Runtime credentials stay in this process; the workspace's own plugins provide theirs.
+        OPENCODE_AUTH_CONTENT: JSON.stringify(yield* auth.stored()),
         OPENCODE_WORKSPACE_ID: config.id,
         OPENCODE_EXPERIMENTAL_WORKSPACES: "true",
         OTEL_EXPORTER_OTLP_HEADERS: process.env.OTEL_EXPORTER_OTLP_HEADERS,

@@ -22,7 +22,8 @@ import { DigitalOceanAuthPlugin } from "./digitalocean"
 import { XaiAuthPlugin } from "./xai"
 import { CerebrasPlugin } from "./cerebras"
 import { SnowflakeCortexAuthPlugin } from "./snowflake-cortex"
-import { Effect, Layer, Context } from "effect"
+import { Effect, Layer, Context, Schema } from "effect"
+import { Auth } from "@/auth"
 import { EffectBridge } from "@/effect/bridge"
 import { InstanceState } from "@/effect/instance-state"
 import { errorMessage } from "@/util/error"
@@ -130,6 +131,8 @@ const layer = Layer.effect(
     const events = yield* EventV2Bridge.Service
     const config = yield* Config.Service
     const flags = yield* RuntimeFlags.Service
+    const auth = yield* Auth.Service
+    const decodeAuth = Schema.decodeUnknownOption(Auth.Info)
 
     const state = yield* InstanceState.make<State>(
       Effect.fn("Plugin.state")(function* (ctx) {
@@ -252,6 +255,30 @@ const layer = Layer.effect(
           )
         }
 
+        // Collect in-memory credentials once every plugin has seen the config.
+        const credentials: Record<string, Auth.Info> = {}
+        for (const hook of hooks) {
+          const provide = hook["auth.credentials"]
+          if (!provide) continue
+          const result = yield* Effect.tryPromise({
+            try: () => provide(),
+            catch: errorMessage,
+          }).pipe(
+            Effect.tapError((error) => Effect.logError("plugin auth.credentials hook failed", { error })),
+            Effect.option,
+          )
+          if (result._tag === "None" || !result.value || typeof result.value !== "object") continue
+          for (const [providerID, info] of Object.entries(result.value)) {
+            const decoded = decodeAuth(info)
+            if (decoded._tag === "Some") credentials[providerID] = decoded.value
+            else yield* Effect.logWarning("ignoring invalid plugin credential", { providerID })
+          }
+        }
+        if (Object.keys(credentials).length) {
+          const withdraw = yield* auth.register(credentials)
+          yield* Effect.addFinalizer(() => withdraw)
+        }
+
         const unsubscribe = yield* events.listen((event) => {
           if (event.location?.directory !== ctx.directory) return Effect.void
           return Effect.sync(() => {
@@ -312,7 +339,7 @@ const layer = Layer.effect(
 export const node = LayerNode.make({
   service: Service,
   layer: layer,
-  deps: [EventV2Bridge.node, Config.node, RuntimeFlags.node],
+  deps: [EventV2Bridge.node, Config.node, RuntimeFlags.node, Auth.node],
 })
 
 export * as Plugin from "."

@@ -275,6 +275,25 @@ export const InjectEnvPlugin = async () => {
 
 ---
 
+### Provide credentials without storing them
+
+Supply provider credentials from a secret store. They are held in memory for the plugin's lifetime: unlike `/connect`, they are never written to `auth.json`, and unlike environment variables, they never reach shell commands, MCP servers or LSPs. They take precedence over stored credentials, and the hook runs once, after every plugin's `config` hook.
+
+```ts title=".opencode/plugins/keys-from-pass.ts"
+import type { Plugin } from "@opencode-ai/plugin"
+
+export const KeysFromPass: Plugin = async ({ $ }) => {
+  return {
+    "auth.credentials": async () => {
+      const key = (await $`pass show example/api`.text()).split("\n", 1)[0].trim()
+      return { anthropic: { type: "api", key } }
+    },
+  }
+}
+```
+
+---
+
 ### Custom tools
 
 Plugins can also add custom tools to opencode:

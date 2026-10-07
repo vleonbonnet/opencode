@@ -1,6 +1,8 @@
 import { describe, expect } from "bun:test"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { Effect } from "effect"
+import path from "path"
+import { Global } from "@opencode-ai/core/global"
 import { Auth } from "../../src/auth"
 import { testEffect } from "../lib/effect"
 
@@ -70,6 +72,48 @@ describe("Auth", () => {
       yield* auth.remove("anthropic")
       const after = yield* auth.all()
       expect(after["anthropic"]).toBeUndefined()
+    }),
+  )
+
+  it.instance("runtime credentials overlay stored ones and are never persisted", () =>
+    Effect.gen(function* () {
+      const auth = yield* Auth.Service
+      yield* auth.set("stored-only", { type: "api", key: "disk" })
+      yield* auth.set("shadowed", { type: "api", key: "disk" })
+      const withdraw = yield* auth.register({
+        "runtime-only": { type: "api", key: "memory" },
+        shadowed: { type: "api", key: "memory" },
+      })
+      expect(yield* auth.get("runtime-only")).toEqual({ type: "api", key: "memory" })
+      expect(yield* auth.get("shadowed")).toEqual({ type: "api", key: "memory" })
+      expect(yield* auth.get("stored-only")).toEqual({ type: "api", key: "disk" })
+      // A write after registration must not flush runtime entries to disk.
+      yield* auth.set("another", { type: "api", key: "disk" })
+      yield* auth.remove("stored-only")
+      const stored = yield* auth.stored()
+      expect(stored["runtime-only"]).toBeUndefined()
+      expect(stored["shadowed"]).toEqual({ type: "api", key: "disk" })
+      const file = yield* Effect.promise(() => Bun.file(path.join(Global.Path.data, "auth.json")).text())
+      expect(file).not.toContain("memory")
+      yield* withdraw
+      expect(yield* auth.get("runtime-only")).toBeUndefined()
+      expect(yield* auth.get("shadowed")).toEqual({ type: "api", key: "disk" })
+      yield* auth.remove("shadowed")
+      yield* auth.remove("another")
+    }),
+  )
+
+  it.instance("withdrawing one registration keeps the others", () =>
+    Effect.gen(function* () {
+      const auth = yield* Auth.Service
+      const first = yield* auth.register({ shared: { type: "api", key: "first" }, a: { type: "api", key: "a" } })
+      const second = yield* auth.register({ shared: { type: "api", key: "second" } })
+      expect(yield* auth.get("shared")).toEqual({ type: "api", key: "second" })
+      yield* second
+      expect(yield* auth.get("shared")).toEqual({ type: "api", key: "first" })
+      yield* first
+      expect(yield* auth.get("shared")).toBeUndefined()
+      expect(yield* auth.get("a")).toBeUndefined()
     }),
   )
 })

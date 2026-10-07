@@ -346,6 +346,7 @@ Hook surface (mutate `output` in place; return `void`):
 
 - `event(input)`: every bus event
 - `config(cfg)`: once on init with the merged config
+- `auth.credentials()`: returns `{ [providerID]: Auth }` held in memory only, never written to auth.json or exported to child processes
 - `chat.message`, `chat.params`, `chat.headers`
 - `tool.execute.before`, `tool.execute.after`
 - `tool.definition`
