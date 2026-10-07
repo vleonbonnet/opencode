@@ -264,11 +264,12 @@ function lookup(normalized: CacheModel.Normalized, now: number) {
   const consider = (index: number) => {
     const saved = map.get(normalized.blocks[index].prefix)
     if (!saved) return
-    // Older ledgers used 5m for every automatic host (or a guaranteed 24h).
-    // Reinterpret their window without resetting when the prefix was used.
+    // Older ledgers used 5m for every automatic host (or a guaranteed 24h),
+    // and a window's policy can change since it was recorded. Reinterpret it
+    // under the current policy without resetting when the prefix was used.
     const retention = normalized.automaticRetention
     const entry =
-      retention && !saved.retentionSource
+      retention && saved.retentionSource !== retention.source
         ? {
             ...saved,
             ttl: retention.ttl,

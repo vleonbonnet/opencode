@@ -276,6 +276,18 @@ function anthropic(body: Record<string, unknown>, request: Captured): Omit<Norma
 // 30m, not a guaranteed 24h; in-memory mode typically lasts 5-10m. Its default
 // depends on the organisation's retention policy, which the wire cannot reveal.
 // Codex uses a separate backend: model-family defaults there remain estimates.
+//
+// GitHub Copilot serves GPT models from OpenAI and its own Azure OpenAI
+// deployments (docs.github.com/en/copilot/reference/ai-models/model-hosting)
+// and documents no window of its own beyond a tutorial's "24 hours", which
+// measurements contradict. Both backends guarantee GPT-5.6+ prefixes for 30m
+// and default GPT-5.5 to extended retention; Copilot runs under a zero data
+// retention agreement, so earlier models default to in-memory. Measured on
+// api.githubcopilot.com (gpt-6-astra, gpt-6-sol): full prefix reads after up
+// to 25m idle, misses from about 27-30m on.
+const COPILOT_HOST =
+  /^(?:api(?:\.(?:individual|business|enterprise))?\.githubcopilot\.com|copilot-api\.[a-z0-9-]+(?:\.[a-z0-9-]+)+)$/
+
 function automaticRetention(body: Record<string, unknown>, request: Captured): Retention {
   const fallback = { ttl: AUTOMATIC_DEFAULT_TTL, source: "undocumented provider fallback" }
   const url = URL.parse(request.url)
@@ -284,9 +296,26 @@ function automaticRetention(body: Record<string, unknown>, request: Captured): R
       ? "OpenAI"
       : url?.origin === "https://chatgpt.com" && url.pathname === "/backend-api/codex/responses"
         ? "Codex"
-        : undefined
+        : url?.protocol === "https:" &&
+            !url.port &&
+            !url.username &&
+            !url.password &&
+            COPILOT_HOST.test(url.hostname) &&
+            /^\/(responses|chat\/completions)$/.test(url.pathname)
+          ? "Copilot"
+          : undefined
   if (!provider) return fallback
   const version = typeof body.model === "string" ? /^gpt-(\d+)(?:\.(\d+))?(?:-|$)/.exec(body.model) : null
+  if (provider === "Copilot") {
+    // Copilot also proxies non-OpenAI models over these endpoints.
+    if (!version) return fallback
+    const major = Number(version[1])
+    const minor = Number(version[2] ?? 0)
+    if (major > 5 || (major === 5 && minor >= 6))
+      return { ttl: 30 * 60_000, source: "Copilot GPT-5.6+, OpenAI/Azure 30m minimum" }
+    if (major === 5 && minor === 5) return { ttl: 30 * 60_000, source: "Copilot GPT-5.5 extended retention estimate" }
+    return { ttl: AUTOMATIC_DEFAULT_TTL, source: "Copilot in-memory estimate" }
+  }
   const major = Number(version?.[1])
   const minor = Number(version?.[2] ?? 0)
   if (major > 5 || (major === 5 && minor >= 6))

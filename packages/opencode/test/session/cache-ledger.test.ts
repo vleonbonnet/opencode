@@ -14,6 +14,7 @@ const ANTHROPIC = "https://api.anthropic.com/v1/messages"
 const FIREWORKS = "https://api.fireworks.ai/inference/v1/chat/completions"
 const OPENAI = "https://api.openai.com/v1/responses"
 const CODEX = "https://chatgpt.com/backend-api/codex/responses"
+const COPILOT = "https://api.githubcopilot.com/responses"
 const CC = { type: "ephemeral", ttl: "1h" }
 
 type Body = Record<string, any>
@@ -421,6 +422,16 @@ describe("CacheLedger automatic retention", () => {
     { url: CODEX, model: "gpt-5.5" },
     { url: OPENAI, model: "gpt-5.4", extra: { prompt_cache_retention: "24h" } },
     { url: OPENAI, model: "future-model", extra: { prompt_cache_options: { ttl: "30m" } } },
+    { url: COPILOT, model: "gpt-6-astra" },
+    { url: COPILOT, model: "gpt-5.6-sol" },
+    { url: COPILOT, model: "gpt-5.5" },
+    {
+      url: "https://api.githubcopilot.com/chat/completions",
+      model: "gpt-6-sol",
+      extra: { messages: [{ role: "user", content: "hello " + "x".repeat(4000) }] },
+    },
+    { url: "https://api.business.githubcopilot.com/responses", model: "gpt-6.1-sol" },
+    { url: "https://copilot-api.acme.ghe.com/responses", model: "gpt-6-luna" },
   ])("$url $model reuses a prefix after 29m and is uncertain after 30m", async ({ url, model, extra }) => {
     const start = Date.now()
     const captured = request(url, body(model, extra))
@@ -438,6 +449,7 @@ describe("CacheLedger automatic retention", () => {
       expect(aged.lostTokens).toBe(117_344)
       expect(aged.reasons[0]).toStartWith("cache may have expired: idle ~31m, retention window 30m")
       if (url === CODEX) expect(aged.reasons[0]).toContain("Codex model-family estimate")
+      if (url.includes("copilot")) expect(aged.reasons[0]).toContain("(Copilot GPT-5.")
       // An uncertain prediction must not prevent real cache hits refreshing it.
       await wire(sessionID, captured)
       CacheLedger.observe(sessionID, { input: 96, read: 117_248, write: 0 })
@@ -455,7 +467,13 @@ describe("CacheLedger automatic retention", () => {
     { url: OPENAI, model: "unknown-model", extra: { prompt_cache_options: { ttl: "1h" } } },
     { url: CODEX, model: "gpt-5.4", extra: { prompt_cache_retention: "24h" } },
     { url: FIREWORKS, model: "gpt-6-astra", extra: { messages: [{ role: "user", content: "hello" }] } },
-    { url: "https://api.githubcopilot.com/responses", model: "gpt-6-astra", extra: {} },
+    { url: COPILOT, model: "gpt-5.4", extra: { prompt_cache_retention: "24h" } },
+    { url: COPILOT, model: "gemini-3-pro", extra: {} },
+    { url: "https://api.githubcopilot.com/v1/responses", model: "gpt-6-astra", extra: {} },
+    { url: "https://api.githubcopilot.com.example/responses", model: "gpt-6-astra", extra: {} },
+    { url: "https://evil.example/api.githubcopilot.com/responses", model: "gpt-6-astra", extra: {} },
+    { url: "https://api.githubcopilot.com:8443/responses", model: "gpt-6-astra", extra: {} },
+    { url: "http://api.githubcopilot.com/responses", model: "gpt-6-astra", extra: {} },
     { url: "https://api.openai.com.example/v1/responses", model: "gpt-6-astra", extra: {} },
     { url: "https://gateway.example/v1/responses", model: "gpt-6-astra", extra: { prompt_cache_retention: "24h" } },
     {
@@ -498,43 +516,66 @@ describe("CacheLedger automatic retention", () => {
   test.each([
     { url: CODEX, model: "gpt-6-astra", ttl: 5 * 60_000, extra: {} },
     { url: OPENAI, model: "gpt-5.4", ttl: 24 * 60 * 60_000, extra: { prompt_cache_retention: "24h" } },
-  ])("old $ttl ms ledger entries adopt the policy without refreshing their age", async ({ url, model, ttl, extra }) => {
-    await using tmp = await tmpdir()
-    const file = path.join(tmp.path, "cache-ledger.json")
-    const start = Date.now()
-    const captured = request(url, body(model, extra))
-    const normalized = CacheModel.normalize(captured)
-    // Legacy ledger fixture: entries have a timestamp and TTL, but no policy source.
-    await fs.writeFile(
-      file,
-      JSON.stringify({
-        entries: {
-          [normalized.namespace]: {
-            [normalized.blocks.at(-1)!.prefix]: { tokens: 117_344, exact: true, expires: start + ttl, ttl },
+    { url: COPILOT, model: "gpt-6-astra", ttl: 5 * 60_000, extra: {}, source: "undocumented provider fallback" },
+  ])(
+    "old $ttl ms ledger entries adopt the policy without refreshing their age",
+    async ({
+      url,
+      model,
+      ttl,
+      extra,
+      source,
+    }: {
+      url: string
+      model: string
+      ttl: number
+      extra: Body
+      source?: string
+    }) => {
+      await using tmp = await tmpdir()
+      const file = path.join(tmp.path, "cache-ledger.json")
+      const start = Date.now()
+      const captured = request(url, body(model, extra))
+      const normalized = CacheModel.normalize(captured)
+      // Legacy ledger fixture: entries have a timestamp and TTL, but no policy
+      // source, or the source of a policy that has since changed.
+      await fs.writeFile(
+        file,
+        JSON.stringify({
+          entries: {
+            [normalized.namespace]: {
+              [normalized.blocks.at(-1)!.prefix]: {
+                tokens: 117_344,
+                exact: true,
+                expires: start + ttl,
+                ttl,
+                ...(source ? { retentionSource: source } : {}),
+              },
+            },
           },
-        },
-        sessions: {
-          [sessionID]: {
-            last: { ...normalized, time: start, prompt: 117_344, usage: { input: 96, read: 117_248, write: 0 } },
-            verifications: [],
-            thinking: {},
+          sessions: {
+            [sessionID]: {
+              last: { ...normalized, time: start, prompt: 117_344, usage: { input: 96, read: 117_248, write: 0 } },
+              verifications: [],
+              thinking: {},
+            },
           },
-        },
-      }),
-    )
-    try {
-      setSystemTime(start + 29 * 60_000)
-      CacheLedger.configure({ file })
-      expect(CacheLedger.predict(sessionID, captured).status).toBe("hit")
-      setSystemTime(start + 31 * 60_000)
-      const aged = CacheLedger.predict(sessionID, captured)
-      expect(aged.status).toBe("unknown")
-      expect(aged.reasons[0]).toStartWith("cache may have expired: idle ~31m, retention window 30m")
-    } finally {
-      CacheLedger.configure({})
-      setSystemTime()
-    }
-  })
+        }),
+      )
+      try {
+        setSystemTime(start + 29 * 60_000)
+        CacheLedger.configure({ file })
+        expect(CacheLedger.predict(sessionID, captured).status).toBe("hit")
+        setSystemTime(start + 31 * 60_000)
+        const aged = CacheLedger.predict(sessionID, captured)
+        expect(aged.status).toBe("unknown")
+        expect(aged.reasons[0]).toStartWith("cache may have expired: idle ~31m, retention window 30m")
+      } finally {
+        CacheLedger.configure({})
+        setSystemTime()
+      }
+    },
+  )
 })
 
 describe("CacheLedger thinking binding", () => {
