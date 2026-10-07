@@ -349,10 +349,11 @@ Hook surface (mutate `output` in place; return `void`):
 - `auth.credentials()`: returns `{ [providerID]: Auth }` held in memory only, never written to auth.json or exported to child processes
 - `chat.message`, `chat.params`, `chat.headers`
 - `tool.execute.before`, `tool.execute.after`
+- `tool.permission(input, output)`: push `{ permission, patterns, always?, metadata? }` to `output.checks` to add permission checks decided from the call's arguments; each is evaluated against the calling agent's rules (`input.agent`), and can only make a call stricter
 - `tool.definition`
 - `command.execute.before`
 - `shell.env`
-- `permission.ask`
+- `permission.ask` (declared, but never called)
 - `experimental.chat.messages.transform`, `experimental.chat.system.transform`,
   `experimental.session.compacting`, `experimental.compaction.autocontinue`,
   `experimental.text.complete`

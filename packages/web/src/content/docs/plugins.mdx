@@ -200,6 +200,7 @@ Plugins can subscribe to events as seen below in the Examples section. Here is a
 
 - `tool.execute.after`
 - `tool.execute.before`
+- `tool.permission`
 
 #### TUI Events
 
@@ -255,6 +256,32 @@ export const EnvProtection = async ({ project, client, $, directory, worktree })
   }
 }
 ```
+
+---
+
+### Permission checks from tool arguments
+
+Make writes through an MCP server's file tools follow your `edit` rules. `tool.permission` adds checks to a tool call, evaluated against the calling agent's rules like the built-in ones: a rule that denies refuses the call, a rule that asks prompts for it. The tool keeps its own checks, so a plugin can only make a call stricter.
+
+```javascript title=".opencode/plugins/mcp-edit.js"
+import path from "node:path"
+
+export const McpEdit = async ({ worktree }) => {
+  return {
+    "tool.permission": async (input, output) => {
+      if (!input.tool.startsWith("files_write") || typeof input.args.path !== "string") return
+      const filepath = path.resolve(worktree, input.args.path)
+      output.checks.push({
+        permission: "edit",
+        patterns: [path.relative(worktree, filepath)],
+        metadata: { filepath },
+      })
+    },
+  }
+}
+```
+
+The hook receives the tool, the calling agent's name, the session and call IDs, and the arguments. Patterns follow the built-in tools' convention, paths relative to the worktree, so `"edit": { "*AGENTS.md": "ask" }` now also covers `files_write`.
 
 ---
 

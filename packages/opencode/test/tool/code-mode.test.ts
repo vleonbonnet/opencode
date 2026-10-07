@@ -371,6 +371,30 @@ describe("code mode execute", () => {
     expect(asked.map((req: any) => req.permission)).toEqual(["a_tool", "b_tool"])
   })
 
+  test("a child call's tool.permission checks run through ask after the tool's own", async () => {
+    const asked: { permission: string; patterns: readonly string[] }[] = []
+    const permissionCtx: Tool.Context = {
+      ...ctx,
+      ask: (req) => Effect.sync(() => void asked.push({ permission: req.permission, patterns: req.patterns })),
+    }
+    const trigger = ((name: unknown, input: any, output: any) =>
+      Effect.sync(() => {
+        if (name === "tool.permission") output.checks.push({ permission: "edit", patterns: [input.args.path] })
+        return output
+      })) as Plugin.Interface["trigger"]
+    const ok = () => ({ content: [{ type: "text", text: "ok" }] })
+    const tool = await build({ a_tool: mcpTool("a", ok) }, undefined, undefined, trigger)
+
+    await Effect.runPromise(
+      tool.execute({ code: "await tools.a.tool({ path: 'AGENTS.md' }); return 'done'" }, permissionCtx),
+    )
+
+    expect(asked).toEqual([
+      { permission: "a_tool", patterns: ["*"] },
+      { permission: "edit", patterns: ["AGENTS.md"] },
+    ])
+  })
+
   test("a denied permission fails the child call with a catchable message, not the whole execute", async () => {
     const denyCtx: Tool.Context = { ...ctx, ask: () => Effect.die(new Error("permission denied by user")) }
     const called: string[] = []
@@ -415,11 +439,20 @@ describe("code mode execute", () => {
     expect(out.output).toBe("done")
     expect(events.map((e) => [e.name, e.input.tool, e.input.callID])).toEqual([
       ["tool.execute.before", "a_tool", "call_code_mode/1"],
+      ["tool.permission", "a_tool", "call_code_mode/1"],
       ["tool.execute.after", "a_tool", "call_code_mode/1"],
       ["tool.execute.before", "b_tool", "call_code_mode/2"],
+      ["tool.permission", "b_tool", "call_code_mode/2"],
       ["tool.execute.after", "b_tool", "call_code_mode/2"],
     ])
-    const [before, after] = events
+    const [before, permission, after] = events
+    expect(permission!.input).toEqual({
+      tool: "a_tool",
+      agent: "build",
+      sessionID: ctx.sessionID,
+      callID: "call_code_mode/1",
+      args: { x: 1 },
+    })
     expect(before!.input.sessionID).toBe(ctx.sessionID)
     expect(before!.output).toEqual({ args: { x: 1 } })
     expect(after!.input.args).toEqual({ x: 1 })

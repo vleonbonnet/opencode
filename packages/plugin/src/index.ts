@@ -219,6 +219,18 @@ export type ProviderHook = {
 /** @deprecated Use AuthOAuthResult instead. */
 export type AuthOuathResult = AuthOAuthResult
 
+/** One permission check a `tool.permission` hook adds to a tool call. */
+export type ToolPermissionCheck = {
+  /** Permission key the rules are matched on, e.g. `edit` or a custom key. */
+  permission: string
+  /** Patterns matched against the rules; at least one. */
+  patterns: string[]
+  /** Patterns an "always" reply approves for the rest of the session; defaults to `patterns`. */
+  always?: string[]
+  /** Shown with the prompt; `edit` checks should carry `filepath`. */
+  metadata?: Record<string, unknown>
+}
+
 export interface Hooks {
   dispose?: () => Promise<void>
   event?: (input: { event: Event }) => Promise<void>
@@ -273,6 +285,25 @@ export interface Hooks {
   "tool.execute.before"?: (
     input: { tool: string; sessionID: string; callID: string },
     output: { args: any },
+  ) => Promise<void>
+  /**
+   * Add permission checks to a tool call, decided from its arguments.  Runs
+   * after `tool.execute.before`, so it sees the arguments the tool will
+   * receive.  Each check pushed to `output.checks` is evaluated against the
+   * calling agent's permission rules like any built-in check: a rule that
+   * denies refuses the call, a rule that asks prompts for it.  The tool's own
+   * checks still run, so a plugin can only make a call stricter, never lift a
+   * check.  A malformed check refuses the call.
+   *
+   * For example, a plugin that knows an MCP server's file tools can describe
+   * a write as `{ permission: "edit", patterns: ["src/index.ts"],
+   * metadata: { filepath: "/abs/src/index.ts" } }`, so the `edit` rules apply to
+   * it as they do to the built-in edit tool.  `patterns` follow the built-in
+   * tools' convention: paths relative to the worktree.
+   */
+  "tool.permission"?: (
+    input: { tool: string; agent: string; sessionID: string; callID: string; args: any },
+    output: { checks: ToolPermissionCheck[] },
   ) => Promise<void>
   "shell.env"?: (
     input: { cwd: string; sessionID?: string; callID?: string },
