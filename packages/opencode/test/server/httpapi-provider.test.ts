@@ -379,6 +379,30 @@ describe("provider HttpApi", () => {
   )
 
   it.instance(
+    "keeps resolved provider credentials out of provider lists",
+    Effect.gen(function* () {
+      const directory = (yield* TestInstance).directory
+      const secret = "sk-ant-never-served"
+      yield* setEnvScoped("OPENCODE_AUTH_CONTENT", JSON.stringify({ anthropic: { type: "api", key: secret } }))
+      const headers = { "x-opencode-directory": directory }
+      const providerResponse = yield* request("/provider", { headers })
+      const configResponse = yield* request("/config/providers", { headers })
+
+      expect(providerResponse.status).toBe(200)
+      expect(configResponse.status).toBe(200)
+
+      const providerBody = yield* providerResponse.text
+      const configBody = yield* configResponse.text
+      expect(providerByID(JSON.parse(providerBody), "all", "anthropic")).toBeDefined()
+      expect(JSON.parse(providerBody).connected).toContain("anthropic")
+      expect(providerByID(JSON.parse(configBody), "providers", "anthropic")).toBeDefined()
+      expect(providerBody).not.toContain(secret)
+      expect(configBody).not.toContain(secret)
+    }),
+    projectOptions,
+  )
+
+  it.instance(
     "keeps provider.models hook input mutations out of provider state",
     Effect.gen(function* () {
       const directory = (yield* TestInstance).directory

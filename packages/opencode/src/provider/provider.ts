@@ -1185,6 +1185,12 @@ export function toPublicInfo(provider: Info): Info {
   )
 }
 
+/** Provider info for HTTP clients: the resolved credential stays in the server. */
+export function toClientInfo(provider: Info): Info {
+  const { key: _key, ...info } = toPublicInfo(provider)
+  return info
+}
+
 export function defaultModelIDs<T extends { models: Record<string, { id: string }> }>(providers: Record<string, T>) {
   return mapValues(providers, (item) => sort(Object.values(item.models))[0].id)
 }
