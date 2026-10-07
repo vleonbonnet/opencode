@@ -1238,6 +1238,7 @@ describe("tool.shell abort", () => {
           })
           expect(result.output).toContain("shell tool terminated command after exceeding timeout")
           expect(result.output).toContain("retry with a larger timeout value in milliseconds")
+          expect(result.output).toContain("do not retry with a longer sleep: poll a command that reports completion")
         }),
       ),
     15_000,

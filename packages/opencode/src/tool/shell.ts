@@ -823,7 +823,7 @@ export const ShellTool = Tool.define(
       const meta: string[] = []
       if (expired) {
         meta.push(
-          `shell tool terminated command after exceeding timeout ${input.timeout} ms. If this command is expected to take longer and is not waiting for interactive input, retry with a larger timeout value in milliseconds.`,
+          `shell tool terminated command after exceeding timeout ${input.timeout} ms. If this command is expected to take longer and is not waiting for interactive input, retry with a larger timeout value in milliseconds. If it was waiting for something else to finish, such as a build, deploy or job, do not retry with a longer sleep: poll a command that reports completion, in a loop that exits as soon as it succeeds and gives up after a deadline.`,
         )
       }
       if (aborted) meta.push("User aborted the command")
