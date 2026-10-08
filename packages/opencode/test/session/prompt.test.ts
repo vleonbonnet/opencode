@@ -59,6 +59,7 @@ import { awaitWithTimeout, pollWithTimeout, testEffect } from "../lib/effect"
 import { anthropicReply, reply, TestLLMServer } from "../lib/llm-server"
 import { Wire } from "../../src/session/cache/wire"
 import { CacheLedger } from "../../src/session/cache/ledger"
+import { SystemBaseline } from "../../src/session/system-baseline"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
@@ -903,6 +904,224 @@ it.instance("mode reminders stay on the user message they were sent with", () =>
       message.parts.filter((part) => part.type === "text" && part.synthetic && part.text.includes("system-reminder")),
     )
     expect(reminders).toHaveLength(3)
+  }),
+)
+
+// Frozen system prompt sections
+
+const systemOf = (messages: Record<string, any>[]) => messages.find((message) => message.role === "system")
+const userWith = (messages: Record<string, any>[], text: string) =>
+  messages.find((message) => message.role === "user" && JSON.stringify(message.content).includes(text))
+const mentions = (value: unknown, text: string) => JSON.stringify(value ?? "").includes(text)
+const UPDATED = "replaces the earlier version"
+
+const storedUpdates = (sessionID: SessionID) =>
+  Effect.gen(function* () {
+    const sessions = yield* Session.Service
+    return (yield* sessions.messages({ sessionID })).flatMap((message) =>
+      message.parts.flatMap((part) => {
+        const update = SystemBaseline.updateOf(part)
+        return update ? [{ messageID: message.info.id, update }] : []
+      }),
+    )
+  })
+
+const frozenSetup = Effect.fn("test.frozenSetup")(function* (extra: Partial<ConfigV1.Info> = {}) {
+  const { dir, llm } = yield* useServerConfig((url) => ({ ...providerCfg(url), ...extra }))
+  const agentsFile = path.join(dir, "AGENTS.md")
+  yield* writeText(agentsFile, "Rule one.")
+  const prompt = yield* SessionPrompt.Service
+  const sessions = yield* Session.Service
+  const chat = yield* sessions.create({
+    title: "Pinned",
+    permission: [{ permission: "*", pattern: "*", action: "allow" }],
+  })
+  const turn = Effect.fn("test.frozenTurn")(function* (text: string, sessionID = chat.id) {
+    const message = yield* prompt.prompt({
+      sessionID,
+      agent: "build",
+      model: ref,
+      noReply: true,
+      parts: [{ type: "text", text }],
+    })
+    yield* llm.text(`reply to ${text}`)
+    yield* prompt.loop({ sessionID })
+    return message.info
+  })
+  const requests = () =>
+    Effect.map(llm.hits, (hits) => mainHits(hits).map((hit) => hit.body.messages as Record<string, any>[]))
+  return { dir, llm, agentsFile, prompt, sessions, chat, turn, requests }
+})
+
+it.instance(
+  "an instruction edit reaches the model as an update on the next user message, not in the system prompt",
+  () =>
+    Effect.gen(function* () {
+      const { agentsFile, chat, turn, requests } = yield* frozenSetup()
+      yield* turn("first")
+      yield* writeText(agentsFile, "Rule two.")
+      yield* turn("second")
+      yield* turn("third")
+
+      const sent = yield* requests()
+      expect(sent).toHaveLength(3)
+      expect(mentions(systemOf(sent[0]), "Rule one.")).toBe(true)
+      // The system prompt never changes.
+      expect(systemOf(sent[1])).toEqual(systemOf(sent[0]))
+      expect(systemOf(sent[2])).toEqual(systemOf(sent[0]))
+      // The edit rides on the user message of the next turn, and is replayed as sent.
+      const second = userWith(sent[1], "second")
+      expect(mentions(second, "Rule two.")).toBe(true)
+      expect(mentions(second, UPDATED)).toBe(true)
+      expect(mentions(userWith(sent[1], "first"), "Rule two.")).toBe(false)
+      expect(userWith(sent[2], "second")).toEqual(second)
+      // Delivered once.
+      expect(mentions(userWith(sent[2], "third"), "Rule two.")).toBe(false)
+
+      const updates = yield* storedUpdates(chat.id)
+      expect(updates).toHaveLength(1)
+      expect(updates[0].update.changes).toHaveLength(1)
+      expect(updates[0].update.changes[0]).toStartWith("updated instructions: ")
+      expect(updates[0].update.changes[0]).toEndWith("AGENTS.md")
+      expect(updates[0].update.sections.instructions?.some((entry) => entry.content === "Rule two.")).toBe(true)
+    }),
+)
+
+it.instance("an instruction edit during a turn waits for the next turn", () =>
+  Effect.gen(function* () {
+    const { agentsFile, llm, prompt, chat, turn, requests } = yield* frozenSetup()
+    yield* prompt.prompt({
+      sessionID: chat.id,
+      agent: "build",
+      model: ref,
+      noReply: true,
+      parts: [{ type: "text", text: "first" }],
+    })
+    yield* llm.tool("write", { filePath: agentsFile, content: "Rule two." })
+    yield* llm.text("written")
+    yield* prompt.loop({ sessionID: chat.id })
+    expect(yield* Effect.promise(() => Bun.file(agentsFile).text())).toBe("Rule two.")
+    yield* turn("second")
+
+    const sent = yield* requests()
+    expect(sent).toHaveLength(3)
+    // The step after the edit repeats the turn's context.
+    expect(systemOf(sent[1])).toEqual(systemOf(sent[0]))
+    expect(mentions(sent[1], UPDATED)).toBe(false)
+    expect(systemOf(sent[2])).toEqual(systemOf(sent[0]))
+    expect(mentions(userWith(sent[2], "second"), UPDATED)).toBe(true)
+  }),
+)
+
+it.instance("reverting the message that delivered an update delivers it again", () =>
+  Effect.gen(function* () {
+    const { agentsFile, chat, turn, requests } = yield* frozenSetup()
+    const revert = yield* SessionRevert.Service
+    yield* turn("first")
+    yield* writeText(agentsFile, "Rule two.")
+    const reverted = yield* turn("reverted-turn")
+    yield* revert.revert({ sessionID: chat.id, messageID: reverted.id })
+    yield* turn("third")
+
+    const sent = yield* requests()
+    expect(sent).toHaveLength(3)
+    expect(mentions(sent[2], "reverted-turn")).toBe(false)
+    expect(systemOf(sent[2])).toEqual(systemOf(sent[0]))
+    expect(mentions(userWith(sent[2], "third"), "Rule two.")).toBe(true)
+    expect(yield* storedUpdates(chat.id)).toHaveLength(1)
+  }),
+)
+
+it.instance("compaction rebuilds the system prompt from the current sections", () =>
+  Effect.gen(function* () {
+    // The retained tail keeps the turn that delivered the update.
+    const { agentsFile, llm, prompt, chat, turn, requests } = yield* frozenSetup({ compaction: { tail_turns: 1 } })
+    const compaction = yield* SessionCompaction.Service
+    yield* turn("first")
+    yield* writeText(agentsFile, "Rule two.")
+    yield* turn("second")
+    yield* compaction.create({ sessionID: chat.id, agent: "build", model: ref, auto: false })
+    yield* llm.text("summary of the conversation")
+    yield* prompt.loop({ sessionID: chat.id })
+    yield* turn("third")
+
+    const last = (yield* requests()).at(-1)!
+    // The tail kept the turn that delivered the update.
+    expect(userWith(last, "second")).toBeDefined()
+    expect(mentions(systemOf(last), "Rule two.")).toBe(true)
+    expect(mentions(systemOf(last), "Rule one.")).toBe(false)
+    // The earlier update would override the new baseline with older text.
+    expect(mentions(last, UPDATED)).toBe(false)
+  }),
+)
+
+it.instance("a fork keeps the system prompt its copied history was sent with", () =>
+  Effect.gen(function* () {
+    const { agentsFile, sessions, chat, turn, requests } = yield* frozenSetup()
+    yield* turn("first")
+    yield* writeText(agentsFile, "Rule two.")
+    const fork = yield* sessions.fork({ sessionID: chat.id })
+    yield* turn("in the fork", fork.id)
+
+    const sent = yield* requests()
+    expect(systemOf(sent[1])).toEqual(systemOf(sent[0]))
+    expect(mentions(userWith(sent[1], "in the fork"), "Rule two.")).toBe(true)
+  }),
+)
+
+it.instance("preflight predicts the update without storing it", () => {
+  const captures: Record<string, any>[] = []
+  const off = Wire.onCapture((tag, request) => {
+    if (tag.mode === "dryrun") captures.push(JSON.parse(request.body ?? "{}"))
+  })
+  return Effect.gen(function* () {
+    CacheLedger.reset()
+    const { agentsFile, llm, prompt, sessions, chat } = yield* frozenSetup()
+    yield* prompt.prompt({
+      sessionID: chat.id,
+      agent: "build",
+      model: ref,
+      noReply: true,
+      parts: [{ type: "text", text: "first" }],
+    })
+    yield* llm.text("reply", { usage: { input: 5000, output: 10 } })
+    yield* prompt.loop({ sessionID: chat.id })
+    yield* writeText(agentsFile, "Rule two.")
+    const stored = yield* sessions.messages({ sessionID: chat.id })
+
+    const report = yield* prompt.preflight({ sessionID: chat.id, agent: "build", model: ref })
+    expect(report.status).toBe("hit")
+    expect(report.lostTokens).toBe(0)
+    expect(report.divergence).toBeUndefined()
+    expect(report.staleThinking).toBeUndefined()
+    expect(mentions(captures.at(-1)!.messages.at(-1), "Rule two.")).toBe(true)
+    expect(yield* sessions.messages({ sessionID: chat.id })).toEqual(stored)
+    expect(yield* storedUpdates(chat.id)).toHaveLength(0)
+  }).pipe(Effect.ensuring(Effect.sync(off)))
+})
+
+const liveMcpInstructions: MCP.ServerInstructions[] = []
+const withLiveMcpInstructions = testEffect(makeHttp({ mcpInstructions: liveMcpInstructions }))
+
+withLiveMcpInstructions.instance("an MCP instruction change reaches the model as an update", () =>
+  Effect.gen(function* () {
+    liveMcpInstructions.splice(0, liveMcpInstructions.length, {
+      name: "guide-server",
+      instructions: "Use lookup before mutate.",
+      tools: [],
+    })
+    const { chat, turn, requests } = yield* frozenSetup()
+    yield* turn("first")
+    liveMcpInstructions.splice(0, 1, { name: "guide-server", instructions: "Never mutate.", tools: [] })
+    yield* turn("second")
+
+    const sent = yield* requests()
+    expect(mentions(systemOf(sent[0]), "Use lookup before mutate.")).toBe(true)
+    expect(systemOf(sent[1])).toEqual(systemOf(sent[0]))
+    const second = userWith(sent[1], "second")
+    expect(mentions(second, "The MCP server instructions are now:")).toBe(true)
+    expect(mentions(second, "Never mutate.")).toBe(true)
+    expect((yield* storedUpdates(chat.id))[0].update.changes).toEqual(["MCP server instructions"])
   }),
 )
 

@@ -29,6 +29,7 @@ import type { SQL } from "drizzle-orm"
 import { PartTable, SessionTable } from "@opencode-ai/core/session/sql"
 import { ProjectTable } from "@opencode-ai/core/project/sql"
 import { MessageV2 } from "./message-v2"
+import { SystemBaseline } from "./system-baseline"
 import type { InstanceContext } from "../project/instance-context"
 import { InstanceState } from "@/effect/instance-state"
 import { Snapshot } from "@/snapshot"
@@ -729,6 +730,8 @@ const layer: Layer.Layer<
           yield* updatePart(p)
         }
       }
+      // The copied history was sent with the original's system prompt.
+      yield* SystemBaseline.copy(db, { from: input.sessionID, to: session.id, messages: idMap })
       return session
     })
 

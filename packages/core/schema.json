@@ -1,9 +1,9 @@
 {
   "version": "7",
   "dialect": "sqlite",
-  "id": "f1de291b-614d-4058-9e1e-cbf1ab34af88",
+  "id": "d1b2b666-37e8-4614-8e5c-79be66442a08",
   "prevIds": [
-    "f14a9b18-8207-487e-a3d3-227e629ba9ad"
+    "f1de291b-614d-4058-9e1e-cbf1ab34af88"
   ],
   "ddl": [
     {
@@ -16,6 +16,10 @@
     },
     {
       "name": "message_diff",
+      "entityType": "tables"
+    },
+    {
+      "name": "session_system_baseline",
       "entityType": "tables"
     },
     {
@@ -205,6 +209,66 @@
       "name": "data",
       "entityType": "columns",
       "table": "message_diff"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "session_id",
+      "entityType": "columns",
+      "table": "session_system_baseline"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "generation",
+      "entityType": "columns",
+      "table": "session_system_baseline"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "sections",
+      "entityType": "columns",
+      "table": "session_system_baseline"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "compaction_id",
+      "entityType": "columns",
+      "table": "session_system_baseline"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "time_created",
+      "entityType": "columns",
+      "table": "session_system_baseline"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "time_updated",
+      "entityType": "columns",
+      "table": "session_system_baseline"
     },
     {
       "type": "integer",
@@ -1538,6 +1602,21 @@
     },
     {
       "columns": [
+        "session_id"
+      ],
+      "tableTo": "session",
+      "columnsTo": [
+        "id"
+      ],
+      "onUpdate": "NO ACTION",
+      "onDelete": "CASCADE",
+      "nameExplicit": false,
+      "name": "fk_session_system_baseline_session_id_session_id_fk",
+      "entityType": "fks",
+      "table": "session_system_baseline"
+    },
+    {
+      "columns": [
         "active_account_id"
       ],
       "tableTo": "account",
@@ -1771,6 +1850,15 @@
       "nameExplicit": false,
       "name": "message_diff_pk",
       "table": "message_diff",
+      "entityType": "pks"
+    },
+    {
+      "columns": [
+        "session_id"
+      ],
+      "nameExplicit": false,
+      "name": "session_system_baseline_pk",
+      "table": "session_system_baseline",
       "entityType": "pks"
     },
     {

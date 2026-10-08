@@ -35,12 +35,21 @@ export interface Interface {
   readonly clear: (messageID: MessageID) => Effect.Effect<void>
   readonly systemPaths: () => Effect.Effect<Set<string>, FSUtil.Error>
   readonly system: () => Effect.Effect<string[], FSUtil.Error>
+  /** The instructions system() renders, by source (file path or URL). Unreadable or empty sources are left out. */
+  readonly entries: () => Effect.Effect<Entry[], FSUtil.Error>
   readonly find: (dir: string) => Effect.Effect<string | undefined, FSUtil.Error>
   readonly resolve: (
     messages: SessionV1.WithParts[],
     filepath: string,
     messageID: MessageID,
   ) => Effect.Effect<{ filepath: string; content: string }[], FSUtil.Error>
+}
+
+export type Entry = { readonly source: string; readonly content: string }
+
+/** How system() presents one instruction source to the model. */
+export function render(entry: Entry) {
+  return `Instructions from: ${entry.source}\n${entry.content}`
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/Instruction") {}
@@ -152,7 +161,7 @@ const layer: Layer.Layer<
       return paths
     })
 
-    const system = Effect.fn("Instruction.system")(function* () {
+    const entries = Effect.fn("Instruction.entries")(function* () {
       const config = yield* cfg.get()
       const paths = yield* systemPaths()
       const urls = (config.instructions ?? []).filter(
@@ -163,9 +172,13 @@ const layer: Layer.Layer<
       const remote = yield* Effect.forEach(urls, fetch, { concurrency: 4 })
 
       return [
-        ...Array.from(paths).flatMap((item, i) => (files[i] ? [`Instructions from: ${item}\n${files[i]}`] : [])),
-        ...urls.flatMap((item, i) => (remote[i] ? [`Instructions from: ${item}\n${remote[i]}`] : [])),
+        ...Array.from(paths).flatMap((source, i) => (files[i] ? [{ source, content: files[i] }] : [])),
+        ...urls.flatMap((source, i) => (remote[i] ? [{ source, content: remote[i] }] : [])),
       ]
+    })
+
+    const system = Effect.fn("Instruction.system")(function* () {
+      return (yield* entries()).map(render)
     })
 
     const find = Effect.fn("Instruction.find")(function* (dir: string) {
@@ -220,7 +233,7 @@ const layer: Layer.Layer<
       return results
     })
 
-    return Service.of({ clear, systemPaths, system, find, resolve })
+    return Service.of({ clear, systemPaths, system, entries, find, resolve })
   }),
 )
 

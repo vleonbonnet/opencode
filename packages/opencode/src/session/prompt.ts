@@ -60,6 +60,7 @@ import { answerResult } from "@/tool/question"
 import { isRecord } from "@/util/record"
 import { SessionReminders } from "./reminders"
 import { SessionTools } from "./tools"
+import { SystemBaseline } from "./system-baseline"
 import { Wire } from "./cache/wire"
 import { CacheLedger } from "./cache/ledger"
 import { LLMEvent } from "@opencode-ai/llm"
@@ -181,6 +182,35 @@ const layer = Layer.effect(
         Effect.provideService(Session.Service, sessions),
       )
 
+    // The frozen system prompt sections of the session and the history as the
+    // model sees it, delivering changed sections at a turn boundary.
+    const applySystemBaseline = Effect.fn("SessionPrompt.applySystemBaseline")(function* (input: {
+      session: Session.Info
+      messages: SessionV1.WithParts[]
+      user: SessionV1.User
+      agent: Agent.Info
+      model: Provider.Model
+      persist: boolean
+    }) {
+      const exposure = yield* agents.exposure(input.agent)
+      return yield* SystemBaseline.prepare({
+        db,
+        sessionID: input.session.id,
+        messages: input.messages,
+        user: input.user,
+        observe: Effect.all({
+          environment: sys.environment(input.model),
+          instructions: instruction.entries().pipe(Effect.orDie),
+          mcp: sys
+            .mcp(input.agent, input.session.permission, exposure)
+            .pipe(Effect.map((text) => (text ? [text] : []))),
+          skills: sys.skills(input.agent, exposure).pipe(Effect.map((text) => (text ? [text] : []))),
+        }),
+        store: (part) => sessions.updatePart(part),
+        persist: input.persist,
+      })
+    })
+
     // Builds the LLM request for one loop step from the (reminder-applied)
     // history. The loop and preflight both use it, so a preflight dry run is
     // the exact request the next turn sends.
@@ -192,6 +222,8 @@ const layer = Layer.effect(
       model: Provider.Model
       step: number
       processor: Pick<SessionProcessor.Handle, "message" | "updateToolCall" | "completeToolCall">
+      /** The session's frozen system prompt sections (applySystemBaseline). */
+      system: string[]
       onStructured: (output: unknown) => void
       /** The user accepted losing stale thinking on this request. */
       acceptThinkingLoss?: boolean
@@ -230,19 +262,8 @@ const layer = Layer.effect(
 
       yield* plugin.trigger("experimental.chat.messages.transform", {}, { messages: msgs })
 
-      const [skills, env, instructions, mcpInstructions, modelMsgs] = yield* Effect.all([
-        sys.skills(agent, exposure),
-        sys.environment(model),
-        instruction.system().pipe(Effect.orDie),
-        sys.mcp(agent, session.permission, exposure),
-        MessageV2.toModelMessagesEffect(msgs, model),
-      ])
-      const system = [
-        ...env,
-        ...instructions,
-        ...(mcpInstructions ? [mcpInstructions] : []),
-        ...(skills ? [skills] : []),
-      ]
+      const modelMsgs = yield* MessageV2.toModelMessagesEffect(msgs, model)
+      const system = [...input.system]
       const format = lastUser.format ?? { type: "text" as const }
       if (format.type === "json_schema") system.push(STRUCTURED_OUTPUT_SYSTEM_PROMPT)
       return {
@@ -398,6 +419,15 @@ const layer = Layer.effect(
 
       const agent = resolved.agent
       msgs = yield* applyReminders({ messages: msgs, agent, session: view, persist: false })
+      const frozen = yield* applySystemBaseline({
+        session: view,
+        messages: msgs,
+        user: info,
+        agent,
+        model,
+        persist: false,
+      })
+      msgs = frozen.messages
       const assistant: SessionV1.Assistant = {
         id: MessageID.ascending(),
         parentID: info.id,
@@ -420,6 +450,7 @@ const layer = Layer.effect(
         agent,
         model,
         step: 1,
+        system: frozen.system,
         processor: {
           message: assistant,
           updateToolCall: () => Effect.die(new Error("preflight never executes tools")),
@@ -1499,6 +1530,15 @@ const layer = Layer.effect(
             throw error
           }
           msgs = yield* applyReminders({ messages: msgs, agent, session, persist: true })
+          const frozen = yield* applySystemBaseline({
+            session,
+            messages: msgs,
+            user: lastUser,
+            agent,
+            model,
+            persist: true,
+          })
+          msgs = frozen.messages
 
           const msg: SessionV1.Assistant = {
             id: MessageID.ascending(),
@@ -1553,6 +1593,7 @@ const layer = Layer.effect(
               model,
               step,
               processor: handle,
+              system: frozen.system,
               onStructured(output: unknown) {
                 structured = output
               },
