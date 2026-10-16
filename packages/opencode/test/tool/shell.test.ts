@@ -1190,6 +1190,86 @@ describe("tool.shell commands behind a prefix", () => {
       )
     }),
   )
+
+  const heredocs: Array<{ name: string; command: string; patterns?: string[]; body: boolean }> = [
+    {
+      name: "a quoted heredoc an interpreter reads",
+      command: "python3 - <<'EOF'\nprint('kanopy-oidc')\nEOF\ntail -3 f",
+      patterns: ["python3 - <<'EOF'", "tail -3 f"],
+      body: false,
+    },
+    { name: "a double-quoted delimiter", command: 'cat > f <<"EOF"\nkanopy-oidc\nEOF', body: false },
+    { name: "an escaped delimiter", command: "cat <<-\\EOF\n\tkanopy-oidc\n\tEOF", body: false },
+    {
+      name: "a heredoc substituted into an argument",
+      command: `git commit -m "$(cat <<'EOF'\nuse kanopy-oidc\nEOF\n)" && echo done`,
+      patterns: ["echo done"],
+      body: false,
+    },
+    { name: "a heredoc assigned to a variable", command: "x=$(cat <<'EOF'\nkanopy-oidc\nEOF\n)", body: false },
+    {
+      name: "a heredoc read by a loop",
+      command: `while read f; do echo "$f"; done <<'EOF'\nkanopy-oidc\nEOF`,
+      body: false,
+    },
+    {
+      name: "an unquoted heredoc",
+      command: "cat <<EOF\nkanopy-oidc $(whoami)\nEOF",
+      patterns: ["whoami"],
+      body: true,
+    },
+    {
+      name: "a heredoc a shell reads",
+      command: "bash <<'EOF'\nkubectl delete pod kanopy-oidc\nEOF",
+      patterns: ["kubectl delete pod kanopy-oidc"],
+      body: true,
+    },
+    {
+      name: "a heredoc piped into a shell behind a runner",
+      command: "cat <<'EOF' | tee log | sudo bash -s\nkubectl delete pod kanopy-oidc\nEOF",
+      patterns: ["kubectl delete pod kanopy-oidc"],
+      body: true,
+    },
+    {
+      name: "a heredoc sudo -s reads",
+      command: "sudo -s <<'EOF'\nrm -r kanopy-oidc\nEOF",
+      patterns: ["rm -r kanopy-oidc"],
+      body: true,
+    },
+    {
+      name: "a heredoc a program named at run time reads",
+      command: `"$run" <<'EOF'\nkubectl delete pod kanopy-oidc\nEOF`,
+      patterns: ["kubectl delete pod kanopy-oidc"],
+      body: true,
+    },
+    { name: "a heredoc xargs reads", command: "cat <<'EOF' | xargs rm\n-r kanopy-oidc\nEOF", body: true },
+    {
+      name: "a heredoc substituted into a shell's -c script",
+      command: `bash -c "$(cat <<'EOF'\nkubectl delete pod kanopy-oidc\nEOF\n)"`,
+      body: true,
+    },
+    {
+      name: "a heredoc substituted into a statement that runs a shell",
+      command: `echo "$(cat <<'EOF'\nkanopy-oidc\nEOF\n)" | sh`,
+      body: true,
+    },
+  ]
+
+  for (const item of heredocs) {
+    each(`${item.body ? "keeps" : "leaves out"} the body of ${item.name}`, () =>
+      Effect.gen(function* () {
+        const tmp = yield* tmpdirScoped()
+        yield* runIn(
+          tmp,
+          Effect.gen(function* () {
+            const req = (yield* asked(item.command)).bash
+            for (const pattern of item.patterns ?? []) expect(req.patterns).toContain(pattern)
+            expect(req.patterns.some((pattern) => pattern.includes("kanopy-oidc"))).toBe(item.body)
+          }),
+        )
+      }),
+    )
+  }
 })
 
 describe("tool.shell abort", () => {

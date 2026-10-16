@@ -101,6 +101,12 @@ const RUNNERS: Record<string, { values: string[]; operands?: number }> = {
 // Shells that run a script string given with -c.
 const SHELLS = new Set(["ash", "bash", "dash", "fish", "ksh", "sh", "zsh"])
 const SHELL_VALUES = new Set(["-O", "+O", "-o", "+o", "--init-file", "--rcfile"])
+// Commands that run their input as a shell script, and those that turn their
+// input into code or arguments.  `sudo` and `doas` read a script when they run
+// no command (`sudo -s`).
+const READERS = new Set([...SHELLS, ".", "source", "ssh", "su"])
+const RUNNER_SHELLS = new Set(["doas", "sudo"])
+const EXPANDERS = new Set(["eval", "parallel", "xargs"])
 // A script string nested deeper than this is only checked as the text of the
 // command that carries it.
 const MAX_SCRIPT_DEPTH = 4
@@ -120,6 +126,12 @@ type Scan = {
   dirs: Set<string>
   patterns: Set<string>
   always: Set<string>
+}
+
+// A span of the parsed command text, in string indices.
+type Range = {
+  start: number
+  end: number
 }
 
 type Chunk = {
@@ -162,12 +174,83 @@ function parts(node: Node) {
   return out
 }
 
-function source(node: Node) {
-  return (node.parent?.type === "redirected_statement" ? node.parent.text : node.text).trim()
+function source(node: Node, ranges: Range[]) {
+  return cut(node.parent?.type === "redirected_statement" ? node.parent : node, ranges).trim()
+}
+
+// The text of a node without the RANGES inside it.
+function cut(node: Node, ranges: Range[]) {
+  const inside = ranges
+    .filter((range) => range.start >= node.startIndex && range.end <= node.endIndex)
+    .toSorted((a, b) => a.start - b.start)
+  if (!inside.length) return node.text
+  const at = (index: number) => index - node.startIndex
+  return (
+    inside.map((range, i) => node.text.slice(i ? at(inside[i - 1].end) : 0, at(range.start))).join("") +
+    node.text.slice(at(inside[inside.length - 1].end))
+  )
 }
 
 function commands(node: Node) {
   return node.descendantsOfType("command").filter((child): child is Node => Boolean(child))
+}
+
+// What the heredocs of a tree hold.  `ranges` are the bodies, with their
+// closing delimiter, that are only data and are left out of the text rules
+// see: bash expands nothing in a body whose delimiter is quoted, so it is data
+// unless what reads it turns it into code or arguments.  `scripts` are the
+// bodies a shell runs, to be checked command by command.  A tree with a parse
+// error keeps every body, since its heredocs may be misread.
+function heredocs(root: Node) {
+  return root
+    .descendantsOfType("heredoc_redirect")
+    .filter((redirect): redirect is Node => Boolean(redirect))
+    .reduce(
+      (out, redirect) => {
+        const child = (type: string) => redirect.children.find((item) => item?.type === type)
+        const body = child("heredoc_body")
+        if (!body) return out
+        const found = consumers(redirect).map((node) => unwrap(node, []))
+        const names = found.flatMap((item) => item.views.map((view) => view.name))
+        const reads =
+          names.some((name) => READERS.has(name) || dynamic(name, false)) ||
+          found.some((item) => item.views.length === 1 && RUNNER_SHELLS.has(item.views[0].name))
+        if (reads) out.scripts.push(body.text)
+        const start = child("heredoc_start")
+        const end = child("heredoc_end")
+        if (root.hasError || !start || !end || !/['"\\]/.test(start.text)) return out
+        if (reads || names.some((name) => EXPANDERS.has(name)) || found.some((item) => item.scripts.length)) return out
+        out.ranges.push({ start: body.startIndex, end: end.endIndex })
+        return out
+      },
+      { ranges: [] as Range[], scripts: [] as string[] },
+    )
+}
+
+// The commands that read a heredoc: those of the statement it is redirected
+// to and those after it in its pipelines.  Once its output is substituted into
+// a word, every command of the top-level statement holding that word counts,
+// since where the word ends up is not followed.
+function consumers(redirect: Node) {
+  const statement = redirect.parent
+  if (!statement) return []
+  const out = [statement.childForFieldName("body"), ...redirect.children.filter((item) => item?.type === "pipeline")]
+    .filter((node): node is Node => Boolean(node))
+    .flatMap(commands)
+  const state = { node: statement, substituted: false }
+  while (state.node.parent) {
+    const parent = state.node.parent
+    const after = state.node.endIndex
+    if (parent.type === "pipeline") {
+      out.push(
+        ...parent.children.filter((item): item is Node => Boolean(item) && item!.startIndex >= after).flatMap(commands),
+      )
+    }
+    if (parent.type === "command_substitution" || parent.type === "process_substitution") state.substituted = true
+    if (state.substituted && parent.parent?.type === "program") out.push(...commands(parent))
+    state.node = parent
+  }
+  return out
 }
 
 // Statements that change the environment of the commands after them, which bash
@@ -186,8 +269,8 @@ function assignments(node: Node) {
 // runners (`env`, `sudo`, `xargs`, …) and `find -exec` run in turn, together
 // with the script strings it hands to a shell's -c, to `eval`, to `env -S` or
 // to `watch`.  Each inner command has fewer words than the one running it, so
-// the walk ends.
-function unwrap(node: Node) {
+// the walk ends.  Words are taken without the heredoc bodies in RANGES.
+function unwrap(node: Node, ranges: Range[]) {
   const name = node.childForFieldName("name")
   if (!name) return { views: [], scripts: [] }
   const views: View[] = [
@@ -196,7 +279,7 @@ function unwrap(node: Node) {
       args: node
         .childrenForFieldName("argument")
         .filter((item): item is Node => Boolean(item))
-        .map((item) => ({ type: item.type, text: item.text })),
+        .map((item) => ({ type: item.type, text: cut(item, ranges) })),
     },
   ]
   const scripts: string[] = []
@@ -617,10 +700,10 @@ export const ShellTool = Tool.define(
 
       // A statement that sets or clears a variable decides what the commands
       // after it see (`export KUBECONFIG=…`), so its text is checked as well.
-      const declared = (node: Node) => {
+      const declared = (node: Node, ranges: Range[]) => {
         if (ps || shellKind === "cmd") return
         for (const item of assignments(node)) {
-          const statement = item.text.trim()
+          const statement = cut(item, ranges).trim()
           scan.patterns.add(statement)
           scan.always.add(
             item.type === "declaration_command" || item.type === "unset_command"
@@ -630,12 +713,28 @@ export const ShellTool = Tool.define(
         }
       }
 
-      // Script strings found on the way are parsed and their commands queued
-      // behind the rest; their trees live until the caller's scope closes.
-      declared(root)
-      const queue = commands(root).map((node) => ({ node, depth: 0 }))
+      // Commands are checked as they come in the queue, with the data-only
+      // heredoc bodies of their tree left out of their text.  Script strings
+      // and the heredocs a shell reads are queued behind them, then parsed in
+      // turn; their trees live until the caller's scope closes.
+      const queue: Array<{ node: Node; depth: number; ranges: Range[] } | { script: string; depth: number }> = []
+      const visit = (tree: Node, depth: number) => {
+        const found = ps || shellKind === "cmd" ? { ranges: [], scripts: [] } : heredocs(tree)
+        declared(tree, found.ranges)
+        queue.push(...commands(tree).map((node) => ({ node, depth, ranges: found.ranges })))
+        if (depth < MAX_SCRIPT_DEPTH) queue.push(...found.scripts.map((script) => ({ script, depth: depth + 1 })))
+      }
+      visit(root, 0)
       for (let i = 0; i < queue.length; i++) {
-        const node = queue[i].node
+        const entry = queue[i]
+        if ("script" in entry) {
+          const tree = yield* Effect.acquireRelease(parse(entry.script, false), (tree) =>
+            Effect.sync(() => tree.delete()),
+          )
+          visit(tree.rootNode, entry.depth)
+          continue
+        }
+        const node = entry.node
         const command = parts(node)
         const tokens = command.map((item) => item.text)
         const cmd = ps || shellKind === "cmd" ? tokens[0]?.toLowerCase() : tokens[0]
@@ -643,7 +742,7 @@ export const ShellTool = Tool.define(
         if (cmd && (FILES.has(cmd) || (shellKind === "cmd" && CMD_FILES.has(cmd)))) yield* files(command)
 
         if (tokens.length && (!cmd || !CWD.has(cmd))) {
-          scan.patterns.add(source(node))
+          scan.patterns.add(source(node, entry.ranges))
           scan.always.add(BashArity.prefix(tokens).join(" ") + " *")
         }
 
@@ -653,23 +752,19 @@ export const ShellTool = Tool.define(
         // assignment, a directory or quoting would be judged by that prefix
         // alone.  Each command it runs is checked as well.  This only adds
         // patterns: it can add a prompt or a denial, never lift one.
-        const found = unwrap(node)
-        for (const [index, item] of found.views.entries()) {
-          if (CWD.has(item.name)) continue
-          const words = [{ type: "word", text: item.name }, ...item.args]
-          if (FILES.has(item.name) && !(index === 0 && item.name === cmd)) yield* files(words)
-          scan.patterns.add(text(item))
+        const found = unwrap(node, entry.ranges)
+        for (const [index, view] of found.views.entries()) {
+          if (CWD.has(view.name)) continue
+          const words = [{ type: "word", text: view.name }, ...view.args]
+          if (FILES.has(view.name) && !(index === 0 && view.name === cmd)) yield* files(words)
+          scan.patterns.add(text(view))
           scan.always.add(BashArity.prefix(words.map((word) => word.text)).join(" ") + " *")
-          const flat = split(item)
+          const flat = split(view)
           if (flat) scan.patterns.add(text(flat))
         }
 
-        if (queue[i].depth >= MAX_SCRIPT_DEPTH) continue
-        for (const item of found.scripts) {
-          const tree = yield* Effect.acquireRelease(parse(item, false), (tree) => Effect.sync(() => tree.delete()))
-          declared(tree.rootNode)
-          queue.push(...commands(tree.rootNode).map((child) => ({ node: child, depth: queue[i].depth + 1 })))
-        }
+        if (entry.depth >= MAX_SCRIPT_DEPTH) continue
+        queue.push(...found.scripts.map((script) => ({ script, depth: entry.depth + 1 })))
       }
 
       return scan
