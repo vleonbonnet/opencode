@@ -675,6 +675,11 @@ export type Todo = {
   priority: string
 }
 
+export type PermissionReason = {
+  pattern: string
+  rule?: PermissionRule
+}
+
 export type SessionStatus =
   | {
       type: "idle"
@@ -1402,6 +1407,7 @@ export type GlobalEvent = {
             messageID: string
             callID: string
           }
+          reasons?: Array<PermissionReason>
         }
       }
     | {
@@ -2517,6 +2523,7 @@ export type PermissionRequest = {
     messageID: string
     callID: string
   }
+  reasons?: Array<PermissionReason>
 }
 
 export type PermissionNotFoundError = {
@@ -5817,6 +5824,7 @@ export type PermissionAsked = {
       messageID: string
       callID: string
     }
+    reasons?: Array<PermissionReason>
   }
 }
 
@@ -6980,6 +6988,7 @@ export type EventPermissionAsked = {
       messageID: string
       callID: string
     }
+    reasons?: Array<PermissionReason>
   }
 }
 

@@ -27,14 +27,19 @@ interface State {
 
 export function evaluate(permission: string, pattern: string, ...rulesets: PermissionV1.Ruleset[]): PermissionV1.Rule {
   return (
-    rulesets
-      .flat()
-      .findLast((rule) => Wildcard.match(permission, rule.permission) && Wildcard.match(pattern, rule.pattern)) ?? {
+    decide(permission, pattern, ...rulesets) ?? {
       action: "ask",
       permission,
       pattern: "*",
     }
   )
+}
+
+/** The rule that decides PERMISSION for PATTERN, the last one matching; none when no rule matches. */
+export function decide(permission: string, pattern: string, ...rulesets: PermissionV1.Ruleset[]) {
+  return rulesets
+    .flat()
+    .findLast((rule) => Wildcard.match(permission, rule.permission) && Wildcard.match(pattern, rule.pattern))
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/Permission") {}
@@ -67,21 +72,21 @@ const layer = Layer.effect(
     const ask = Effect.fn("Permission.ask")(function* (input: PermissionV1.AskInput) {
       const { approved, pending } = yield* InstanceState.get(state)
       const { ruleset, ...request } = input
-      let needsAsk = false
+      const reasons: PermissionV1.Reason[] = []
 
       for (const pattern of request.patterns) {
-        const rule = evaluate(request.permission, pattern, ruleset, approved)
+        const rule = decide(request.permission, pattern, ruleset, approved)
         yield* Effect.logInfo("evaluated", { permission: request.permission, pattern, action: rule })
-        if (rule.action === "deny") {
+        if (rule?.action === "deny") {
           return yield* new PermissionV1.DeniedError({
             ruleset: ruleset.filter((rule) => Wildcard.match(request.permission, rule.permission)),
           })
         }
-        if (rule.action === "allow") continue
-        needsAsk = true
+        if (rule?.action === "allow") continue
+        reasons.push(rule ? { pattern, rule } : { pattern })
       }
 
-      if (!needsAsk) return
+      if (!reasons.length) return
 
       const id = request.id ?? PermissionV1.ID.ascending()
       const info: PermissionV1.Request = {
@@ -92,6 +97,7 @@ const layer = Layer.effect(
         metadata: request.metadata,
         always: request.always,
         tool: request.tool,
+        reasons,
       }
       yield* Effect.logInfo("asking", { id, permission: info.permission, patterns: info.patterns })
 

@@ -694,6 +694,57 @@ it.instance(
   { git: true },
 )
 
+it.instance(
+  "ask - reports the rule that asks for each pattern",
+  () =>
+    Effect.gen(function* () {
+      const fiber = yield* ask({
+        sessionID: SessionID.make("session_test"),
+        permission: "bash",
+        patterns: ["cat secret", "ls", "git push"],
+        metadata: {},
+        always: [],
+        ruleset: [
+          { permission: "bash", pattern: "*", action: "allow" },
+          { permission: "bash", pattern: "*secret*", action: "ask" },
+          { permission: "bash", pattern: "git *", action: "ask" },
+          { permission: "bash", pattern: "git push", action: "allow" },
+          { permission: "edit", pattern: "*", action: "ask" },
+        ],
+      }).pipe(Effect.forkScoped)
+
+      const items = yield* waitForPending(1)
+      expect(items[0].reasons).toEqual([
+        { pattern: "cat secret", rule: { permission: "bash", pattern: "*secret*", action: "ask" } },
+      ])
+
+      yield* rejectAll()
+      yield* Fiber.await(fiber)
+    }),
+  { git: true },
+)
+
+it.instance(
+  "ask - reports a pattern no rule matches without a rule",
+  () =>
+    Effect.gen(function* () {
+      const fiber = yield* ask({
+        sessionID: SessionID.make("session_test"),
+        permission: "bash",
+        patterns: ["ls"],
+        metadata: {},
+        always: [],
+        ruleset: [{ permission: "edit", pattern: "*", action: "allow" }],
+      }).pipe(Effect.forkScoped)
+
+      expect((yield* waitForPending(1))[0].reasons).toEqual([{ pattern: "ls" }])
+
+      yield* rejectAll()
+      yield* Fiber.await(fiber)
+    }),
+  { git: true },
+)
+
 // reply tests
 
 it.instance(

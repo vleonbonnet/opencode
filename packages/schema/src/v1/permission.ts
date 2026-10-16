@@ -24,7 +24,14 @@ export type Rule = typeof Rule.Type
 export const Ruleset = Schema.Array(Rule).annotate({ identifier: "PermissionRuleset" })
 export type Ruleset = typeof Ruleset.Type
 
-export const Request = Schema.Struct({
+// Why a request asks: a pattern that needs approval and the configured rule
+// that asks for it, absent when no rule matches and asking is the default.
+export const Reason = Schema.Struct({ pattern: Schema.String, rule: Schema.optional(Rule) }).annotate({
+  identifier: "PermissionReason",
+})
+export type Reason = typeof Reason.Type
+
+const fields = {
   id: ID,
   sessionID: SessionID,
   permission: Schema.String,
@@ -32,7 +39,11 @@ export const Request = Schema.Struct({
   metadata: Schema.Record(Schema.String, Schema.Unknown),
   always: Schema.Array(Schema.String),
   tool: Schema.optional(Schema.Struct({ messageID: Schema.String, callID: Schema.String })),
-}).annotate({ identifier: "PermissionRequest" })
+}
+
+export const Request = Schema.Struct({ ...fields, reasons: Schema.optional(Schema.Array(Reason)) }).annotate({
+  identifier: "PermissionRequest",
+})
 export type Request = typeof Request.Type
 
 export const Reply = Schema.Literals(["once", "always", "reject"])
@@ -48,7 +59,7 @@ export const Approval = Schema.Struct({ projectID: Project.ID, patterns: Schema.
 })
 export type Approval = typeof Approval.Type
 
-export const AskInput = Schema.Struct({ ...Request.fields, id: Schema.optional(ID), ruleset: Ruleset }).annotate({
+export const AskInput = Schema.Struct({ ...fields, id: Schema.optional(ID), ruleset: Ruleset }).annotate({
   identifier: "PermissionAskInput",
 })
 export type AskInput = typeof AskInput.Type
