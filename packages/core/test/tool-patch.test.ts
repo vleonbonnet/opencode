@@ -709,6 +709,38 @@ describe("PatchTool", () => {
     ),
   )
 
+  it.live("preserves each file's line endings and BOM when updating and moving files", () =>
+    withTempTool((directory, registry) =>
+      Effect.gen(function* () {
+        const original = path.join(directory, "windows.org")
+        const moved = path.join(directory, "nested", "windows.org")
+        const unix = path.join(directory, "unix.txt")
+        yield* Effect.promise(() =>
+          fs.writeFile(original, "﻿#+name: example\r\n#+begin_src bash\r\necho old\r\n#+end_src\r\n"),
+        )
+        yield* Effect.promise(() => fs.writeFile(unix, "before\nold\nafter\n"))
+        const settled = yield* executeTool(
+          registry,
+          call(
+            "*** Begin Patch\n*** Update File: windows.org\n*** Move to: nested/windows.org\n@@\n-echo old\n+echo new\n+echo added\n*** Update File: unix.txt\n@@\n-old\n+new\n*** End Patch",
+          ),
+        )
+        expect(settled.status).toBe("completed")
+        if (settled.status !== "completed") return
+        expect(yield* exists(original)).toBe(false)
+        expect(yield* Effect.promise(() => fs.readFile(moved, "utf8"))).toBe(
+          "﻿#+name: example\r\n#+begin_src bash\r\necho new\r\necho added\r\n#+end_src\r\n",
+        )
+        expect(yield* Effect.promise(() => fs.readFile(unix, "utf8"))).toBe("before\nnew\nafter\n")
+        const output = Schema.decodeUnknownSync(PatchTool.Output)(settled.output)
+        expect(output.files[0]?.patch).not.toContain("-#+name:")
+        expect(output.files[0]?.patch).not.toContain("+#+name:")
+        expect(output.files[0]?.patch).not.toContain("﻿")
+        expect(output.files[0]).toMatchObject({ additions: 2, deletions: 1 })
+      }),
+    ),
+  )
+
   it.live("does not invent a first-line diff for BOM files", () =>
     withTempTool((directory, registry) =>
       Effect.gen(function* () {

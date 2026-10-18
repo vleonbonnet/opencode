@@ -2,6 +2,7 @@ export * as Patch from "./patch.js"
 
 import { Result, Schema } from "effect"
 import { Bom } from "./bom.js"
+import { LineEnding } from "./line-ending.js"
 
 export class BoundaryError extends Schema.TaggedError<BoundaryError>()("Patch.BoundaryError", {
   boundary: Schema.Literals(["first", "last"]),
@@ -125,14 +126,42 @@ export function parse(patchText: string): Result.Result<ReadonlyArray<Hunk>, Par
   return Result.succeed(hunks)
 }
 
+/**
+ * Applies chunks to the LF view of the file, then gives every line its own line ending back. Untouched lines keep
+ * their bytes; a patch line that keeps or replaces a source line reuses that line's ending; any other line takes the
+ * replaced region's dominant ending, else the file's. CRLF and mixed-ending files therefore stay as they were.
+ */
 export function derive(path: string, chunks: ReadonlyArray<UpdateFileChunk>, original: string): FileUpdate {
   const source = Bom.split(original)
-  const lines = source.text.split("\n")
+  const lines = source.text.split(/\r?\n/)
+  const endings: Array<string | undefined> = Array.from(source.text.matchAll(/\r?\n/g), (match) => match[0])
   if (lines.at(-1) === "") lines.pop()
+  else endings.push(undefined)
+  const fallback = LineEnding.dominant(source.text, "\n")
   const replacements = computeReplacements(lines, path, chunks)
-  for (const [start, remove, insert] of replacements.reverse()) lines.splice(start, remove, ...insert)
-  if (lines.at(-1) !== "") lines.push("")
-  const next = Bom.split(lines.join("\n"))
+  for (const [start, remove, insert, replaced] of replacements.reverse()) {
+    const region = endings.slice(start, start + remove)
+    const regionFallback = LineEnding.dominant(region.join(""), fallback)
+    // When every replaced line ends alike, each inserted line takes that ending whatever it aligns with.
+    const counterpart = region.every((ending) => ending === undefined || ending === regionFallback)
+      ? []
+      : LineEnding.align(replaced, insert)
+    lines.splice(start, remove, ...insert)
+    endings.splice(
+      start,
+      remove,
+      ...insert.map((_, index) => {
+        const line = counterpart[index]
+        return (line === undefined ? undefined : region[line]) ?? regionFallback
+      }),
+    )
+  }
+  // A trailing empty line is the final newline, which every patched file ends with.
+  if (lines.at(-1) === "") {
+    lines.pop()
+    endings.pop()
+  }
+  const next = Bom.split(lines.map((line, index) => line + (endings[index] ?? fallback)).join(""))
   return { content: next.text, bom: source.bom || next.bom }
 }
 
@@ -309,7 +338,9 @@ function isBoundary(line: string) {
 }
 
 function computeReplacements(lines: ReadonlyArray<string>, path: string, chunks: ReadonlyArray<UpdateFileChunk>) {
-  const replacements: Array<readonly [start: number, remove: number, insert: ReadonlyArray<string>]> = []
+  const replacements: Array<
+    readonly [start: number, remove: number, insert: ReadonlyArray<string>, replaced: ReadonlyArray<string>]
+  > = []
   let lineIndex = 0
   for (const chunk of chunks) {
     if (chunk.changeContext) {
@@ -318,7 +349,7 @@ function computeReplacements(lines: ReadonlyArray<string>, path: string, chunks:
       lineIndex = context + 1
     }
     if (chunk.oldLines.length === 0) {
-      replacements.push([lines.length, 0, chunk.newLines])
+      replacements.push([lines.length, 0, chunk.newLines, []])
       continue
     }
     let oldLines = chunk.oldLines
@@ -335,7 +366,7 @@ function computeReplacements(lines: ReadonlyArray<string>, path: string, chunks:
       throw new Error(`Failed to find ${expected} in ${path}`)
     }
     if (found === -1) throw new Error(`Failed to find expected lines in ${path}:\n${chunk.oldLines.join("\n")}`)
-    replacements.push([found, oldLines.length, newLines])
+    replacements.push([found, oldLines.length, newLines, oldLines])
     lineIndex = found + oldLines.length
   }
   return replacements.sort((left, right) => left[0] - right[0])
