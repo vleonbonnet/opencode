@@ -296,12 +296,18 @@ export const Plugin = {
         if (!tool) return
         const selected = yield* agents.resolve(event.agent)
         if (!selected) return
-        const available = (yield* agents.list())
+        const session = yield* sessions.get(event.sessionID).pipe(Effect.orElseSucceed(() => undefined))
+        if (!session) return
+        const all = yield* agents.list()
+        // Listed for every agent sharing the exposure; launching still answers to the acting agent's rules.
+        const exposure = Agent.exposure(selected, all, session)
+        const ceilings = yield* permission.ceilings(session)
+        const available = all
           .filter(
             (agent) =>
               agent.mode !== "primary" &&
               !agent.hidden &&
-              Permission.evaluate(name, agent.id, selected.permissions).effect !== "deny",
+              exposure.some((permissions) => Permission.decide(name, agent.id, permissions, ceilings) !== "deny"),
           )
           .toSorted((a, b) => a.id.localeCompare(b.id))
         if (available.length === 0) return

@@ -58,8 +58,14 @@ const update = (previous: ReadonlyArray<Summary>, current: ReadonlyArray<Summary
 }
 
 export interface Interface {
-  /** Lists skills the given ruleset does not deny; callers pass the merged agent and Session permissions. */
-  readonly load: (permissions: Permission.Ruleset) => Effect.Effect<Instructions.List>
+  /**
+   * Lists skills that at least one exposure ruleset and every delegation ceiling do not deny; callers pass the merged
+   * agent and Session permissions of each agent sharing the request's exposure, and the Session's ceilings.
+   */
+  readonly load: (
+    exposure: ReadonlyArray<Permission.Ruleset>,
+    ceilings?: ReadonlyArray<Permission.Ceiling>,
+  ) => Effect.Effect<Instructions.List>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/SkillInstructions") {}
@@ -70,8 +76,11 @@ const layer = Layer.effect(
     const skills = yield* Skill.Service
 
     return Service.of({
-      load: Effect.fn("SkillInstructions.load")(function* (permissions) {
-        const available = Skill.available(yield* skills.list(), permissions)
+      load: Effect.fn("SkillInstructions.load")(function* (exposure, ceilings = []) {
+        const listed = yield* skills.list()
+        const shown = new Set(exposure.flatMap((permissions) => Skill.available(listed, permissions, ceilings)))
+        const available = listed
+          .filter((skill) => shown.has(skill))
           .flatMap((skill) =>
             skill.description === undefined || skill.autoinvoke === false
               ? []

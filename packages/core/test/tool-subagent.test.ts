@@ -35,6 +35,7 @@ import { PluginHooks } from "@opencode/core/plugin/hooks"
 import { PluginSupervisor } from "@opencode/core/plugin/supervisor"
 import { Permission } from "@opencode/core/permission"
 import { SubagentTool } from "@opencode/core/tool/plugin/subagent"
+import type { SessionHooks } from "@opencode/plugin/effect/session"
 import { Tool } from "@opencode/core/tool"
 import { tmpdir } from "./fixture/tmpdir"
 import { tempGlobalLayer } from "./fixture/global"
@@ -112,12 +113,29 @@ const executionNode = makeGlobalNode({
   deps: [Bus.node, SessionStore.node],
 })
 
+// The most recently activated Location's session context hook, which describes the available subagents.
+let contextHook: ((event: SessionHooks["context"]) => Effect.Effect<void>) | undefined
 const subagentPluginSupervisor = makeLocationNode({
   name: "test/subagent-plugins",
   layer: Layer.effectDiscard(
     Effect.gen(function* () {
       const hooks = yield* PluginHooks.Service
-      yield* registerToolPlugin(SubagentTool.Plugin, {}, (name, callback) => hooks.register("tool", name, callback))
+      yield* registerToolPlugin(
+        SubagentTool.Plugin,
+        {
+          session: {
+            hook: (name, callback) =>
+              Effect.sync(() => {
+                if (name !== "context") return { dispose: Effect.void }
+                // Hook names and callbacks are correlated, but the generic registration API does not narrow them.
+                // oxlint-disable-next-line typescript-eslint/no-unsafe-type-assertion
+                contextHook = callback as (event: SessionHooks["context"]) => Effect.Effect<void>
+                return { dispose: Effect.void }
+              }),
+          },
+        },
+        (name, callback) => hooks.register("tool", name, callback),
+      )
     }),
   ),
   deps: [
@@ -723,6 +741,128 @@ describe("SubagentTool", () => {
             { sessionID: parent.id, agent: planAgent },
             { sessionID: parent.id, agent: toolIdentity.agent },
           ])
+        }),
+      ),
+    ),
+  )
+
+  it.live("lists the same subagents for every selectable agent while each agent's rules decide launches", () =>
+    Effect.acquireRelease(
+      Effect.promise(() => tmpdir()),
+      (dir) => Effect.promise(() => dir[Symbol.asyncDispose]()),
+    ).pipe(
+      Effect.flatMap((dir) =>
+        Effect.gen(function* () {
+          const location = Location.Ref.make({ directory: AbsolutePath.make(dir.path) })
+          const sessions = yield* Session.Service
+          const parent = yield* sessions.create({ location, model: parentModel })
+          yield* withSubagent(parent.location)
+          const hook = contextHook
+          if (!hook) throw new Error("expected the subagent context hook")
+          const locations = yield* LocationServiceMap.Service
+          const scope = locations.get(parent.location)
+          const plan = Agent.ID.make("plan")
+          const hidden = { action: SubagentTool.name, resource: "fallback", effect: "deny" } as const
+          yield* Agent.Service.use((agents) =>
+            agents.transform((editor) => {
+              editor.update(plan, (agent) => {
+                agent.mode = "primary"
+                agent.permissions.push({ action: SubagentTool.name, resource: "reviewer", effect: "deny" }, hidden)
+              })
+              // Every other selectable agent, including the harness's spare primary agent, denies the fallback too.
+              for (const id of [toolIdentity.agent, Agent.ID.make("primary")])
+                editor.update(id, (agent) => {
+                  agent.permissions.push(hidden)
+                })
+            }),
+          ).pipe(Effect.provide(scope))
+          const describeFor = (agent: Agent.ID) =>
+            Effect.gen(function* () {
+              const event = {
+                sessionID: parent.id,
+                agent,
+                model: parentModel,
+                system: [],
+                messages: [],
+                options: {},
+                tools: { [SubagentTool.name]: { description: "Spawn a subagent", input: {} } },
+              } satisfies SessionHooks["context"]
+              yield* hook(event)
+              return event.tools[SubagentTool.name].description
+            })
+
+          const planned = yield* describeFor(plan)
+          // Build may launch the reviewer, so plan lists it too; both deny the fallback, so neither lists it.
+          expect(planned).toBe(yield* describeFor(toolIdentity.agent))
+          expect(planned).toContain("- reviewer:")
+          expect(planned).not.toContain("- fallback:")
+
+          const registry = yield* Tool.Service.pipe(Effect.provide(scope))
+          expect(
+            yield* executeTool(registry, {
+              sessionID: parent.id,
+              ...toolIdentity,
+              agent: plan,
+              call: {
+                type: "tool-call",
+                id: "call-plan-reviewer",
+                name: SubagentTool.name,
+                input: { agent: "reviewer", description: "review", prompt: "review this" },
+              },
+            }),
+          ).toMatchObject({ status: "error", error: { type: "permission.rejected" } })
+        }),
+      ),
+    ),
+  )
+
+  it.live("lists for a child Session its own agent's subagents within what its delegators allow", () =>
+    Effect.acquireRelease(
+      Effect.promise(() => tmpdir()),
+      (dir) => Effect.promise(() => dir[Symbol.asyncDispose]()),
+    ).pipe(
+      Effect.flatMap((dir) =>
+        Effect.gen(function* () {
+          const fallback: Permission.Rule = { action: SubagentTool.name, resource: "fallback", effect: "deny" }
+          const helper = Agent.ID.make("helper")
+          const { parent, delegate, sessions, scope } = yield* planDelegation(dir.path, {
+            permissions: [fallback],
+            plan: [],
+          })
+          const hook = contextHook
+          if (!hook) throw new Error("expected the subagent context hook")
+          // A user may also select the helper, so in a root Session it shares the other agents' exposure.
+          yield* Agent.Service.use((agents) =>
+            agents.transform((editor) =>
+              editor.update(helper, (agent) => {
+                agent.mode = "all"
+                agent.permissions.push({ action: SubagentTool.name, resource: "reviewer", effect: "deny" })
+              }),
+            ),
+          ).pipe(Effect.provide(scope))
+          const describeFor = (sessionID: Session.ID) =>
+            Effect.gen(function* () {
+              const event = {
+                sessionID,
+                agent: helper,
+                model: parentModel,
+                system: [],
+                messages: [],
+                options: {},
+                tools: { [SubagentTool.name]: { description: "Spawn a subagent", input: {} } },
+              } satisfies SessionHooks["context"]
+              yield* hook(event)
+              return event.tools[SubagentTool.name].description
+            })
+
+          expect(yield* describeFor(parent.id)).toContain("- reviewer:")
+          const child = yield* delegate({ as: toolIdentity.agent, agent: "helper", id: "call-helper" })
+          // Without the copy of the parent's rules, only the delegating Session's deny still hides the fallback.
+          yield* sessions.setPermissions({ sessionID: child, permissions: [] })
+          const listed = yield* describeFor(child)
+          expect(listed).not.toContain("- reviewer:")
+          expect(listed).not.toContain("- fallback:")
+          expect(listed).toContain("- helper:")
         }),
       ),
     ),

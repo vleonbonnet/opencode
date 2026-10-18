@@ -30,8 +30,11 @@ export type Name = Skill.Name
 
 export { Event } from "@opencode/schema/skill"
 
-export const available = (skills: ReadonlyArray<Info>, permissions: Permission.Ruleset) =>
-  skills.filter((skill) => Permission.evaluate("skill", skill.id, permissions).effect !== "deny")
+export const available = (
+  skills: ReadonlyArray<Info>,
+  permissions: Permission.Ruleset,
+  ceilings: ReadonlyArray<Permission.Ceiling> = [],
+) => skills.filter((skill) => Permission.decide("skill", skill.id, permissions, ceilings) !== "deny")
 
 export const toModelOutput = (skill: Info, files: ReadonlyArray<string>) => {
   const directory = path.dirname(skill.path)

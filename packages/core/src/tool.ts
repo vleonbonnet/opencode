@@ -40,7 +40,16 @@ type Data = {
 
 export interface Interface extends State.Transformable<Editor> {
   readonly list: () => Effect.Effect<ReadonlyArray<Tool.Info & { readonly id: string }>>
-  readonly snapshot: (permissions?: Permission.Ruleset) => Effect.Effect<Snapshot>
+  /**
+   * Tools for a request under the acting agent's `permissions`. `exposure` (default: those permissions) decides what
+   * is listed: a tool is left out when every ruleset wholly disables it, or when any delegation ceiling of the Session
+   * does. A listed tool the acting rules wholly disable is refused when called.
+   */
+  readonly snapshot: (
+    permissions?: Permission.Ruleset,
+    exposure?: ReadonlyArray<Permission.Ruleset>,
+    ceilings?: ReadonlyArray<Permission.Ceiling>,
+  ) => Effect.Effect<Snapshot>
 }
 
 /** A local execution result after hooks and content normalization. */
@@ -222,25 +231,37 @@ const layer = Layer.effect(
       transform: state.transform,
       reload: state.reload,
       list: () => Effect.sync(() => Array.from(state.get().tools.values())),
-      snapshot: Effect.fn("Tool.snapshot")((permissions) =>
+      snapshot: Effect.fn("Tool.snapshot")((permissions, exposure, ceilings = []) =>
         Effect.sync(() => {
           const data = state.get()
           const active = new Map<string, Tool.Info>()
           const rules = permissions ?? []
+          const listing = exposure === undefined || exposure.length === 0 ? [rules] : exposure
+          // A ceiling binds every agent of the Session, so what it disables is never listed, and so never called.
+          const hidden = (action: string) =>
+            listing.every((ruleset) => whollyDisabled(action, ruleset)) ||
+            ceilings.some((ceiling) => whollyDisabled(action, ceiling.rules))
+          // A tool listed for another agent of the Session still answers to the acting agent's rules.
+          const refused = (name: string, action: string, agent: Agent.ID) =>
+            whollyDisabled(action, rules) ? refusal(name, action, agent, rules) : undefined
           for (const [name, tool] of data.tools) {
-            if (whollyDisabled(tool.options?.permission ?? name, rules)) continue
+            if (hidden(tool.options?.permission ?? name)) continue
             active.set(name, tool)
           }
           const direct = new Map(Array.from(active).filter(([, tool]) => tool.options?.codemode === false))
           const codeModeTools = new Map(Array.from(active).filter(([, tool]) => tool.options?.codemode !== false))
           const namespaces = data.namespaces
           const codeModeInventory = { tools: codeModeTools, namespaces }
-          const codeModeEnabled = !whollyDisabled("execute", rules)
+          const codeModeEnabled = !hidden("execute")
           const codeModeTool = codeModeEnabled
             ? CodeModeTool.create(codeModeInventory, (name, tool, input, context) =>
-                beforeExecute(name, input, context).pipe(
-                  Effect.flatMap((event) => executeTool(tool, name, event.input, context)),
-                ),
+                Effect.suspend(() => {
+                  const error = refused(name, tool.options?.permission ?? name, context.agent)
+                  if (error) return Effect.fail(error)
+                  return beforeExecute(name, input, context).pipe(
+                    Effect.flatMap((event) => executeTool(tool, name, event.input, context)),
+                  )
+                }),
               )
             : undefined
           const names = Array.from(codeModeTools.keys()).join("\0")
@@ -268,14 +289,27 @@ const layer = Layer.effect(
                 id: Tool.CallID.make(input.call.id),
                 progress: input.progress ?? (() => Effect.void),
               }
+              const refusedCall = (called: string) => {
+                const requested = input.definitions?.get(called)
+                if (!requested && input.definitions) return undefined
+                const name = requested?.name ?? called
+                if (name === "execute" && codeModeTool) return refused(name, name, input.agent)
+                const tool = direct.get(name)
+                return tool && refused(name, tool.options?.permission ?? name, input.agent)
+              }
+              // Refused before the hooks run, as Code Mode refuses its calls, so no plugin hook acts on them.
+              const early = refusedCall(input.call.name)
+              if (early) return yield* early
               const event = yield* beforeExecute(input.call.name, input.call.input, context)
               const requested = input.definitions?.get(event.tool)
               // Preserve session context removal and alias resolution, now after the repair hook.
               if (!requested && input.definitions && (direct.has(event.tool) || codeModeTool?.name === event.tool))
                 return yield* new Tool.Error({ message: `Tool is not available for this request: ${event.tool}` })
+              // A hook may still repair the call into one the acting rules refuse.
+              const late = refusedCall(event.tool)
+              if (late) return yield* late
               const name = requested?.name ?? event.tool
-              if (name === "execute" && codeModeTool)
-                return yield* executeTool(codeModeTool, name, event.input, context)
+              if (name === "execute" && codeModeTool) return yield* executeTool(codeModeTool, name, event.input, context)
               const tool = direct.get(name)
               if (tool) return yield* executeTool(tool, name, event.input, context)
               return yield* new Tool.Error({
@@ -293,6 +327,17 @@ const whollyDisabled = (action: string, rules: Permission.Ruleset) => {
   const rule = rules.findLast((rule) => Wildcard.match(action, rule.action))
   return rule?.resource === "*" && rule.effect === "deny"
 }
+
+const refusal = (name: string, action: string, agent: Agent.ID, rules: Permission.Ruleset) =>
+  new Tool.Error({
+    message: `The ${agent} agent is not permitted to use ${name}`,
+    error: new Permission.BlockedError({
+      rules: rules.filter((rule) => Wildcard.match(action, rule.action)),
+      permission: action,
+      resources: ["*"],
+      reason: `The ${agent} agent is not permitted to use ${name}.`,
+    }),
+  })
 
 const formatSchemaIssue = SchemaIssue.makeFormatterDefault()
 

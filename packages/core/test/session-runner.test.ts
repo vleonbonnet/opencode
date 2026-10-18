@@ -367,8 +367,8 @@ const layer = Layer.unwrap(
       load: () => Effect.succeed(Instructions.empty),
     })
     const skillInstructions = Layer.mock(SkillInstructions.Service, {
-      load: (permissions) => {
-        // `setup` tags each agent's ruleset with a `skill` rule naming that agent.
+      load: ([permissions = []]) => {
+        // `setup` tags each agent's ruleset with a `skill` rule naming that agent; the acting agent's comes first.
         const baseline = permissions
           .filter((rule) => rule.action === "skill")
           .map((rule) => state.skillBaselines.get(Agent.ID.make(rule.resource)))
@@ -1889,6 +1889,56 @@ describe("SessionRunnerLLM", () => {
       [defaultSystem, fakeIdentity, "Build skills\n\nInitial context"],
     ])
     expect(systemTexts(s.requests[1])).toContainEqual(expect.stringContaining("Reviewer skills"))
+  })
+
+  scenario("sends plan and build the same tools while each agent's rules decide its calls", function* (s) {
+    const agents = yield* Agent.Service
+    const plan = Agent.ID.make("plan")
+    // Plan wholly denies two write tools that build allows; alone, plan's request would leave them out.
+    yield* agents.transform((editor) =>
+      editor.update(plan, (agent) => {
+        agent.mode = "primary"
+        agent.permissions.push(
+          { action: "note_write", resource: "*", effect: "deny" },
+          { action: "catalog_write", resource: "*", effect: "deny" },
+        )
+      }),
+    )
+    const registry = yield* Tool.Service
+    const writes: string[] = []
+    const writer = (name: string): ToolInfo => ({
+      name,
+      description: "Write a note",
+      input: Schema.Struct({ text: Schema.String }),
+      output: Schema.Struct({ text: Schema.String }),
+      execute: ({ text }) => Effect.sync(() => (writes.push(text), { output: { text } })),
+    })
+    yield* transformTools(registry, { note_write: writer("note_write") }, { codemode: false })
+    yield* transformTools(registry, { catalog_write: writer("catalog_write") }, { codemode: true })
+
+    yield* s.llm.push(TestLLM.tool("call-build-note", "note_write", { text: "build" }), TestLLM.stop())
+    yield* s.runPrompt("Build writes")
+    yield* s.bus.publish(SessionEvent.AgentSelected, { sessionID, agent: plan })
+    yield* s.llm.push(TestLLM.tool("call-plan-note", "note_write", { text: "plan" }), TestLLM.stop())
+    yield* s.runPrompt("Plan writes")
+
+    expect(s.requests).toHaveLength(4)
+    const [build, , planned] = s.requests
+    expect(build?.tools.map((tool) => tool.name)).toContain("note_write")
+    expect(build?.system.map((part) => part.text).join("\n")).toContain("catalog_write")
+    // Byte-identical tools and system prompt, and no instruction update: the Code Mode catalog did not change.
+    expect(planned?.tools).toEqual(build?.tools)
+    expect(planned?.system).toEqual(build?.system)
+    expect(systemTexts(planned!)).toEqual([])
+    expect(writes).toEqual(["build"])
+    expect((yield* s.context).at(-2)).toMatchObject(
+      Expected.assistant({}, [
+        Expected.failedTool(
+          { id: "call-plan-note" },
+          { error: { type: "permission.rejected", message: "The plan agent is not permitted to use note_write." } },
+        ),
+      ]),
+    )
   })
 
   scenario("keeps the sampled agent when selection changes during observation", function* (s) {
