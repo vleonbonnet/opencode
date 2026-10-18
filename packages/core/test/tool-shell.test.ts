@@ -1598,6 +1598,30 @@ describe("ShellTool", () => {
     { timeout: 15_000 },
   )
 
+  it.live("points a timed-out command at the background instead of a longer timeout", () =>
+    Effect.acquireUseRelease(
+      Effect.promise(() => tmpdir()),
+      (tmp) => {
+        reset()
+        return withSession(tmp.path, (registry) =>
+          Effect.gen(function* () {
+            const settled = yield* executeTool(registry, call({ command: idleCommand, timeout: 100 }))
+            expect(settled.status).toBe("completed")
+            expect(settled.metadata).toMatchObject({ timeout: true })
+            const text = settled.content?.map((item) => (item.type === "text" ? item.text : "")).join("\n") ?? ""
+            expect(text).toContain("Command exceeded timeout of 100 ms.")
+            expect(text).toContain("run it again with background: true and wait for the notification that it finished")
+            expect(text).toContain(
+              "Do not retry with a larger timeout or a longer sleep, and do not poll for completion",
+            )
+            expect(text).toContain("Timed out before completion")
+          }),
+        )
+      },
+      (tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]().then(() => undefined)),
+    ),
+  )
+
   it.live("returns the shell id for a background command", () =>
     Effect.acquireUseRelease(
       Effect.promise(() => tmpdir()),
@@ -1633,7 +1657,9 @@ describe("ShellTool", () => {
             expect((yield* shell.list()).map((info) => info.id)).toContain(id)
             expect((yield* shell.wait(id)).status).toBe("timeout")
             expect((yield* Fiber.join(admitted)).valueOrUndefined?.data.item.payload).toMatchObject({
-              text: expect.stringContaining("Timed out before completion"),
+              text: expect.stringMatching(
+                /Command exceeded timeout of 50 ms\. If it needs more time, run it again in the background without a timeout and wait for the notification that it finished\.\n\nTimed out before completion/,
+              ),
               description: idleCommand,
               metadata: {
                 source: "shell",
