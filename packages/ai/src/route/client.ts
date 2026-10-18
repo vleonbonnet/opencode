@@ -586,7 +586,7 @@ const compile = Effect.fn("LLM.compile")(function* (request: LLMRequest, options
   }
 })
 
-/** @internal Test-only projection of the execution compiler; not exported from package barrels. */
+/** Projection of the execution compiler: the provider-native body a request compiles to, without sending it. */
 export const compileRequest = Effect.fn("LLM.compileRequest")(function* (request: LLMRequest) {
   const compiled = yield* compile(request)
   return {
@@ -597,6 +597,33 @@ export const compileRequest = Effect.fn("LLM.compileRequest")(function* (request
     body: compiled.body,
     metadata: { transport: compiled.route.transport.id },
   }
+})
+
+/**
+ * The HTTP request a route builds for `request`, without sending it: the URL, the headers after authentication, and
+ * the body text after `http.body` overlays, uncompressed. WebSocket transports carry the same body in their frames,
+ * so this is the HTTP-equivalent form of a request that never crosses HTTP. With `authenticate: false` the route's auth
+ * does not run: no credential is loaded, refreshed or signed with, and the headers carry none, so a request can be
+ * rendered for accounting as often as needed.
+ */
+export const compileHttpRequest = Effect.fn("LLM.compileHttpRequest")(function* (
+  request: LLMRequest,
+  options?: { readonly authenticate?: boolean },
+) {
+  const resolved = prepareRequest(request)
+  const route = resolved.model.route
+  const body = yield* route.body.from(resolved)
+  const parts = yield* HttpTransport.jsonRequestParts({
+    body,
+    request: resolved,
+    endpoint: route.endpoint,
+    auth: options?.authenticate === false ? Auth.none : route.auth,
+    encodeBody: ProviderShared.encodeJson,
+  })
+  const headers: Record<string, string> = Object.fromEntries(
+    Object.entries(parts.headers).map(([name, value]) => [name, String(value)]),
+  )
+  return { url: parts.url, headers, body: parts.bodyText }
 })
 
 const streamRequestWith = (runtime: TransportRuntime) => (request: LLMRequest, options?: StreamOptions) =>
@@ -689,6 +716,8 @@ export const Route = { make } as const
 export const LLMClient = {
   canCompact,
   compact,
+  compileRequest,
+  compileHttpRequest,
   Service,
   layer,
   stream,
