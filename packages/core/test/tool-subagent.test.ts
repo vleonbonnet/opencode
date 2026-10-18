@@ -207,6 +207,72 @@ const withSubagent = (location: Location.Ref) =>
     ).pipe(Effect.provide(locations.get(location)))
   })
 
+const planAgent = Agent.ID.make("plan")
+
+/** A parent Session with helpers to delegate from it (or its descendants) and to read a Session's decisions. */
+const planDelegation = (
+  directory: string,
+  input: {
+    readonly permissions?: Permission.Ruleset
+    readonly plan: Permission.Ruleset
+    readonly subagents?: Readonly<Record<string, Permission.Ruleset>>
+  },
+) =>
+  Effect.gen(function* () {
+    const location = Location.Ref.make({ directory: AbsolutePath.make(directory) })
+    const sessions = yield* Session.Service
+    const parent = yield* sessions.create({ location, model: parentModel, permissions: input.permissions })
+    yield* withSubagent(parent.location)
+    const locations = yield* LocationServiceMap.Service
+    const scope = locations.get(parent.location)
+    yield* Agent.Service.use((agents) =>
+      agents.transform((editor) => {
+        editor.update(planAgent, (agent) => {
+          agent.mode = "primary"
+          agent.permissions.push(...input.plan)
+        })
+        for (const [id, permissions] of Object.entries(input.subagents ?? {}))
+          editor.update(Agent.ID.make(id), (agent) => {
+            agent.mode = "subagent"
+            agent.permissions.push(...permissions)
+          })
+      }),
+    ).pipe(Effect.provide(scope))
+    const registry = yield* Tool.Service.pipe(Effect.provide(scope))
+    const permission = yield* Permission.Service.pipe(Effect.provide(scope))
+    const delegate = (call: {
+      readonly from?: Session.ID
+      readonly as: Agent.ID
+      readonly agent: string
+      readonly id: string
+      readonly sessionID?: Session.ID
+    }) =>
+      executeTool(registry, {
+        sessionID: call.from ?? parent.id,
+        ...toolIdentity,
+        agent: call.as,
+        call: {
+          type: "tool-call",
+          id: call.id,
+          name: SubagentTool.name,
+          input: {
+            agent: call.agent,
+            description: "review",
+            prompt: "review this",
+            ...(call.sessionID === undefined ? {} : { sessionID: call.sessionID }),
+          },
+        },
+      }).pipe(
+        Effect.map((result) => {
+          expect(result).toMatchObject({ status: "completed" })
+          return outputSessionID(result.metadata)
+        }),
+      )
+    const decide = (sessionID: Session.ID, action: string, resource: string) =>
+      permission.ask({ sessionID, action, resources: [resource], save: [] }).pipe(Effect.map((result) => result.effect))
+    return { parent, sessions, scope, delegate, decide }
+  })
+
 describe("SubagentTool", () => {
   completionIt.live("admits one durable completion across live delivery and restart replay", () =>
     Effect.acquireRelease(
@@ -515,6 +581,148 @@ describe("SubagentTool", () => {
             ),
           ).toEqual(["You are a subagent spawned by another session.\nreview this", "continue this"])
           expect(second.content).toEqual([{ type: "text", text: completedOutput(childID) }])
+        }),
+      ),
+    ),
+  )
+
+  it.live("holds plan-delegated children to plan's decision wherever rules overlap", () =>
+    Effect.acquireRelease(
+      Effect.promise(() => tmpdir()),
+      (dir) => Effect.promise(() => dir[Symbol.asyncDispose]()),
+    ).pipe(
+      Effect.flatMap((dir) =>
+        Effect.gen(function* () {
+          const plans = path.join(dir.path, "plans")
+          const guard: Permission.Rule = { action: "shell", resource: "rm *", effect: "deny" }
+          const { delegate, decide } = yield* planDelegation(dir.path, {
+            permissions: [guard],
+            plan: [
+              // Which subagents plan may launch does not bind what the subagent may launch.
+              { action: "subagent", resource: "*", effect: "deny" },
+              { action: "subagent", resource: "reviewer", effect: "allow" },
+              { action: "subagent", resource: "keeper", effect: "allow" },
+              { action: "edit", resource: "*", effect: "deny" },
+              { action: "edit", resource: path.join(plans, "*"), effect: "allow" },
+              { action: "edit", resource: "keys/*", effect: "allow" },
+              { action: "edit", resource: "*.pem", effect: "deny" },
+              { action: "shell", resource: "*", effect: "deny" },
+              { action: "shell", resource: "cat *", effect: "allow" },
+              { action: "shell", resource: "*>*", effect: "deny" },
+            ],
+            subagents: {
+              keeper: [
+                { action: "edit", resource: "*", effect: "deny" },
+                { action: "edit", resource: "keys/*", effect: "allow" },
+              ],
+            },
+          })
+
+          const general = yield* delegate({ as: planAgent, agent: "reviewer", id: "call-general" })
+          expect(yield* decide(general, "edit", path.join(dir.path, "src", "app.ts"))).toBe("deny")
+          expect(yield* decide(general, "edit", path.join(plans, "next.md"))).toBe("allow")
+          expect(yield* decide(general, "read", path.join(dir.path, "README.md"))).toBe("allow")
+          expect(yield* decide(general, "shell", "rm -rf src")).toBe("deny")
+          expect(yield* decide(general, "shell", "cat a")).toBe("allow")
+          expect(yield* decide(general, "shell", "ls")).toBe("deny")
+          // Plan's cat exception overlaps its redirect deny without containing it; plan denies the redirect.
+          expect(yield* decide(general, "shell", "cat a > b")).toBe("deny")
+          expect(yield* decide(general, SubagentTool.name, "explore")).toBe("allow")
+
+          const keeper = yield* delegate({ as: planAgent, agent: "keeper", id: "call-keeper" })
+          expect(yield* decide(keeper, "edit", "keys/notes.md")).toBe("allow")
+          expect(yield* decide(keeper, "edit", path.join(plans, "next.md"))).toBe("deny")
+          // The subagent's exception and plan's allow both cover the key, but plan denies it as a .pem file.
+          expect(yield* decide(keeper, "edit", "keys/server.pem")).toBe("deny")
+        }),
+      ),
+    ),
+  )
+
+  it.live("holds every descendant of a plan delegation to plan's current rules", () =>
+    Effect.acquireRelease(
+      Effect.promise(() => tmpdir()),
+      (dir) => Effect.promise(() => dir[Symbol.asyncDispose]()),
+    ).pipe(
+      Effect.flatMap((dir) =>
+        Effect.gen(function* () {
+          yield* Effect.promise(() =>
+            Bun.write(path.join(dir.path, "opencode.json"), JSON.stringify({ experimental: { subagent_depth: 2 } })),
+          )
+          const scout = Agent.ID.make("scout")
+          const { delegate, decide, sessions, scope } = yield* planDelegation(dir.path, {
+            plan: [
+              { action: "edit", resource: "*", effect: "deny" },
+              { action: "notes_write", resource: "*", effect: "deny" },
+            ],
+            // A read-only subagent that may launch subagents of its own.
+            subagents: {
+              scout: [
+                { action: "edit", resource: "*", effect: "deny" },
+                { action: SubagentTool.name, resource: "*", effect: "allow" },
+              ],
+            },
+          })
+          const source = path.join(dir.path, "src", "app.ts")
+
+          const child = yield* delegate({ as: planAgent, agent: "scout", id: "call-scout" })
+          const grandchild = yield* delegate({ from: child, as: scout, agent: "reviewer", id: "call-nested" })
+          expect(yield* decide(grandchild, "edit", source)).toBe("deny")
+          expect(yield* decide(grandchild, "notes_write", "*")).toBe("deny")
+          expect(yield* decide(grandchild, "read", path.join(dir.path, "README.md"))).toBe("allow")
+
+          // Reloading the child's agent with looser rules does not loosen plan's.
+          yield* Agent.Service.use((agents) =>
+            agents.transform((editor) =>
+              editor.update(scout, (agent) => {
+                agent.permissions.push({ action: "edit", resource: "*", effect: "allow" })
+              }),
+            ),
+          ).pipe(Effect.provide(scope))
+          expect(yield* decide(child, "edit", source)).toBe("deny")
+          // Neither does switching the child to an agent that allows edits outside the subagent tool.
+          yield* sessions.switchAgent({ sessionID: child, agent: Agent.ID.make("reviewer") })
+          expect(yield* decide(child, "edit", source)).toBe("deny")
+          expect(yield* decide(child, "notes_write", "*")).toBe("deny")
+        }),
+      ),
+    ),
+  )
+
+  it.live("keeps host-set child rules and plan's ceiling whoever continues the child", () =>
+    Effect.acquireRelease(
+      Effect.promise(() => tmpdir()),
+      (dir) => Effect.promise(() => dir[Symbol.asyncDispose]()),
+    ).pipe(
+      Effect.flatMap((dir) =>
+        Effect.gen(function* () {
+          const guard: Permission.Rule = { action: "shell", resource: "rm *", effect: "deny" }
+          const { parent, delegate, decide, sessions } = yield* planDelegation(dir.path, {
+            permissions: [guard],
+            plan: [{ action: "edit", resource: "*", effect: "deny" }],
+          })
+          const source = path.join(dir.path, "src", "app.ts")
+          const child = yield* delegate({ as: planAgent, agent: "reviewer", id: "call-plan" })
+          const host: Permission.Rule = { action: "webfetch", resource: "*", effect: "deny" }
+          yield* sessions.setPermissions({ sessionID: child, permissions: [host] })
+
+          // Build continuing the child neither replaces the host's rules nor lifts plan's.
+          yield* delegate({ as: toolIdentity.agent, agent: "reviewer", id: "call-build", sessionID: child })
+          expect((yield* sessions.get(child)).permissions).toEqual([host])
+          expect(yield* decide(child, "edit", source)).toBe("deny")
+          expect(yield* decide(child, "webfetch", "https://example.com")).toBe("deny")
+          // The parent session's deny still binds the child after the host replaced the child's rules.
+          expect(yield* decide(child, "shell", "rm -rf src")).toBe("deny")
+          expect(yield* decide(child, "shell", "git status")).toBe("allow")
+
+          yield* delegate({ as: planAgent, agent: "reviewer", id: "call-plan-again", sessionID: child })
+          expect((yield* sessions.get(child)).permissions).toEqual([host])
+          expect(yield* decide(child, "edit", source)).toBe("deny")
+          // Each delegating Session and agent is recorded once, in order.
+          expect((yield* sessions.get(child)).delegators).toEqual([
+            { sessionID: parent.id, agent: planAgent },
+            { sessionID: parent.id, agent: toolIdentity.agent },
+          ])
         }),
       ),
     ),

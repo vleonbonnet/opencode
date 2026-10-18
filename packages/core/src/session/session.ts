@@ -86,6 +86,19 @@ export const make = Effect.fn("Session.make")(function* () {
     yield* get(sessionID)
     yield* bus.publish(SessionEvent.Permissions, { sessionID, permissions: input.permissions })
   })
+  const delegate = Effect.fn("Session.delegate")(function* (
+    sessionID: SessionSchema.ID,
+    input: { delegator: SessionSchema.Delegator },
+  ) {
+    const session = yield* get(sessionID)
+    if (
+      session.delegators?.some(
+        (item) => item.sessionID === input.delegator.sessionID && item.agent === input.delegator.agent,
+      )
+    )
+      return
+    yield* bus.publish(SessionEvent.Delegated, { sessionID, delegator: input.delegator })
+  })
   const switchAgent = Effect.fn("Session.switchAgent")(function* (
     sessionID: SessionSchema.ID,
     input: { agent: Agent.ID },
@@ -350,6 +363,7 @@ export const make = Effect.fn("Session.make")(function* () {
     rename,
     setMetadata,
     setPermissions,
+    delegate,
     switchAgent,
     switchModel,
     inbox,
@@ -374,6 +388,7 @@ export const make = Effect.fn("Session.make")(function* () {
     const rename = operations.rename.bind(undefined, sessionID)
     const setMetadata = operations.setMetadata.bind(undefined, sessionID)
     const setPermissions = operations.setPermissions.bind(undefined, sessionID)
+    const delegate = operations.delegate.bind(undefined, sessionID)
     const switchAgent = operations.switchAgent.bind(undefined, sessionID)
     const switchModel = operations.switchModel.bind(undefined, sessionID)
     const inbox = operations.inbox.bind(undefined, sessionID)
@@ -401,6 +416,7 @@ export const make = Effect.fn("Session.make")(function* () {
       rename,
       setMetadata,
       setPermissions,
+      delegate,
       switchAgent,
       switchModel,
       inbox,

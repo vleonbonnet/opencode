@@ -15,9 +15,13 @@ import { Permission } from "./permission.js"
 import { TokenUsage } from "./token-usage.js"
 import { Revert } from "./session-revert.js"
 import { SessionFork } from "./session-fork.js"
+import { SessionDelegator } from "./session-delegator.js"
 
 export const ID = SessionID
 export type ID = SessionID
+
+export const Delegator = SessionDelegator.Info
+export type Delegator = SessionDelegator.Info
 
 export const Metadata = SessionMetadata
 export type Metadata = SessionMetadata
@@ -56,6 +60,11 @@ export const Info = Schema.Struct({
   metadata: Metadata.pipe(optional),
   /** Evaluated after the agent's rules; the last matching rule wins. */
   permissions: Permission.Ruleset.pipe(optional),
+  /**
+   * Who launched or continued this Session through the subagent tool, oldest first and never shortened. Each delegator,
+   * and each one recorded on an ancestor, bounds what this Session may do.
+   */
+  delegators: Schema.Array(Delegator).pipe(optional),
   revert: Revert.pipe(optional),
 }).annotate({ identifier: "Session.Info" })
 

@@ -362,6 +362,8 @@ export type PermissionRule = { action: string; resource: string; effect: Permiss
 
 export type PluginInfo = { id?: string; source: PluginSource; features: PluginFeatures; state: PluginState }
 
+export type SessionDelegator = { sessionID: SessionID; agent: AgentID }
+
 export type SessionForkBoundary =
   | { type: "before"; messageID: SessionMessageID }
   | { type: "through"; messageID: SessionMessageID }
@@ -1014,6 +1016,16 @@ export type SessionMetadataUpdated = {
   durable: { aggregateID: string; seq: EventSeq; version: 1 }
   location?: LocationRef
   data: { sessionID: SessionID; metadata: SessionMetadata }
+}
+
+export type SessionDelegated = {
+  id: EventID
+  created: number
+  metadata?: { [x: string]: any }
+  type: "session.delegated"
+  durable: { aggregateID: string; seq: EventSeq; version: 1 }
+  location?: LocationRef
+  data: { sessionID: SessionID; delegator: SessionDelegator }
 }
 
 export type SessionViewed = {
@@ -2120,6 +2132,7 @@ export type SessionInfo = {
   subpath?: RelativePath
   metadata?: SessionMetadata
   permissions?: PermissionRuleset
+  delegators?: Array<SessionDelegator>
   revert?: SessionRevert
   location: LocationPublicRef
 }
@@ -2143,6 +2156,7 @@ export type SessionCreated = {
     model?: ModelRef
     metadata?: SessionMetadata
     permissions?: PermissionRuleset
+    delegators?: Array<SessionDelegator>
     version: string
   }
 }
@@ -2514,6 +2528,7 @@ export type SessionEventDurable =
   | SessionRenamed
   | SessionMetadataUpdated
   | SessionPermissions
+  | SessionDelegated
   | SessionViewed
   | SessionDeleted
   | SessionForked
@@ -2577,6 +2592,7 @@ export type V2Event =
   | SessionRenamed
   | SessionMetadataUpdated
   | SessionPermissions
+  | SessionDelegated
   | SessionViewed
   | SessionUsageUpdated
   | SessionDeleted
@@ -3233,6 +3249,7 @@ export type SessionImportInput = {
         readonly resource: string
         readonly effect: "allow" | "deny" | "ask"
       }>
+      readonly delegators?: ReadonlyArray<{ readonly sessionID: string; readonly agent: string }>
       readonly revert?: {
         readonly messageID: string
         readonly partID?: string
@@ -3576,6 +3593,7 @@ export type SessionImportInput = {
         readonly resource: string
         readonly effect: "allow" | "deny" | "ask"
       }>
+      readonly delegators?: ReadonlyArray<{ readonly sessionID: string; readonly agent: string }>
       readonly revert?: {
         readonly messageID: string
         readonly partID?: string
@@ -3919,6 +3937,7 @@ export type SessionImportInput = {
         readonly resource: string
         readonly effect: "allow" | "deny" | "ask"
       }>
+      readonly delegators?: ReadonlyArray<{ readonly sessionID: string; readonly agent: string }>
       readonly revert?: {
         readonly messageID: string
         readonly partID?: string

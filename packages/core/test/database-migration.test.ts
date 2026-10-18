@@ -21,6 +21,7 @@ import executionClaimsMigration from "@opencode/core/database/migration/20260811
 import sessionInboxMigration from "@opencode/core/database/migration/20260812181746_session_inbox"
 import sessionViewedStateMigration from "@opencode/core/database/migration/20260819222447_session_viewed_state"
 import azureCliCredentialMigration from "@opencode/core/database/migration/20261007190000_azure_cli_external_credential"
+import sessionDelegatorsMigration from "@opencode/core/database/migration/20261019044242_session_delegators"
 import { Global } from "@opencode/util/global"
 
 const run = <A, E>(
@@ -209,6 +210,26 @@ describe("DatabaseMigration", () => {
           time_idle: null,
           time_viewed: null,
           idle_outcome: null,
+        })
+        expect(yield* db.get(sql`SELECT count(*) AS count FROM migration`)).toEqual({ count: 1 })
+      }),
+    )
+  })
+
+  test("adds no delegators to existing sessions", async () => {
+    await run(
+      Effect.gen(function* () {
+        const db = yield* makeDb
+        yield* db.run(sql`CREATE TABLE session_v2 (id text PRIMARY KEY, title text)`)
+        yield* db.run(sql`INSERT INTO session_v2 (id, title) VALUES ('ses_existing', 'Existing')`)
+
+        yield* DatabaseMigration.applyOnly(db, [sessionDelegatorsMigration])
+        yield* DatabaseMigration.applyOnly(db, [sessionDelegatorsMigration])
+
+        expect(yield* db.get(sql`SELECT id, title, delegators FROM session_v2`)).toEqual({
+          id: "ses_existing",
+          title: "Existing",
+          delegators: null,
         })
         expect(yield* db.get(sql`SELECT count(*) AS count FROM migration`)).toEqual({ count: 1 })
       }),

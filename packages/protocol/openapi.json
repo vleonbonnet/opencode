@@ -18359,6 +18359,19 @@
         "required": ["_tag", "message"],
         "additionalProperties": false
       },
+      "Session.Delegator": {
+        "type": "object",
+        "properties": {
+          "sessionID": {
+            "$ref": "#/components/schemas/Session.ID"
+          },
+          "agent": {
+            "$ref": "#/components/schemas/Agent.ID"
+          }
+        },
+        "required": ["sessionID", "agent"],
+        "additionalProperties": false
+      },
       "Session.ForkBoundary": {
         "anyOf": [
           {
@@ -18689,6 +18702,12 @@
           },
           "permissions": {
             "$ref": "#/components/schemas/Permission.Ruleset"
+          },
+          "delegators": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Session.Delegator"
+            }
           },
           "revert": {
             "$ref": "#/components/schemas/Session.Revert"

@@ -744,6 +744,16 @@ export function createData(config: CreateDataInput) {
         if (store.session.info[event.data.sessionID])
           setStore("session", "info", event.data.sessionID, "permissions", event.data.permissions)
         return
+      case "session.delegated": {
+        const delegators = store.session.info[event.data.sessionID]?.delegators ?? []
+        const { sessionID, agent } = event.data.delegator
+        if (
+          store.session.info[event.data.sessionID] &&
+          !delegators.some((item) => item.sessionID === sessionID && item.agent === agent)
+        )
+          setStore("session", "info", event.data.sessionID, "delegators", [...delegators, event.data.delegator])
+        return
+      }
       case "session.moved": {
         const current = store.session.info[event.data.sessionID]
         if (current) {

@@ -166,9 +166,19 @@ export const Plugin = {
                   message: `Session ${existing.id} is not a child of the current session`,
                 })
               const override = input.model === undefined ? undefined : yield* resolveModel(input.model)
+              // The child, and every Session below it, answers to each agent that delegates to it, so plan mode is not
+              // bypassed through a subagent whose own rules allow more. A continuation records it before the child runs.
+              const delegator = { sessionID: context.sessionID, agent: context.agent }
               // Continuing with a different agent switches the child, mirroring create semantics
               // where an explicit model wins over the agent's configured model, which wins over the inherited one.
               if (existing !== undefined) {
+                yield* sessions
+                  .delegate({ sessionID: existing.id, delegator })
+                  .pipe(
+                    Effect.mapError(
+                      (error) => new ToolFailure({ message: `Failed to delegate to subagent: ${existing.id}`, error }),
+                    ),
+                  )
                 const switched = existing.agent !== agent.id
                 const model = override ?? (switched ? agent.model : undefined)
                 yield* Effect.all([
@@ -190,6 +200,7 @@ export const Plugin = {
                     title: input.description,
                     agent: Agent.ID.make(input.agent),
                     model,
+                    delegators: [delegator],
                   })
                   .pipe(
                     Effect.mapError(

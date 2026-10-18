@@ -461,6 +461,7 @@ const layer = Layer.effectDiscard(
             model: event.data.model,
             metadata: event.data.metadata,
             permission: event.data.permissions,
+            delegators: event.data.delegators,
             version: event.data.version,
             time_created: event.created,
             time_updated: event.created,
@@ -597,6 +598,26 @@ const layer = Layer.effectDiscard(
         .where(eq(SessionTable.id, event.data.sessionID))
         .run()
         .pipe(Effect.orDie),
+    )
+    yield* bus.project(SessionEvent.Delegated, (event) =>
+      Effect.gen(function* () {
+        const row = yield* db
+          .select({ delegators: SessionTable.delegators })
+          .from(SessionTable)
+          .where(eq(SessionTable.id, event.data.sessionID))
+          .get()
+          .pipe(Effect.orDie)
+        if (!row) return
+        const { sessionID, agent } = event.data.delegator
+        const delegators = row.delegators ?? []
+        if (delegators.some((item) => item.sessionID === sessionID && item.agent === agent)) return
+        yield* db
+          .update(SessionTable)
+          .set({ delegators: [...delegators, event.data.delegator], time_updated: event.created })
+          .where(eq(SessionTable.id, event.data.sessionID))
+          .run()
+          .pipe(Effect.orDie)
+      }),
     )
     yield* bus.project(SessionEvent.Viewed, (event) => {
       const idle = event.data.idle

@@ -27,6 +27,7 @@ const permission = Layer.succeed(
       return Effect.void
     },
     reply: () => Effect.void,
+    ceilings: () => Effect.succeed([]),
     get: () => Effect.succeed(undefined),
     forSession: () => Effect.succeed([]),
     list: () => Effect.succeed([]),
