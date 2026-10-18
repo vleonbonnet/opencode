@@ -2565,11 +2565,18 @@ describe("SessionRunnerLLM", () => {
           "generation",
           "providerOptions",
           "toolChoice",
-          "cache",
           "promptCacheKey",
           "http",
         ] as const)
           expect(compact[field]).toEqual(normal[field])
+        // Compaction keeps the turn's breakpoints, so it reads the turn's cache, at the default TTL: the next turn
+        // starts from the summary, so a one-hour write of the compaction prompt would never be read.
+        expect(normal.cache).toEqual(
+          route === AnthropicMessages.route
+            ? { tools: true, system: true, messages: { tail: 1 }, ttlSeconds: 3600 }
+            : undefined,
+        )
+        expect(compact.cache).toBeUndefined()
         expect(compact.toolChoice).toBeUndefined()
         expect(compact.system.map((part) => part.text)).toContain("Review the project carefully.")
         expect(requestAgents[2]).toBe(agentID)

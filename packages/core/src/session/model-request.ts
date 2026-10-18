@@ -1,6 +1,7 @@
 export * as SessionModelRequest from "./model-request.js"
 
 import {
+  type CachePolicyObject,
   GenerationOptions,
   type GenerationOptionsFields,
   HttpOptions,
@@ -11,6 +12,8 @@ import {
   Message,
   SystemPart,
 } from "@opencode/ai"
+import { AnthropicMessages } from "@opencode/ai/protocols/anthropic-messages"
+import { BedrockCache } from "@opencode/ai/protocols/utils/bedrock-cache"
 import type { StreamOptions } from "@opencode/ai/route"
 import type {
   SessionCompaction,
@@ -215,6 +218,40 @@ export const boundImages = (messages: LLMRequest["messages"]) => {
   })
 }
 
+// The auto placement (last tool, first and last system parts, conversation tail) with a one-hour TTL.
+const ONE_HOUR_CACHE: CachePolicyObject = { tools: true, system: true, messages: { tail: 1 }, ttlSeconds: 3600 }
+
+// Vercel's gateway wraps the Anthropic Messages protocol under its own protocol ID.
+const speaksAnthropicMessages = (model: LanguageModel) =>
+  model.route.protocol === AnthropicMessages.protocol.id || model.route.id === "vercel-ai-gateway-messages"
+
+// Bedrock caches some older Claude releases for five minutes only, and the oldest not at all.
+const takesOneHour = (model: LanguageModel) => {
+  if (!model.id.includes("anthropic.claude-")) return true
+  const bedrock = BedrockCache.breakpoints(model)
+  return bedrock.supported && bedrock.ttl1h
+}
+
+/**
+ * Claude prompt caches behind Anthropic Messages (Anthropic, GitHub Copilot, Vertex, Bedrock Mantle and the Anthropic
+ * gateways) honour a one-hour TTL, so a short break no longer re-sends the whole conversation. A one-hour write costs
+ * 2x base input instead of 1.25x, which pays off only for a root Session's own turns: auxiliary requests and child
+ * Sessions run once or back to back, so their entries rarely sit five idle minutes before a reuse. Other models on the
+ * protocol keep the default TTL their endpoints are known to take.
+ */
+export const cachePolicy = (
+  model: LanguageModel,
+  kind: SessionRequestKind,
+  session: SessionSchema.Info,
+): CachePolicyObject | undefined =>
+  kind === "primary" &&
+  session.parentID === undefined &&
+  speaksAnthropicMessages(model) &&
+  /claude/i.test(model.id) &&
+  takesOneHour(model)
+    ? ONE_HOUR_CACHE
+    : undefined
+
 type Definitions = PluginHooks.Domains["session"]["context"]["tools"]
 
 /** Builds the model request for each session flow. Each entry runs its own plugin hook. */
@@ -293,6 +330,7 @@ export const layer = Layer.effect(
         },
         // TODO: Persist cache lineage so nested forks reuse the root session's cache key.
         promptCacheKey: /^ses_[0-9a-f]{64}$/.test(affinity) ? affinity.slice(4) : affinity,
+        cache: cachePolicy(model.model, kind, session),
         system: shaped.system,
         messages: boundImages(unsupportedParts(shaped.messages, model.capabilities, model.model.provider)),
         tools: Array.from(hooked, ([name, t]) => ({ ...t, name })),
