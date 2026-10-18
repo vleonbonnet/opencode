@@ -395,6 +395,10 @@ const requestSchema = Schema.Struct({
   cache: Schema.optional(CachePolicy),
   // Stable cache affinity for protocols that support provider-managed prompt caching.
   promptCacheKey: Schema.optional(Schema.String),
+  // What a provider that binds thinking signatures to the prompt prefix does with a replayed block whose prefix
+  // changed: reject the request ("error") or drop the block ("drop_block", the default where binding applies).
+  // Protocols without thinking binding ignore it; an explicit binding in provider options still wins.
+  thinkingPrefixMismatch: Schema.optional(Schema.Literals(["error", "drop_block"])),
   metadata: Schema.optional(Schema.Record(Schema.String, Schema.Unknown)),
 })
 
@@ -427,6 +431,7 @@ export namespace LLMRequest {
     http: request.http,
     cache: request.cache,
     promptCacheKey: request.promptCacheKey,
+    thinkingPrefixMismatch: request.thinkingPrefixMismatch,
     metadata: request.metadata,
   })
 

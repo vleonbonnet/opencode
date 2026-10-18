@@ -483,14 +483,15 @@ const isThinkingDisabled = Schema.is(
   }),
 )
 
-// Claude 5.1+ binds each thinking signature to the prefix above it. Ask Bedrock to drop the affected blocks instead of
-// failing when that prefix changes. `http.body` overlays this field by field, so callers can still override it.
+// Claude 5.1+ binds each thinking signature to the prefix above it. Unless the request asks to fail
+// (`thinkingPrefixMismatch: "error"`), ask Bedrock to drop the affected blocks when that prefix changes. `http.body`
+// overlays this field by field, so callers can still override it.
 const applyThinkingBindingDefault = (request: LLMRequest, thinking: Readonly<Record<string, unknown>> | undefined) => {
   if (isThinkingDisabled(request.http?.body)) return thinking
   if (!supportsThinkingBlockBinding(request.model)) return thinking
   return {
     ...(thinking ?? { type: "adaptive" as const }),
-    block_binding: { prefix_mismatch_behavior: "drop_block" },
+    block_binding: { prefix_mismatch_behavior: request.thinkingPrefixMismatch ?? "drop_block" },
   }
 }
 
