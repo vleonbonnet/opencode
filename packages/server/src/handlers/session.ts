@@ -319,6 +319,7 @@ export const SessionHandler = HttpApiBuilder.group(Api, "server.session", (handl
               files: ctx.payload.files,
               agents: ctx.payload.agents,
               skills: ctx.payload.skills,
+              metadata: ctx.payload.metadata,
               delivery: ctx.payload.delivery,
             })
             .pipe(
@@ -342,6 +343,32 @@ export const SessionHandler = HttpApiBuilder.group(Api, "server.session", (handl
               locationErrors,
             )
           return HttpApiSchema.NoContent.make()
+        }),
+      )
+      .handle(
+        "session.preflight",
+        Effect.fn(function* (ctx) {
+          return {
+            data: yield* session.preflight({ sessionID: ctx.params.sessionID, ...ctx.payload }).pipe(
+              Effect.catchTag("Session.NotFoundError", missingSession),
+              Effect.catchTag("Session.AttachmentError", (error) =>
+                Effect.fail(new InvalidRequestError({ message: error.message, field: "files" })),
+              ),
+              Effect.catchTag("SessionPreflight.InvalidInputError", (error) =>
+                Effect.fail(new InvalidRequestError({ message: error.message, field: error.field })),
+              ),
+              locationErrors,
+            ),
+          }
+        }),
+      )
+      .handle(
+        "session.thinking",
+        Effect.fn(function* (ctx) {
+          const dropped = yield* session
+            .thinking(ctx.params.sessionID)
+            .pipe(Effect.catchTag("Session.NotFoundError", missingSession))
+          return { data: { dropped } }
         }),
       )
       .handle(

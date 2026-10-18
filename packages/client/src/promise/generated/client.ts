@@ -45,6 +45,10 @@ import type {
   SessionPromptOutput,
   SessionCommandInput,
   SessionCommandOutput,
+  SessionPreflightInput,
+  SessionPreflightOutput,
+  SessionThinkingInput,
+  SessionThinkingOutput,
   SessionSkillInput,
   SessionSkillOutput,
   SessionSyntheticInput,
@@ -747,6 +751,7 @@ export function make(options: ClientOptions) {
               files: input["files"],
               agents: input["agents"],
               skills: input["skills"],
+              metadata: input["metadata"],
               delivery: input["delivery"],
             },
             successStatus: 204,
@@ -755,6 +760,35 @@ export function make(options: ClientOptions) {
           },
           requestOptions,
         ),
+      preflight: (input: SessionPreflightInput, requestOptions?: RequestOptions) =>
+        request<{ readonly data: SessionPreflightOutput }>(
+          {
+            method: "POST",
+            path: `/api/experimental/session/${encodeURIComponent(input.sessionID)}/preflight`,
+            body: {
+              text: input["text"],
+              files: input["files"],
+              command: input["command"],
+              agent: input["agent"],
+              model: input["model"],
+            },
+            successStatus: 200,
+            declaredStatuses: [400, 401, 404],
+            empty: false,
+          },
+          requestOptions,
+        ).then((value) => value.data),
+      thinking: (input: SessionThinkingInput, requestOptions?: RequestOptions) =>
+        request<{ readonly data: SessionThinkingOutput }>(
+          {
+            method: "GET",
+            path: `/api/experimental/session/${encodeURIComponent(input.sessionID)}/thinking`,
+            successStatus: 200,
+            declaredStatuses: [400, 401, 404],
+            empty: false,
+          },
+          requestOptions,
+        ).then((value) => value.data),
       skill: (input: SessionSkillInput, requestOptions?: RequestOptions) =>
         request<SessionSkillOutput>(
           {
