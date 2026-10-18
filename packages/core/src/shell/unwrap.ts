@@ -296,6 +296,12 @@ const SCRIPT: Grammar = {
   none: ["-p", ...HELP],
 }
 
+const CRONTAB: Grammar = {
+  values: ["-u"],
+  flags: ["-s"],
+  none: ["-l", "-e", "-r", "-i", "-n", "-T", "-c", "-V"],
+}
+
 const FISH: Grammar = {
   values: [
     ...["-c", "--command", "-C", "--init-command", "-d", "--debug", "-o", "--debug-output", "-f", "--features"],
@@ -325,6 +331,44 @@ const SHELLS: Record<string, Dialect> = {
 }
 const SHELL_LONG_VALUES = new Set(["--init-file", "--rcfile", "--emulate"])
 const POWERSHELLS = new Set(["pwsh", "powershell", "pwsh-preview"])
+const NON_POSIX_SHELLS = new Set(["fish", "csh", "tcsh", "cmd", ...POWERSHELLS])
+
+// Interpreters that read their program from their input unless an `inline` option gives it or, for those whose
+// operand is a program `file`, a file is named; `values` take the next word.
+type Interpreter = { inline: readonly string[]; values?: readonly string[]; file: boolean }
+const INTERPRETERS: Record<string, Interpreter> = {
+  python: { inline: ["-c", "-m"], values: ["-W", "-X"], file: true },
+  node: {
+    inline: ["-e", "--eval", "-p", "--print"],
+    values: ["-r", "--require", "--import", "--loader", "--experimental-loader", "-C", "--conditions", "--env-file"],
+    file: true,
+  },
+  perl: { inline: ["-e", "-E"], values: ["-I"], file: true },
+  ruby: { inline: ["-e"], values: ["-I", "-r"], file: true },
+  php: { inline: ["-r", "-R", "-B", "-E", "-F", "-f"], values: ["-c", "-d", "-z"], file: true },
+  lua: { inline: ["-e"], values: ["-l"], file: true },
+  osascript: { inline: ["-e"], values: ["-l", "-s"], file: true },
+  Rscript: { inline: ["-e"], file: true },
+  psql: {
+    inline: ["-c", "--command"],
+    values: [
+      ...["-d", "--dbname", "-h", "--host", "-p", "--port", "-U", "--username", "-v", "--set", "--variable", "-o"],
+      ...["--output", "-L", "--log-file", "-T", "--table-attr", "-F", "--field-separator", "-R", "-P", "--pset"],
+    ],
+    file: false,
+  },
+  mysql: { inline: ["-e", "--execute"], file: false },
+  mariadb: { inline: ["-e", "--execute"], file: false },
+  sqlite3: { inline: [], file: false },
+  mongosh: { inline: ["--eval", "-f", "--file"], file: false },
+  mongo: { inline: ["--eval"], file: false },
+  "redis-cli": { inline: [], file: false },
+}
+const INTERPRETER_ALIASES: Array<[RegExp, string]> = [
+  [/^(?:python|pypy)[0-9.]*$/, "python"],
+  [/^nodejs$/, "node"],
+  [/^lua[0-9.]*$/, "lua"],
+]
 
 const FIND_EXECS = new Set(["-exec", "-execdir", "-ok", "-okdir"])
 
@@ -1167,6 +1211,304 @@ export function renamed(item: View): View | undefined {
 export function words(item: View) {
   const written = [item.program, ...item.args]
   return written.some(dynamic) ? written : written.map(literal)
+}
+
+// What a command runs as a file: a shell's script file or a sourced file, in the DIALECT of the shell reading it; an
+// interpreter's program file; or a program named by its path, whose first line decides how it runs.
+export type Execution = { path: string } & ({ dialect: Dialect } | { interpreter: true } | { program: true })
+
+export function executes(item: View, dialect: Dialect): Execution | undefined {
+  const name = item.name.toLowerCase()
+  if (SHELLS[name]) {
+    const call = shell(item, SHELLS[name])
+    return call.file && !call.input ? { path: call.file, dialect: SHELLS[name] } : undefined
+  }
+  if (name === "." || name === "source")
+    return item.args[0] && !dynamic(item.args[0]) ? { path: literal(item.args[0]), dialect } : undefined
+  const interpreter = interpreterOf(name)
+  if (interpreter?.file) {
+    const file = interpreterOperand(item.args, interpreter)?.file
+    return file === undefined ? undefined : { path: file, interpreter: true }
+  }
+  if (!dynamic(item.program) && literal(item.program).includes("/"))
+    return { path: literal(item.program), program: true }
+}
+
+// How a script file runs, from its first line: by a POSIX-family shell, in its dialect, or by another program.
+export function shebang(body: string): Dialect | undefined {
+  const line = /^#!\s*(\S+)(?:[ \t]+(.*))?/.exec(body.split("\n", 1)[0] ?? "")
+  if (!line) return "posix"
+  const words = [line[1], ...(line[2]?.trim().split(/\s+/) ?? [])]
+  const name = program(words[0]) === "env" ? (words.slice(1).find((word) => !word.startsWith("-")) ?? "") : words[0]
+  return SHELLS[program(name).toLowerCase()]
+}
+
+function interpreterOf(name: string) {
+  return INTERPRETERS[INTERPRETER_ALIASES.find(([pattern]) => pattern.test(name))?.[1] ?? name]
+}
+
+// An interpreter's program as its words give it: inline, from a file, or, when none is returned, from its input.
+function interpreterOperand(args: readonly string[], interpreter: Interpreter) {
+  for (let i = 0; i < args.length; i++) {
+    const word = literal(args[i])
+    if (word === "--") return interpreter.file && args[i + 1] !== undefined ? fileOperand(args[i + 1]) : undefined
+    const flag = word.startsWith("--") ? word.split("=")[0] : word.slice(0, 2)
+    if (interpreter.inline.includes(flag)) return { inline: true as const }
+    if (interpreter.values?.includes(word)) {
+      i++
+      continue
+    }
+    if (word.startsWith("-") && word !== "-") continue
+    return interpreter.file ? fileOperand(args[i]) : undefined
+  }
+}
+
+function fileOperand(raw: string) {
+  if (dynamic(raw)) return { inline: true as const }
+  const file = literal(raw)
+  return STDIN.has(file) ? undefined : { file }
+}
+
+// What the commands reading an input do with it, from those commands as unwrapped and the input's TEXT: the shells
+// that run it as a script, each in its dialect; whether an interpreter runs it as a program in another language,
+// which is checked as text; the commands xargs composes from it; the -c scripts whose commands read it, for the
+// caller to read in turn; and whether anything else turns it into code or arguments. An input nothing does is data.
+// DIALECT is the shell running the readers, which `source /dev/stdin` reads it in.
+export type Reading = { scripts: Script[]; text: boolean; views: View[]; nested: Script[]; code: boolean }
+
+export function reading(found: readonly Unwrapped[], input: string, dialect: Dialect): Reading {
+  const result: Reading = { scripts: [], text: false, views: [], nested: [], code: false }
+  const run = (target: Dialect) => {
+    if (!result.scripts.some((item) => item.dialect === target)) result.scripts.push({ text: input, dialect: target })
+  }
+  for (const item of found) {
+    // A script string known only at run time may be the input itself.
+    for (const found of item.scripts) if (found.dynamic) run(found.dialect)
+    for (const view of item.views) {
+      const name = view.name.toLowerCase()
+      const words = view.args.map(literal)
+      if (view.implied) run("posix")
+      else if (dynamic(view.program)) run("posix")
+      else if (SHELLS[name]) {
+        const call = shell(view, SHELLS[name])
+        if (call.input) run(SHELLS[name])
+        else if (call.file) result.code = true
+        result.nested.push(...call.step.scripts.filter((script) => !script.dynamic))
+      } else if (name === "." || name === "source") {
+        if (STDIN.has(words[0] ?? "")) run(dialect)
+        else result.code = true
+      } else if (NON_POSIX_SHELLS.has(name)) {
+        if (nonPosixReads(name, words)) result.text = true
+      } else if (name === "at" || name === "batch") {
+        if (!words.some((word) => /^-[A-Za-z]*[fldrc]/.test(word))) run("posix")
+      } else if (name === "crontab") {
+        if (
+          options(view.args, CRONTAB).some(
+            (parse) =>
+              !parse.options.some((option) => CRONTAB.none!.includes(option.name)) &&
+              (parse.at >= view.args.length || STDIN.has(literal(view.args[parse.at]))),
+          )
+        )
+          result.text = true
+      } else if (name === "xargs") {
+        result.code = true
+        result.views.push(...xargs(view, input, dialect))
+      } else if (name === "parallel") {
+        result.code = true
+        result.scripts.push(...parallelInput(view, input, dialect))
+      } else if (name === "eval") result.code = true
+      else if (name === "deno" || name === "bun") {
+        if (words.includes("-")) result.text = true
+      } else {
+        const interpreter = interpreterOf(name)
+        if (interpreter && !interpreterOperand(view.args, interpreter)) result.text = true
+      }
+    }
+  }
+  result.code ||= result.scripts.length > 0 || result.text || result.views.length > 0
+  return result
+}
+
+// Whether a shell whose language is not POSIX shell reads its commands from its input.
+function nonPosixReads(name: string, words: readonly string[]) {
+  if (POWERSHELLS.has(name)) {
+    const command = words.findIndex((word) => /^[-/]c(?:o(?:m(?:m(?:a(?:n(?:d)?)?)?)?)?)?$/i.test(word))
+    return command >= 0 ? words[command + 1] === "-" : !words.some((word) => !/^[-/]/.test(word))
+  }
+  if (name === "cmd") return !words.some((word) => /^\/\/?[ckr]/i.test(word))
+  return !words.some((word) => /^-[A-Za-z]*c|^--(?:init-)?command/.test(word) || !word.startsWith("-"))
+}
+
+// The commands xargs runs with INPUT: its command, `echo` by default, with the input's words after it, or with -I,
+// -i or --replace each input line in place of the replace string.
+function xargs(item: View, input: string, dialect: Dialect): View[] {
+  const views: View[] = []
+  for (const parse of options(item.args, RUNNERS.xargs)) {
+    if (parse.options.some((option) => ["-a", "--arg-file", ...RUNNERS.xargs.none!].includes(option.name))) continue
+    const command = item.args.slice(parse.at)
+    const words = command.length ? command : ["echo"]
+    const replace = parse.options.findLast((option) => ["-I", "-i", "--replace", "-J"].includes(option.name))
+    if (replace) {
+      const token = replace.value ?? "{}"
+      const lines = input
+        .split("\n")
+        .map((line) => line.replace(/^[ \t]+/, ""))
+        .filter(Boolean)
+      for (const line of lines.slice(0, MAX_INPUTS))
+        views.push(
+          view(
+            words.map((word) => (literal(word).includes(token) ? quote(literal(word).replaceAll(token, line)) : word)),
+            0,
+            dialect,
+          ),
+        )
+      continue
+    }
+    const delimiter = parse.options.findLast((option) => option.name === "-d" || option.name === "--delimiter")
+    const inputs = parse.options.some((option) => option.name === "-0" || option.name === "--null")
+      ? input.split("\0")
+      : delimiter?.value
+        ? input.split(delimiter.value === "\\n" ? "\n" : delimiter.value)
+        : xargsWords(input)
+    views.push(view([...words, ...inputs.filter((value) => value !== "").map(quote)], 0, dialect))
+  }
+  return views
+}
+
+// The words xargs reads from its input: blank-separated, with quotes and backslashes quoting.
+function xargsWords(input: string) {
+  const words: string[] = []
+  let word: string | undefined
+  for (let i = 0; i < input.length; i++) {
+    const char = input[i]
+    if (char === " " || char === "\t" || char === "\n") {
+      if (word !== undefined) words.push(word)
+      word = undefined
+      continue
+    }
+    if (char === "\\" && i + 1 < input.length) {
+      word = (word ?? "") + input[++i]
+      continue
+    }
+    if (char === "'" || char === '"') {
+      const end = input.indexOf(char, i + 1)
+      const stop = end < 0 ? input.length : end
+      word = (word ?? "") + input.slice(i + 1, stop)
+      i = stop
+      continue
+    }
+    word = (word ?? "") + char
+  }
+  if (word !== undefined) words.push(word)
+  return words
+}
+
+// The scripts GNU parallel runs with INPUT, one argument a line: its command with the line in place of `{}` or after
+// it, or each line as a command.
+function parallelInput(item: View, input: string, dialect: Dialect): Script[] {
+  const scripts: Script[] = []
+  for (const parse of options(item.args, PARALLEL)) {
+    if (parse.options.some((option) => ["-a", "--arg-file", ...PARALLEL.none!].includes(option.name))) continue
+    const rest = item.args.slice(parse.at)
+    if (rest.some((word) => PARALLEL_SEPARATORS.has(literal(word)))) continue
+    const text = rest.map(literal).join(" ")
+    for (const line of input
+      .split("\n")
+      .filter((line) => line.trim())
+      .slice(0, MAX_INPUTS))
+      scripts.push({
+        text: !text ? line : text.includes("{}") ? text.replaceAll("{}", quote(line)) : `${text} ${quote(line)}`,
+        dialect,
+      })
+  }
+  return scripts
+}
+
+// The text an `echo` or `printf` with static words writes, in each way the shells running it may write it: Bash's
+// echo leaves backslashes alone unless given -e, while Dash's interprets them. None when a word is only known at run
+// time, or when printf stores what it formats (`-v`).
+export function output(item: View): string[] | undefined {
+  const name = item.name.toLowerCase()
+  if ((name !== "echo" && name !== "printf") || [item.program, ...item.args].some(dynamic)) return
+  const words = item.args.map(literal)
+  if (name === "printf") {
+    const args = words[0] === "--" ? words.slice(1) : words
+    if (!args.length || args[0].startsWith("-v")) return
+    return [printf(args[0], args.slice(1))]
+  }
+  let at = 0
+  const flags = { n: false, e: false }
+  for (; at < words.length && /^-[neE]+$/.test(words[at]); at++) {
+    if (words[at].includes("n")) flags.n = true
+    if (words[at].includes("e")) flags.e = true
+    if (words[at].includes("E")) flags.e = false
+  }
+  const end = flags.n ? "" : "\n"
+  const plain = words.slice(at).join(" ") + end
+  const escaped = echoEscapes(words.slice(at).join(" "))
+  const interpreted = escaped.text + (escaped.stopped ? "" : end)
+  return [...new Set([flags.e ? interpreted : plain, interpreted])]
+}
+
+// Backslash escapes as echo -e and printf's %b read them, octal after `\0`, or as printf's format reads them, octal
+// after `\`. `\c` stops the output.
+function echoEscapes(text: string, zero = true) {
+  let out = ""
+  for (let i = 0; i < text.length; i++) {
+    if (text[i] !== "\\" || i + 1 >= text.length) {
+      out += text[i]
+      continue
+    }
+    const next = text[i + 1]
+    if (next === "c") return { text: out, stopped: true }
+    if (next in ANSI_ESCAPES && !"'\"?".includes(next)) {
+      out += ANSI_ESCAPES[next]
+      i++
+      continue
+    }
+    const octal = zero
+      ? next === "0"
+        ? /^[0-7]{0,3}/.exec(text.slice(i + 2))?.[0]
+        : undefined
+      : /^[0-7]{1,3}/.exec(text.slice(i + 1))?.[0]
+    if (octal !== undefined) {
+      out += String.fromCharCode(parseInt(octal || "0", 8))
+      i += zero ? octal.length + 1 : octal.length
+      continue
+    }
+    const hex = next === "x" ? /^[0-9a-fA-F]{1,2}/.exec(text.slice(i + 2))?.[0] : undefined
+    if (hex) {
+      out += String.fromCharCode(parseInt(hex, 16))
+      i += hex.length + 1
+      continue
+    }
+    out += "\\"
+  }
+  return { text: out, stopped: false }
+}
+
+// What printf writes for FORMAT and ARGS: its escapes decoded and each conversion replaced by the next argument, the
+// format reused while arguments remain.
+function printf(format: string, args: readonly string[]) {
+  let out = ""
+  let used = 0
+  for (let pass = 0; pass < MAX_INPUTS; pass++) {
+    const start = used
+    out += format.replace(
+      /%(%|[-+ #0]*(?:\d+|\*)?(?:\.(?:\d+|\*))?([a-zA-Z]))|\\[\s\S]/g,
+      (match, spec: string | undefined, conversion: string | undefined) => {
+        if (spec === "%") return "%"
+        if (!conversion) return echoEscapes(match, false).text
+        const value = args[used++] ?? ""
+        if (conversion === "b") return echoEscapes(value).text
+        if (conversion === "c") return value.slice(0, 1)
+        if (conversion === "q") return quote(value)
+        return value
+      },
+    )
+    if (used === start || used >= args.length) break
+  }
+  return out
 }
 
 // The statements a declaration (`export`, `declare`, `local`, `readonly`, `typeset`, `unset`) makes, one for each

@@ -181,6 +181,8 @@ describe("ShellParse refuses scripts it cannot read", () => {
     "bash -c 'kubectl delete pod x; alias a=b'",
     "sh -c 'kubectl delete pod x; a[$i]=1'",
     "eval 'kubectl delete pod x; alias a=b'",
+    "bash <<'EOF'\nkubectl delete pod x\nalias a=b\nEOF",
+    "sh <<'EOF'\nkubectl delete pod x\na[$i]=1\nEOF",
     "ssh host 'kubectl delete pod x; alias a=b'",
   ])("%s", async (command) => {
     expect(await matched(command, "kubectl delete *")).toBe(true)
@@ -281,6 +283,85 @@ describe("ShellParse saved approvals", () => {
     ["kubectl * pods", "kubectl delete pods"],
   ])("an approval of %s does not cover %s", async (approved, other) => {
     expect(await allows(await saves(approved), other)).toBe(false)
+  })
+})
+
+describe("ShellParse heredoc delimiters read as bash reads them", () => {
+  test.each([
+    `cat <<E"O"F > notes\nEOF\nkubectl delete pod x\nE"O"F`,
+    `cat <<E'O'F > notes\nEOF\nkubectl delete pod x\nE'O'F`,
+    `cat <<$'EOF' > notes\nEOF\nkubectl delete pod x\n$'EOF'`,
+    `cat <<-E"O"F > notes\n\tEOF\nkubectl delete pod x\nE"O"F`,
+  ])("%s", async (command) => {
+    expect(await matched(command, "kubectl delete *")).toBe(true)
+  })
+
+  test.each([
+    `cat <<'EOF' > notes\nEOFX\nkubectl delete pod x\nEOF`,
+    `cat <<'EOF' > notes\nEOF \nkubectl delete pod x\nEOF`,
+    `cat <<'E\\OF' > notes\nEOF\nkubectl delete pod x\nE\\OF`,
+    `cat <<'A' <<'B' > notes\nB\nA\nkubectl delete pod x\nB`,
+  ])("leaves out data the legacy parse misreads as commands: %s", async (command) => {
+    const [legacy, portable] = await seen(command)
+    expect(legacy).toEqual(portable)
+    expect(portable?.some((text) => text.includes("kubectl delete"))).toBe(false)
+  })
+})
+
+describe("ShellParse heredoc and here-string readers", () => {
+  // Bodies a shell or another interpreter runs, or that become arguments, are checked; the rule sees them.
+  test.each([
+    "python3 - <<'EOF'\nprint('kanopy-oidc')\nEOF",
+    "python3 <<'EOF'\nprint('kanopy-oidc')\nEOF",
+    "node - <<'EOF'\nconsole.log('kanopy-oidc')\nEOF",
+    "perl <<'EOF'\nprint 'kanopy-oidc'\nEOF",
+    "ruby <<'EOF'\nputs 'kanopy-oidc'\nEOF",
+    "psql -d app <<'EOF'\nselect 'kanopy-oidc';\nEOF",
+    "sqlite3 app.db <<'EOF'\nselect 'kanopy-oidc';\nEOF",
+    "mongosh <<'EOF'\nprint('kanopy-oidc')\nEOF",
+    "at now <<'EOF'\nkanopy-oidc\nEOF",
+    "crontab - <<'EOF'\n* * * * * kanopy-oidc\nEOF",
+    "ionice -c 3 bash <<'EOF'\nkanopy-oidc\nEOF",
+    "docker exec -i app sh <<'EOF'\nkanopy-oidc\nEOF",
+    "kubectl exec -i app -- sh <<'EOF'\nkanopy-oidc\nEOF",
+    "ssh host <<'EOF'\nkanopy-oidc\nEOF",
+    "cat <<'EOF' > >(bash)\nkanopy-oidc\nEOF",
+    "cat > run.sh <<'EOF' && bash run.sh\nkanopy-oidc\nEOF",
+    "cat > run.sh <<'EOF'\nkanopy-oidc\nEOF\nchmod +x run.sh && ./run.sh",
+    "cat > run.py <<'EOF'\nprint('kanopy-oidc')\nEOF\npython3 run.py",
+    "rm -rf $(cat <<'EOF'\nkanopy-oidc\nEOF\n)",
+    "bash <<< 'kanopy-oidc'",
+    "echo 'kanopy-oidc' | sh",
+    "printf 'kanopy-oidc\\n' | bash",
+    "printf 'pod kanopy-oidc' | xargs kubectl delete",
+    "cat <<'EOF' | xargs kubectl delete\npod kanopy-oidc\nEOF",
+  ])("%s", async (command) => {
+    expect(await matched(command, "*kanopy-oidc*")).toBe(true)
+  })
+
+  test.each([
+    "bash <<< 'kubectl delete pod x'",
+    "echo 'kubectl delete pod x' | sh",
+    "sh -c '\"$@\"' _ kubectl delete pod x",
+    "bash -c 'kubectl \"$1\" pod x' _ delete",
+    "printf 'delete pod x' | xargs kubectl",
+    "cat <<'EOF' | xargs -I {} kubectl {}\ndelete pod x\nEOF",
+  ])("composes the command it runs: %s", async (command) => {
+    expect(await matched(command, "kubectl delete *")).toBe(true)
+  })
+
+  // Data a command only stores or prints stays out of the text rules see.
+  test.each([
+    "cat > notes <<'EOF'\nkanopy-oidc\nEOF",
+    "tee notes <<'EOF'\nkanopy-oidc\nEOF",
+    "sudo tee /etc/notes <<'EOF' > /dev/null\nkanopy-oidc\nEOF",
+    "sudo bash -c 'cat > /etc/notes' <<'EOF'\nkanopy-oidc\nEOF",
+    "python3 script.py <<'EOF'\nkanopy-oidc\nEOF",
+    "cat > run.sh <<'EOF'\nkanopy-oidc\nEOF\nbash other.sh",
+  ])("leaves data out: %s", async (command) => {
+    const [legacy, portable] = await seen(command)
+    expect(legacy?.some((text) => text.includes("kanopy-oidc"))).toBe(false)
+    expect(portable?.some((text) => text.includes("kanopy-oidc"))).toBe(false)
   })
 })
 

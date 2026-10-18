@@ -444,6 +444,40 @@ describe("ShellTool scanner permissions", () => {
         }),
       ))
 
+    test(`${scanner}: a rule on heredoc text applies to bodies a shell runs, not to data`, () =>
+      withScanner(portable, (registry, fixture) =>
+        Effect.gen(function* () {
+          const agents = yield* Agent.Service
+          yield* agents.transform((editor) =>
+            editor.update(toolIdentity.agent, (agent) => {
+              agent.permissions = [
+                { action: "shell", resource: "*", effect: "allow" },
+                { action: "shell", resource: "*kanopy-oidc*", effect: "deny" },
+              ]
+            }),
+          )
+          const notes = path.join(fixture.active, "notes")
+          const data = yield* runPermissionCommand(registry, "cat > notes <<'EOF'\nkanopy-oidc\nEOF", notes, [])
+          expect(data.requests).toEqual([])
+          expect(data.exit).toMatchObject({ _tag: "Success", value: { status: "completed", metadata: { exit: 0 } } })
+          expect(yield* Effect.promise(() => Bun.file(notes).text())).toBe("kanopy-oidc\n")
+
+          const marker = path.join(fixture.active, "marker")
+          const script = yield* runPermissionCommand(
+            registry,
+            "sh <<'EOF'\nprintf kanopy-oidc > marker\nEOF",
+            marker,
+            [],
+          )
+          expect(script.requests).toEqual([])
+          expect(script.exit).toMatchObject({
+            _tag: "Success",
+            value: { status: "error", error: { message: expect.stringContaining("Permission denied: shell") } },
+          })
+          expect(yield* Effect.promise(() => Bun.file(marker).exists())).toBe(false)
+        }),
+      ))
+
     test(`${scanner}: external-directory rejection stops execution before a workspace marker is written`, () =>
       withScanner(portable, (registry, fixture) =>
         Effect.gen(function* () {

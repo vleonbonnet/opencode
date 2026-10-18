@@ -197,19 +197,38 @@ export const scan = Effect.fnUntraced(function* (
   return yield* scanLegacy(command, shell, cwd)
 })
 
+const portableScanner = Effect.tryPromise({
+  try: () => import("./scan.js"),
+  catch: (cause) => new Error(`Portable shell scanner failed to load: ${cause}`, { cause }),
+})
+
 const scanLegacy = Effect.fnUntraced(function* (command: string, shell: string, cwd: string) {
   const parsers = yield* Effect.promise(load)
+  const { ShellScan } = yield* portableScanner
   const powershell = ShellSelect.ps(shell)
   const tree = (powershell ? parsers.ps : parsers.bash).parse(command)
   if (!tree) return yield* Effect.fail(new Error("Failed to parse shell command"))
 
-  return yield* Effect.acquireUseRelease(
+  // The commands of a script, for what it does with what it reads.
+  const commands = (script: Script) => {
+    const nested = parsers.bash.parse(script.text)
+    if (!nested) return
+    try {
+      return nested.rootNode
+        .descendantsOfType("command")
+        .filter((node): node is Node => Boolean(node))
+        .map((node) => ShellUnwrap.unwrap(legacyWords(node, script.text, []), script.dialect))
+    } finally {
+      nested.delete()
+    }
+  }
+  const output = yield* Effect.acquireUseRelease(
     Effect.succeed(tree),
     (tree) =>
       Effect.sync(() => {
         const output = collector()
-        const options = { powershell, posix: posix(shell), cwd, shell, dialect: dialect(shell) }
-        const scripts = legacyCommands(output, tree.rootNode, command, options)
+        const options: Options = { powershell, posix: posix(shell), cwd, shell, dialect: dialect(shell), commands }
+        const scripts = legacyCommands(output, tree.rootNode, command, options, ShellScan.heredocExtent)
         // A script is read as the command is: what Tree-sitter finds in it, errors and all.
         follow(output, scripts, (script) => {
           const nested = parsers.bash.parse(script.text)
@@ -218,11 +237,13 @@ const scanLegacy = Effect.fnUntraced(function* (command: string, shell: string, 
             return []
           }
           try {
-            return legacyCommands(output, nested.rootNode, script.text, {
-              ...options,
-              posix: true,
-              dialect: script.dialect,
-            })
+            return legacyCommands(
+              output,
+              nested.rootNode,
+              script.text,
+              { ...options, posix: true, dialect: script.dialect },
+              ShellScan.heredocExtent,
+            )
           } finally {
             nested.delete()
           }
@@ -230,16 +251,31 @@ const scanLegacy = Effect.fnUntraced(function* (command: string, shell: string, 
         return output
       }),
     (tree) => Effect.sync(() => tree.delete()),
-  ).pipe(Effect.flatMap(finish))
+  )
+  // Where Tree-sitter ends a heredoc elsewhere than bash does, the portable scanner reads the command as bash does.
+  if (output.misread) return yield* scanPortable(command, shell, cwd)
+  return yield* finish(output)
 })
 
-type Options = { powershell: boolean; posix: boolean; cwd: string; shell: string; dialect: ShellUnwrap.Dialect }
+type Options = {
+  powershell: boolean
+  posix: boolean
+  cwd: string
+  shell: string
+  dialect: ShellUnwrap.Dialect
+  // The commands of a script, as unwrapped; none when the script cannot be read.
+  commands: (script: Script) => ShellUnwrap.Unwrapped[] | undefined
+}
 type Script = ShellUnwrap.Script
+type Extent = typeof ShellScan.heredocExtent
 
 // Adds the commands of a tree parsed from SOURCE and returns the script strings they hand to a shell.
-function legacyCommands(output: Collector, root: Node, source: string, options: Options) {
-  const text = (node: Node) => (node.parent?.type === "redirected_statement" ? node.parent.text : node.text).trim()
+function legacyCommands(output: Collector, root: Node, source: string, options: Options, extent: Extent) {
+  const heredocs = options.posix ? legacyHeredocs(output, root, source, options, extent) : { ranges: [], reads: [] }
+  const text = (node: Node) =>
+    cut(node.parent?.type === "redirected_statement" ? node.parent : node, heredocs.ranges).trim()
   const scripts: Script[] = []
+  const reads = [...heredocs.reads]
   for (const node of root.descendantsOfType(options.posix ? LEGACY_STATEMENTS : ["command"])) {
     if (!node) continue
     if (node.type !== "command") {
@@ -251,6 +287,7 @@ function legacyCommands(output: Collector, root: Node, source: string, options: 
             ? node.namedChildren
             : node.children,
         source,
+        heredocs.ranges,
       )
       variables(output, text(node), words, node.type === "declaration_command" || node.type === "unset_command")
       continue
@@ -268,44 +305,196 @@ function legacyCommands(output: Collector, root: Node, source: string, options: 
       output.command(text(node), save)
       continue
     }
-    const words = legacyWords(node, source)
+    const words = legacyWords(node, source, heredocs.ranges)
     const assignments = node.children
       .filter((child): child is Node => child?.type === "variable_assignment")
-      .map((child) => child.text)
+      .map((child) => cut(child, heredocs.ranges))
     // The grammar reads assignments with a redirect as a command with an empty name.
     if (!words[0] && assignments.length) {
       variables(output, text(node), assignments, false)
       continue
     }
-    scripts.push(...expand(output, text(node), save, words, options.dialect, assignments))
+    const found = expand(output, text(node), save, words, options.dialect, assignments)
+    scripts.push(...found.scripts)
+    const downstream = legacyDownstream(node)
+    if (downstream.length)
+      reads.push(...piped(found, () => downstream.map((item) => unwrapNode(item, source, options)), options))
   }
-  return scripts
+  return [...emit(output, reads, options), ...scripts]
 }
 
-// The words a command runs with, as written: its name and arguments, without assignments and redirects. Bash removes
-// line continuations before it reads words, which Tree-sitter does not: it can split one shell word into several
-// nodes (`$"…"`, a word continued on the next line), which are joined back here, and it reads the descriptor of a
-// redirect whose operator starts the next line (`2\` then `>out`) as an argument, which is left out.
-function legacyWords(node: Node, source: string) {
+// What the heredocs and here-strings of a tree hold: the heredoc bodies, with their closing delimiter, that are only
+// data and are left out of the text rules see, and what their readers do with each. A heredoc Tree-sitter ends
+// elsewhere than bash does, which a tree with a parse error may hold, marks the scan misread.
+function legacyHeredocs(output: Collector, root: Node, source: string, options: Options, extent: Extent) {
+  const ranges: Range[] = []
+  const reads: Read[] = []
+  const redirects = root
+    .descendantsOfType(["heredoc_redirect", "herestring_redirect"])
+    .filter((node): node is Node => Boolean(node))
+  // A heredoc in a tree with a parse error may sit in an ERROR node of its own.
+  if (root.hasError && root.descendantsOfType(["heredoc_redirect", "heredoc_start", "heredoc_body"]).length)
+    output.misread = true
+  for (const redirect of redirects) {
+    const found = legacyReaders(redirect)
+    const readers = found.nodes.map((node) => unwrapNode(node, source, options))
+    if (redirect.type === "herestring_redirect") {
+      const word = redirect.namedChildren.find((item): item is Node => Boolean(item))
+      if (word)
+        reads.push(read({ text: `${ShellUnwrap.literal(word.text)}\n`, readers, targets: [], later: [] }, options))
+      continue
+    }
+    const child = (type: string) => redirect.children.find((item) => item?.type === type) ?? undefined
+    if (legacyMisread(redirect, source, extent)) output.misread = true
+    const body = child("heredoc_body")
+    if (!body) continue
+    const reading = new Set(found.nodes.map((node) => node.id))
+    const later = root
+      .descendantsOfType("command")
+      .filter((node): node is Node => node !== null && node.startIndex > redirect.startIndex && !reading.has(node.id))
+      .map((node) => unwrapNode(node, source, options))
+    const start = child("heredoc_start")
+    const end = child("heredoc_end")
+    // The body its reader gets: the lines between the heredoc's and the closing delimiter's, without their leading
+    // tabs for `<<-`.
+    const lines = source.slice(
+      source.lastIndexOf("\n", body.startIndex - 1) + 1,
+      end ? source.lastIndexOf("\n", end.startIndex - 1) + 1 : body.endIndex,
+    )
+    const text = source.startsWith("<<-", redirect.startIndex) ? lines.replace(/^\t+/gm, "") : lines
+    const result = read({ text, readers, targets: legacyTargets(redirect), later }, options)
+    reads.push(result)
+    // A quote or backslash in the delimiter, apart from a line continuation, quotes it.
+    if (root.hasError || !start || !end || !/['"\\]/.test(start.text.replaceAll("\\\n", ""))) continue
+    if (found.substituted || !result.data) continue
+    ranges.push({ start: body.startIndex, end: end.endIndex })
+  }
+  return { ranges, reads }
+}
+
+function unwrapNode(node: Node, source: string, options: Options) {
+  return ShellUnwrap.unwrap(legacyWords(node, source, []), options.dialect)
+}
+
+// Whether Tree-sitter reads a heredoc's delimiter word, its quoting or the end of its body otherwise than bash does:
+// it keeps the quotes of a partly quoted delimiter (`E"O"F`), drops backslashes inside quotes, expands a body whose
+// delimiter a backslash quotes (`E\OF`) and ends a body at a line that only begins with the delimiter.
+function legacyMisread(redirect: Node, source: string, extent: Extent) {
+  const child = (type: string) => redirect.children.find((item) => item?.type === type) ?? undefined
+  const start = child("heredoc_start")
+  const body = child("heredoc_body")
+  const end = child("heredoc_end")
+  if (!start || !end) return true
+  const tabs = source.startsWith("<<-", redirect.startIndex)
+  const first = body?.startIndex ?? end.startIndex
+  const line = source.lastIndexOf("\n", first - 1) + 1
+  if (!/^\t*$/.test(source.slice(line, first)) || (!tabs && line !== first)) return true
+  const bash = extent(source, redirect.startIndex + (tabs ? 3 : 2), tabs, line)
+  if (!bash || bash.word !== start.endIndex || bash.end !== end.endIndex) return true
+  // Tree-sitter reads expansions in a body it does not quote; one bash expands, holding `$` or a backquote, has some.
+  const expanded = body?.namedChildren.some((item) => item?.type !== "heredoc_content") ?? false
+  return bash.quoted ? expanded : !expanded && /[$`]/.test(body?.text ?? "")
+}
+
+// The files the statement a heredoc is redirected to writes its output to, as their words read when static.
+function legacyTargets(redirect: Node) {
+  const statement = redirect.parent
+  if (!statement) return []
+  // The grammar puts redirects after a heredoc inside its redirect.
+  const redirects = [
+    ...statement.children,
+    ...(statement.childForFieldName("body")?.childrenForFieldName("redirect") ?? []),
+    ...statement.children
+      .filter((item): item is Node => item?.type === "heredoc_redirect")
+      .flatMap((item) => item.childrenForFieldName("redirect")),
+  ].filter((item): item is Node => item?.type === "file_redirect")
+  return redirects.flatMap((item) => {
+    const operator = item.children.find((child) => child !== null && !child.isNamed)?.text ?? ""
+    const destination = item.childForFieldName("destination")
+    if (!/^(?:>|>>|>\||&>|&>>|>&)$/.test(operator) || !destination || ShellUnwrap.dynamic(destination.text)) return []
+    return [ShellUnwrap.literal(destination.text)]
+  })
+}
+
+// The commands that read a heredoc or here-string: every command of the statement it is redirected to, including the
+// process substitutions its other redirects write to, and those after it in its pipelines; the grammar puts the
+// pipeline after a heredoc inside its redirect. Once its output is substituted into a word, every command of the
+// top-level statement holding that word counts, since where the word ends up is not followed.
+function legacyReaders(redirect: Node) {
+  const statement = redirect.parent
+  if (!statement) return { nodes: [], substituted: false }
+  // The grammar also puts the rest of an and-or list after a heredoc inside its redirect; that list does not read it.
+  const after = new Set(
+    statement
+      .descendantsOfType("heredoc_redirect")
+      .flatMap((item) => item?.childrenForFieldName("right") ?? [])
+      .filter((item): item is Node => Boolean(item))
+      .flatMap((item) => [item, ...commands(item)])
+      .map((item) => item.id),
+  )
+  const nodes = commands(statement).filter((item) => !after.has(item.id))
+  let substituted = false
+  for (let node = statement; node.parent; node = node.parent) {
+    const parent = node.parent
+    const after = node.endIndex
+    if (parent.type === "pipeline")
+      nodes.push(
+        ...parent.children.filter((item): item is Node => item !== null && item.startIndex >= after).flatMap(commands),
+      )
+    if (parent.type === "command_substitution" || parent.type === "process_substitution") substituted = true
+    if (substituted && parent.parent?.type === "program") nodes.push(...commands(parent))
+  }
+  return { nodes, substituted }
+}
+
+// The commands in the later stages of the pipelines around a command, which its output reaches.
+function legacyDownstream(node: Node) {
+  const later: Node[] = []
+  for (let item = node; item.parent; item = item.parent) {
+    const after = item.endIndex
+    if (item.parent.type === "pipeline")
+      later.push(
+        ...item.parent.children
+          .filter((child): child is Node => child !== null && child.startIndex >= after)
+          .flatMap(commands),
+      )
+  }
+  return later
+}
+
+function commands(node: Node) {
+  return node.descendantsOfType("command").filter((item): item is Node => Boolean(item))
+}
+
+// The words a command runs with, as written: its name and arguments, without assignments, redirects and the RANGES
+// in them. Bash removes line continuations before it reads words, which Tree-sitter does not: it can split one shell
+// word into several nodes (`$"…"`, a word continued on the next line), which are joined back here, and it reads the
+// descriptor of a redirect whose operator starts the next line (`2\` then `>out`) as an argument, which is left out.
+// Tree-sitter also leaves a lone `-` before a heredoc (`python3 - <<'EOF'`) out of every node; it is put back.
+function legacyWords(node: Node, source: string, ranges: readonly Range[]) {
   const name = node.childForFieldName("name")
   if (!name) return []
   const nodes = [name, ...node.childrenForFieldName("argument").filter((item): item is Node => Boolean(item))]
-  return wordRanges(nodes, source)
-    .filter((word, index) => {
-      if (index === 0 || !/^(?:\d+|\{[A-Za-z_][A-Za-z0-9_]*\})$/.test(source.slice(word.start, word.end))) return true
-      CONTINUED_REDIRECT_RE.lastIndex = word.end
-      return !CONTINUED_REDIRECT_RE.test(source)
-    })
-    .map((word) => source.slice(word.start, word.end))
+  const words = wordRanges(nodes, source).filter((word, index) => {
+    if (index === 0 || !/^(?:\d+|\{[A-Za-z_][A-Za-z0-9_]*\})$/.test(source.slice(word.start, word.end))) return true
+    CONTINUED_REDIRECT_RE.lastIndex = word.end
+    return !CONTINUED_REDIRECT_RE.test(source)
+  })
+  const redirect = node.nextSibling
+  if (node.parent?.type === "redirected_statement" && redirect?.type === "heredoc_redirect") {
+    const dash = /^[ \t]+-(?=[ \t]+$)/.exec(source.slice(node.endIndex, redirect.startIndex))
+    if (dash) words.push({ start: node.endIndex + dash[0].length - 1, end: node.endIndex + dash[0].length })
+  }
+  return words.map((word) => without(source.slice(word.start, word.end), word.start, ranges))
 }
 
-// The words NODES make in SOURCE: nodes with nothing but line continuations between them are one word, which
-// Tree-sitter splits.
-function joined(nodes: readonly (Node | null)[], source: string) {
+// The words NODES make in SOURCE, without the RANGES in them: nodes with nothing but line continuations between
+// them are one word, which Tree-sitter splits.
+function joined(nodes: readonly (Node | null)[], source: string, ranges: readonly Range[]) {
   return wordRanges(
     nodes.filter((item): item is Node => Boolean(item)),
     source,
-  ).map((word) => source.slice(word.start, word.end))
+  ).map((word) => without(source.slice(word.start, word.end), word.start, ranges))
 }
 
 function wordRanges(nodes: readonly Node[], source: string) {
@@ -317,15 +506,39 @@ function wordRanges(nodes: readonly Node[], source: string) {
   }, [])
 }
 
+function cut(node: Node, ranges: readonly Range[]) {
+  return without(node.text, node.startIndex, ranges)
+}
+
 type Range = { start: number; end: number }
 
+// TEXT, which starts at START, without the RANGES that start inside it, up to its end: a body's range can run past
+// the end of a command's text only by the blank lines trimmed from that text.
+function without(text: string, start: number, ranges: readonly Range[]) {
+  const end = start + text.length
+  const inside = ranges.filter((range) => range.start >= start && range.start < end).sort((a, b) => a.start - b.start)
+  if (!inside.length) return text
+  const state = { text: "", at: start }
+  for (const range of inside) {
+    if (range.start < state.at) continue
+    state.text += text.slice(state.at - start, range.start - start)
+    state.at = Math.min(range.end, end)
+  }
+  return state.text + text.slice(state.at - start)
+}
+
 export const scanPortable = Effect.fnUntraced(function* (command: string, shell: string, cwd: string) {
-  const { ShellScan } = yield* Effect.tryPromise({
-    try: () => import("./scan.js"),
-    catch: (cause) => new Error(`Portable shell scanner failed to load: ${cause}`, { cause }),
-  })
+  const { ShellScan } = yield* portableScanner
   const powershell = ShellSelect.ps(shell)
-  const options = { powershell, posix: posix(shell), cwd, shell, dialect: dialect(shell) }
+  // The commands of a script, for what it does with what it reads.
+  const commands = (script: Script) => {
+    const nested = ShellScan.statements(script.text, script.dialect)
+    if (nested.kind === "opaque") return
+    return nested.commands
+      .filter((item) => !item.declaration && !item.assignment)
+      .map((item) => ShellUnwrap.unwrap(portableWords(item), script.dialect))
+  }
+  const options: Options = { powershell, posix: posix(shell), cwd, shell, dialect: dialect(shell), commands }
   const result = powershell
     ? statementsOf(ShellScan.scanPowerShell(command))
     : ShellScan.statements(command, options.dialect)
@@ -349,20 +562,29 @@ export const scanPortable = Effect.fnUntraced(function* (command: string, shell:
 type Portable = Extract<ShellScan.Statements, { kind: "scanned" }>
 type Command = Portable["commands"][number]
 
-// A PowerShell scan has no assignments prefixed to its commands.
+// A PowerShell scan has no heredocs to follow.
 function statementsOf(result: ShellScan.Result): ShellScan.Statements {
-  return result.kind === "opaque" ? result : { ...result, places: new Map() }
+  return result.kind === "opaque" ? result : { ...result, heredocs: [], places: new Map(), downstream: new Map() }
 }
 
 // Adds the commands the portable scanner found and returns the script strings they hand to a shell.
 function portableCommands(output: Collector, scanned: Portable, options: Options) {
   const { powershell, cwd, shell } = options
+  const heredocs = options.posix ? portableHeredocs(scanned, options) : { spans: [], reads: [] }
   const scripts: Script[] = []
+  const reads = [...heredocs.reads]
   for (const item of scanned.commands) {
-    const resource = item.resource
+    // The data-only heredoc bodies in the text the command was read from are left out of its text and words.
+    const place = scanned.places.get(item)
+    const spans = place ? heredocs.spans.filter((span) => span.text === place.text) : []
+    const kept = place ? without(item.resource, place.start, spans) : item.resource
+    // Trimmed as the legacy resource is once its bodies are left out.
+    const resource = kept === item.resource ? kept : kept.trim()
+    const cutWords = (words: readonly string[]) =>
+      place ? words.map((word, index) => without(word, place.words[index], spans)) : words
     // Declarations and assignments are checked as written, which the substitutions within them are as well.
     if (item.declaration || item.assignment) {
-      if (options.posix) variables(output, resource, portableWords(item), Boolean(item.declaration))
+      if (options.posix) variables(output, resource, cutWords(portableWords(item)), Boolean(item.declaration))
       continue
     }
     const words = portableWords(item)
@@ -425,15 +647,144 @@ function portableCommands(output: Collector, scanned: Portable, options: Options
       output.command(resource, save)
       continue
     }
-    const assignments = scanned.places.get(item)?.assignments ?? []
-    scripts.push(...expand(output, resource, save, words, options.dialect, assignments))
+    const assignments = place?.assignments.map((item) => without(item.raw, item.start, spans)) ?? []
+    const found = expand(output, resource, save, cutWords(words), options.dialect, assignments)
+    scripts.push(...found.scripts)
+    const downstream = scanned.downstream.get(item)
+    if (downstream)
+      reads.push(
+        ...piped(
+          found,
+          () =>
+            downstream
+              .filter((next) => !next.declaration && !next.assignment)
+              .map((next) => ShellUnwrap.unwrap(portableWords(next), options.dialect)),
+          options,
+        ),
+      )
   }
-  return scripts
+  return [...emit(output, reads, options), ...scripts]
 }
 
 // The words a command runs with, as written: without the redirect destinations after a trailing redirect.
 function portableWords(item: Command) {
   return item.redirectWordCount === undefined ? item.rawWords : item.rawWords.slice(0, item.redirectWordCount)
+}
+
+// What the heredocs and here-strings of a scan hold: the spans of the heredoc bodies, with their closing delimiter,
+// that are only data and are left out of the text rules see, and what their readers do with each. Declarations and
+// assignments among the readers only store what they read, as the legacy walk has them.
+function portableHeredocs(scanned: Portable, options: Options) {
+  const spans: ShellScan.Span[] = []
+  const reads: Read[] = []
+  const commands = (items: readonly Command[]) =>
+    items
+      .filter((item) => !item.declaration && !item.assignment)
+      .map((item) => ShellUnwrap.unwrap(portableWords(item), options.dialect))
+  for (const heredoc of scanned.heredocs) {
+    const later = scanned.commands.filter((item) => {
+      const place = scanned.places.get(item)
+      return place?.text === heredoc.text && place.start > heredoc.at && !heredoc.readers.includes(item)
+    })
+    // The body its reader gets, without the leading tabs of its lines for `<<-`.
+    const text = heredoc.tabs ? heredoc.body.replace(/^\t+/gm, "") : heredoc.body
+    const result = read(
+      { text, readers: commands(heredoc.readers), targets: heredoc.targets, later: commands(later) },
+      options,
+    )
+    reads.push(result)
+    if (heredoc.quoted && !heredoc.substituted && result.data) spans.push(...heredoc.spans)
+  }
+  return { spans, reads }
+}
+
+// An input commands read: a heredoc body, a here-string, or the static text echo or printf writes into a pipeline,
+// with the commands reading it, the files its statement writes it to, and the commands after it in the same script,
+// which may run those files.
+type Input = {
+  text: string
+  readers: readonly ShellUnwrap.Unwrapped[]
+  targets: readonly string[]
+  later: readonly ShellUnwrap.Unwrapped[]
+}
+
+// What the commands reading an input do with it: the scripts to check that run it, its text to check whole when an
+// interpreter runs it, the commands composed from it, and whether it is only data.
+type Read = { data: boolean; scripts: Script[]; texts: string[]; views: ShellUnwrap.View[] }
+
+// What the commands reading INPUT do with it (see ShellUnwrap.reading). The commands of a -c script reading it read
+// it in turn, and a file it is written to that a later command runs is run as a script, as a program, or as its
+// first line says. It is data only when nothing does any of that.
+function read(input: Input, options: Options, depth = 1): Read {
+  const reading = ShellUnwrap.reading(input.readers, input.text, options.dialect)
+  const result: Read = {
+    data: !reading.code,
+    scripts: [...reading.scripts],
+    texts: reading.text ? [input.text] : [],
+    views: [...reading.views],
+  }
+  for (const script of reading.nested) {
+    const commands = depth < ShellUnwrap.MAX_SCRIPT_DEPTH ? options.commands(script) : undefined
+    if (!commands) {
+      result.data = false
+      continue
+    }
+    const inner = read({ text: input.text, readers: commands, targets: [], later: [] }, options, depth + 1)
+    result.data &&= inner.data
+    result.scripts.push(...inner.scripts)
+    result.texts.push(...inner.texts)
+    result.views.push(...inner.views)
+  }
+  const tees = input.readers.flatMap((item) =>
+    item.views.flatMap((view) =>
+      view.name === "tee" ? view.args.filter((arg) => !ShellUnwrap.dynamic(arg) && !arg.startsWith("-")) : [],
+    ),
+  )
+  const targets = [...input.targets, ...tees.map(ShellUnwrap.literal)].map(normal)
+  for (const command of input.later)
+    for (const view of command.views) {
+      const run = ShellUnwrap.executes(view, options.dialect)
+      if (!run || !targets.includes(normal(run.path))) continue
+      result.data = false
+      const shell = "dialect" in run ? run.dialect : "program" in run ? ShellUnwrap.shebang(input.text) : undefined
+      if (shell) result.scripts.push({ text: input.text, dialect: shell })
+      else result.texts.push(input.text)
+    }
+  // Read by shells of several dialects, a script is read as POSIX, which is sound for each of them.
+  const dialects = new Set(result.scripts.filter((item) => item.text === input.text).map((item) => item.dialect))
+  result.scripts = [
+    ...(dialects.size ? [{ text: input.text, dialect: dialects.size > 1 ? "posix" : [...dialects][0] }] : []),
+    ...result.scripts.filter((item) => item.text !== input.text),
+  ]
+  return result
+}
+
+function normal(file: string) {
+  return path.posix.normalize(file)
+}
+
+// What the commands downstream of FOUND do with the text it writes, when it is an echo or printf of static words.
+function piped(found: ShellUnwrap.Unwrapped, downstream: () => ShellUnwrap.Unwrapped[], options: Options) {
+  const texts = found.views.flatMap((view) => ShellUnwrap.output(view) ?? [])
+  if (!texts.length) return []
+  const readers = downstream()
+  return texts.map((text) => read({ text, readers, targets: [], later: [] }, options))
+}
+
+// Emits what READS found: the text of each input an interpreter runs, and each command composed from one, with what
+// it runs. Returns the scripts to check that run an input.
+function emit(output: Collector, reads: readonly Read[], options: Options) {
+  const scripts: Script[] = []
+  for (const item of reads) {
+    for (const text of item.texts) output.extra(text, exact(text))
+    for (const view of item.views)
+      scripts.push(
+        ...expand(output, ShellUnwrap.text(view), undefined, [view.program, ...view.args], options.dialect, [], true)
+          .scripts,
+      )
+    scripts.push(...item.scripts)
+  }
+  return scripts
 }
 
 // Bash-family shells; PowerShell and cmd.exe give runners, quoting and scripts other meanings.
@@ -451,7 +802,8 @@ type Collector = ReturnType<typeof collector>
 
 // Permission resources in the order they are found. A command as written is always listed, as each command was
 // before; what it runs is listed unless the same resource already is. Each carries the other spellings of that one
-// command, apart from the resource itself. A command that cannot be checked fails the scan.
+// command, apart from the resource itself. A command that cannot be checked fails the scan, and `misread` tells the
+// legacy scan that Tree-sitter read a heredoc otherwise than bash.
 function collector() {
   const result: Result = { commands: [], directories: [] }
   const seen = new Set<string>()
@@ -467,6 +819,7 @@ function collector() {
   return {
     result,
     failures,
+    misread: false,
     command(resource: string, save: string | undefined, alternates: readonly string[] = []) {
       seen.add(resource)
       push(resource, save, alternates)
@@ -491,21 +844,26 @@ function finish(output: Collector) {
 // runs behind a runner (`sudo`, `env`, `xargs`, …), under a bare program name (`/bin/rm` as `rm`) or as a script
 // handed to a shell that is not POSIX, together with the ASSIGNMENTS prefixed to it and those its runners pass, each
 // a resource of its own. Rules match command text, so each is checked on its own: this only adds resources and
-// spellings, so it can add a prompt or a denial, never lift one. FALLBACK is saved for a statement with no command.
-// Returns the script strings the command hands to a POSIX shell.
+// spellings, so it can add a prompt or a denial, never lift one. FALLBACK is saved for a statement with no command,
+// and ONCE lists the command only when it is not listed yet. Returns what the command runs, with the script strings
+// it hands to a POSIX shell.
 function expand(
   output: Collector,
   resource: string,
-  fallback: string,
+  fallback: string | undefined,
   words: readonly string[],
   dialect: ShellUnwrap.Dialect,
   assignments: readonly string[] = [],
+  once = false,
 ) {
   // The legacy grammar gives a statement of assignments with a redirect an empty command name.
   const found = ShellUnwrap.unwrap(words[0] ? words : [], dialect)
   if (found.truncated) output.fail("Shell command runs too many nested commands to check")
   const [head, ...rest] = found.views
-  output.command(resource, head ? saved(head) : fallback, head ? ShellUnwrap.spellings(head) : [])
+  const save = head ? saved(head) : fallback
+  const alternates = head ? ShellUnwrap.spellings(head) : []
+  if (once) output.extra(resource, save, alternates)
+  else output.command(resource, save, alternates)
   for (const word of [...assignments, ...found.assignments])
     output.extra(word, ShellUnwrap.assignment(word), spelled([word]))
   if (head) renamed(output, head)
@@ -515,7 +873,7 @@ function expand(
     renamed(output, view)
   }
   for (const text of found.texts) output.extra(text, exact(text))
-  return found.scripts
+  return found
 }
 
 // The command as its bare program name runs it, when that differs from the program as written.

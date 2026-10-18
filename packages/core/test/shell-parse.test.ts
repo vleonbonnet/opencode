@@ -69,10 +69,10 @@ describe("ShellParse", () => {
     }
   })
 
-  test("portable scanning handles heredocs with the existing permission resource", async () => {
+  test("portable scanning handles heredocs with the legacy permission resource", async () => {
     const command = "cat <<'EOF'\nstatic body\nEOF"
     const legacy = await Effect.runPromise(ShellParse.scan(command, "/bin/bash", "/workspace"))
-    expect(legacy.commands).toEqual([{ resource: command, save: "cat *", alternates: ["cat"] }])
+    expect(legacy.commands).toEqual([{ resource: "cat <<'EOF'", save: "cat *", alternates: ["cat"] }])
     expect(await Effect.runPromise(ShellParse.scan(command, "/bin/bash", "/workspace", { portable: true }))).toEqual(
       legacy,
     )
@@ -398,5 +398,141 @@ describe("ShellParse statements that set or clear variables", () => {
       expect(
         await Effect.runPromise(ShellParse.scan("export X=1; Y=2; unset X", "cmd", "/workspace", { portable })),
       ).toEqual({ commands: [], directories: [] })
+  })
+})
+
+describe("ShellParse heredoc bodies", () => {
+  test.each<{ name: string; command: string; resources?: string[]; body: boolean }>([
+    {
+      // The interpreter runs the body, which is checked whole, as text.
+      name: "a quoted heredoc an interpreter reads",
+      command: "python3 - <<'EOF'\nprint('kanopy-oidc')\nEOF\ntail -3 f",
+      resources: ["python3 -", "print('kanopy-oidc')\n", "tail -3 f"],
+      body: true,
+    },
+    {
+      name: "a quoted heredoc a script reads as data",
+      command: "python3 script.py <<'EOF'\nkanopy-oidc\nEOF",
+      resources: ["python3 script.py <<'EOF'", "python3 script.py"],
+      body: false,
+    },
+    { name: "a double-quoted delimiter", command: 'cat > f <<"EOF"\nkanopy-oidc\nEOF', body: false },
+    { name: "an escaped delimiter", command: "cat <<-\\EOF\n\tkanopy-oidc\n\tEOF", body: false },
+    {
+      // Where the substituted word ends up is not followed, so a substituted body is kept.
+      name: "a heredoc substituted into an argument",
+      command: `git commit -m "$(cat <<'EOF'\nuse kanopy-oidc\nEOF\n)" && echo done`,
+      resources: [
+        `git commit -m "$(cat <<'EOF'\nuse kanopy-oidc\nEOF\n)"`,
+        "cat <<'EOF'\nuse kanopy-oidc\nEOF",
+        "echo done",
+      ],
+      body: true,
+    },
+    { name: "a heredoc assigned to a variable", command: "x=$(cat <<'EOF'\nkanopy-oidc\nEOF\n)", body: true },
+    {
+      name: "a tab-stripped heredoc assigned to a variable",
+      command: "x=$(cat <<-'EOF'\n\tkanopy-oidc\n\tEOF\n)",
+      resources: ["x=$(cat <<-'EOF'\n\tkanopy-oidc\n\tEOF\n)", "cat <<-'EOF'\n\tkanopy-oidc\n\tEOF"],
+      body: true,
+    },
+    {
+      name: "a heredoc read by a loop",
+      command: `while read f; do echo "$f"; done <<'EOF'\nkanopy-oidc\nEOF`,
+      body: false,
+    },
+    { name: "a heredoc in a backquoted substitution", command: "echo `cat <<'EOF'\nkanopy-oidc\nEOF\n`", body: true },
+    {
+      // The shell runs the file the heredoc is written to, so the body is a script.
+      name: "a heredoc written to a file a shell runs after a list operator",
+      command: "cat <<'EOF' > f && bash f\nkanopy-oidc\nEOF",
+      resources: ["bash f", "kanopy-oidc"],
+      body: true,
+    },
+    {
+      name: "a heredoc written to a file nothing runs",
+      command: "cat <<'EOF' > f && bash g\nkanopy-oidc\nEOF",
+      resources: ["cat <<'EOF' > f && bash g", "bash g"],
+      body: false,
+    },
+    {
+      name: "an unquoted heredoc",
+      command: "cat <<EOF\nkanopy-oidc $(whoami)\nEOF",
+      resources: ["whoami"],
+      body: true,
+    },
+    {
+      name: "a heredoc a shell reads",
+      command: "bash <<'EOF'\nkubectl delete pod kanopy-oidc\nEOF",
+      resources: ["kubectl delete pod kanopy-oidc"],
+      body: true,
+    },
+    {
+      name: "a heredoc piped into a shell behind a runner",
+      command: "cat <<'EOF' | tee log | sudo bash -s\nkubectl delete pod kanopy-oidc\nEOF",
+      resources: ["kubectl delete pod kanopy-oidc"],
+      body: true,
+    },
+    {
+      name: "a heredoc piped from a group into a shell",
+      command: "{ cat <<'EOF'\nkubectl delete pod kanopy-oidc\nEOF\n} | sh",
+      resources: ["kubectl delete pod kanopy-oidc"],
+      body: true,
+    },
+    {
+      name: "a heredoc sudo -s reads",
+      command: "sudo -s <<'EOF'\nrm -r kanopy-oidc\nEOF",
+      resources: ["rm -r kanopy-oidc", "rm -r kanopy-oidc"],
+      body: true,
+    },
+    {
+      name: "a heredoc a program named at run time reads",
+      command: `"$run" <<'EOF'\nkubectl delete pod kanopy-oidc\nEOF`,
+      resources: ["kubectl delete pod kanopy-oidc"],
+      body: true,
+    },
+    {
+      name: "a heredoc whose lines a loop hands to a shell",
+      command: `while read line; do bash -c "$line"; done <<'EOF'\nrm -rf kanopy-oidc\nEOF`,
+      resources: ["rm -rf kanopy-oidc", "rm -r -f kanopy-oidc"],
+      body: true,
+    },
+    { name: "a heredoc xargs reads", command: "cat <<'EOF' | xargs rm\n-r kanopy-oidc\nEOF", body: true },
+    {
+      name: "a heredoc substituted into a shell's -c script",
+      command: `bash -c "$(cat <<'EOF'\nkubectl delete pod kanopy-oidc\nEOF\n)"`,
+      body: true,
+    },
+    {
+      name: "a heredoc substituted into a statement that runs a shell",
+      command: `echo "$(cat <<'EOF'\nkanopy-oidc\nEOF\n)" | sh`,
+      body: true,
+    },
+  ])("$name: body checked $body", async ({ command, resources, body }) => {
+    const result = spellings(await scanned(command))
+    for (const resource of resources ?? []) expect(result).toContain(resource)
+    expect(result.some((resource) => resource.includes("kanopy-oidc"))).toBe(body)
+  })
+
+  test("parses the body a shell reads as a script, checking each of its commands", async () => {
+    expect(await scanned("bash <<'EOF'\nexport KUBECONFIG=x\nsudo rm -rf build\nEOF")).toEqual({
+      commands: [
+        { resource: "bash <<'EOF'\nexport KUBECONFIG=x\nsudo rm -rf build\nEOF", save: "bash *", alternates: ["bash"] },
+        { resource: "export KUBECONFIG=x", save: "export KUBECONFIG=*" },
+        { resource: "sudo rm -rf build", save: "sudo *", alternates: ["sudo rm -r -f build"] },
+        { resource: "rm -rf build", save: "rm *", alternates: ["rm -r -f build"] },
+      ],
+      directories: [],
+    })
+  })
+
+  test("refuses a body a shell reads when the portable scanner cannot analyze it", async () => {
+    const command = "bash <<'EOF'\necho \"unterminated\nEOF"
+    expect(
+      await Effect.runPromise(Effect.result(ShellParse.scan(command, "/bin/bash", "/workspace", { portable: true }))),
+    ).toMatchObject({
+      _tag: "Failure",
+      failure: { message: "Portable shell scanner cannot analyze command: unterminated-quote in a script it runs" },
+    })
   })
 })

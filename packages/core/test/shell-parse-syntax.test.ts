@@ -80,7 +80,8 @@ describe("native shell syntax compatibility", () => {
     const command = "cat <<FIRST <<'SECOND'\n$(printf first)\nFIRST\n$(not_a_command)\nSECOND"
     const expected = {
       commands: [
-        { resource: command, save: "cat *", alternates: ["cat"] },
+        // The quoted body is data for cat and left out; the unquoted one is kept.
+        { resource: "cat <<FIRST <<'SECOND'\n$(printf first)\nFIRST", save: "cat *", alternates: ["cat"] },
         { resource: "printf first", save: "printf *" },
       ],
       directories: [],

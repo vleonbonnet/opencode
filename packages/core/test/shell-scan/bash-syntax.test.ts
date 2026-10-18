@@ -182,14 +182,23 @@ describe("ordinary Bash and Zsh syntax", () => {
 })
 
 describe("Bash shared heredoc delimiter grammar", () => {
+  test.each(['cat <<"E\\$OF"\nhello\nE$OF', '(cat <<"E\\$OF"\nhello\nE$OF\n)'])(
+    "preserves heredoc permission resources and saved prefixes: %s",
+    async (source) => {
+      const legacy = await Effect.runPromise(ShellParse.scan(source, "/bin/bash", "/workspace"))
+      expect(await Effect.runPromise(ShellParse.scanPortable(source, "/bin/bash", "/workspace"))).toEqual(legacy)
+    },
+  )
+
+  // Tree-sitter does not find the end of a body whose delimiter keeps a backslash; the legacy scan then reads the
+  // command as bash and the portable scanner do, which end the body there and leave the data out.
   test.each([
-    '(cat <<"E\\OF"\nhello\nE\\OF\n)',
-    'cat <<"E\\$OF"\nhello\nE$OF',
-    '(cat <<"E\\$OF"\nhello\nE$OF\n)',
-    '(cat <<-"E\\OF"\n\thello\n\tE\\OF\n)',
-  ])("preserves heredoc permission resources and saved prefixes: %s", async (source) => {
-    const legacy = await Effect.runPromise(ShellParse.scan(source, "/bin/bash", "/workspace"))
-    expect(await Effect.runPromise(ShellParse.scanPortable(source, "/bin/bash", "/workspace"))).toEqual(legacy)
+    ['(cat <<"E\\OF"\nhello\nE\\OF\n)', 'cat <<"E\\OF"'],
+    ['(cat <<-"E\\OF"\n\thello\n\tE\\OF\n)', 'cat <<-"E\\OF"'],
+  ])("leaves out a data-only body the legacy parse misreads: %s", async (source, resource) => {
+    const expected = { commands: [{ resource, save: "cat *", alternates: ["cat"] }], directories: [] }
+    expect(await Effect.runPromise(ShellParse.scan(source, "/bin/bash", "/workspace"))).toEqual(expected)
+    expect(await Effect.runPromise(ShellParse.scanPortable(source, "/bin/bash", "/workspace"))).toEqual(expected)
   })
 
   test.each([
