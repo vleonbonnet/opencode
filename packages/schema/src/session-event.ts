@@ -11,6 +11,7 @@ import { SessionID } from "./session-id.js"
 import { SessionMetadata } from "./session-metadata.js"
 import { Location } from "./location.js"
 import { SessionMessage } from "./session-message.js"
+import { SessionCache } from "./session-cache.js"
 import { Revert } from "./session-revert.js"
 import { Shell as ShellSchema } from "./shell.js"
 import { SessionError } from "./session-error.js"
@@ -465,6 +466,21 @@ export namespace Reasoning {
   export type Ended = typeof Ended.Type
 }
 
+export namespace Thinking {
+  /**
+   * Reasoning blocks that later requests leave out: dropped with the user's consent (`asText`, replayed as
+   * `<earlier-reasoning>` text) or by the provider (omitted). Published when the markers are recorded.
+   */
+  export const Dropped = Event.ephemeral({
+    type: "session.thinking.dropped",
+    schema: {
+      ...Base,
+      blocks: Schema.Array(SessionCache.DroppedThinkingBlock),
+    },
+  })
+  export type Dropped = typeof Dropped.Type
+}
+
 export namespace Tool {
   const ToolBase = {
     ...Base,
@@ -684,6 +700,7 @@ export const Definitions = Event.inventory(
   Reasoning.Started,
   Reasoning.Delta,
   Reasoning.Ended,
+  Thinking.Dropped,
   Tool.Input.Started,
   Tool.Input.Delta,
   Tool.Input.Ended,
