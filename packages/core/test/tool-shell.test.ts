@@ -307,7 +307,8 @@ describe("ShellTool scanner permissions", () => {
           expect(asked.requests).toMatchObject([
             {
               action: "shell",
-              resources: ["export SCAN_TEST=hello", "unset SCAN_TEST", "printf hello > marker", "printf hello"],
+              resources: ["export SCAN_TEST=hello", "unset SCAN_TEST", "printf hello > marker"],
+              alternates: [[], [], ["printf hello"]],
               save: ["export SCAN_TEST=*", "unset SCAN_TEST", "printf *"],
             },
           ])
@@ -356,12 +357,8 @@ describe("ShellTool scanner permissions", () => {
           for (const request of prompts) {
             expect(request).toMatchObject({
               action: "shell",
-              resources: [
-                "export SCAN_TEST=$(printf hello)",
-                "printf hello",
-                'printf %s "$SCAN_TEST" > marker',
-                'printf %s "$SCAN_TEST"',
-              ],
+              resources: ["export SCAN_TEST=$(printf hello)", "printf hello", 'printf %s "$SCAN_TEST" > marker'],
+              alternates: [[], [], ['printf %s "$SCAN_TEST"']],
               save: ["export SCAN_TEST=*", "printf *", "printf *"],
             })
           }
@@ -649,7 +646,8 @@ describe("ShellTool conditional process substitution", () => {
               expect(result.requests).toMatchObject([
                 {
                   action: "shell",
-                  resources: ["printf reached > marker", "printf reached", 'wait "$!"'],
+                  resources: ["printf reached > marker", 'wait "$!"'],
+                  alternates: [["printf reached"], []],
                   save: ["printf *", "wait *"],
                 },
               ])

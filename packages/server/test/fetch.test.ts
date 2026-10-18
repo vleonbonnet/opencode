@@ -588,7 +588,15 @@ it.live("routes pending requests through the Session's instance", () =>
     )
     expect(permissions.status).toBe(200)
     expect(yield* Effect.promise(() => permissions.json())).toMatchObject({
-      data: [{ id: "per_pending_read", sessionID: created.data.id, action: "shell", resources: ["pwd"] }],
+      data: [
+        {
+          id: "per_pending_read",
+          sessionID: created.data.id,
+          action: "shell",
+          resources: ["pwd"],
+          reasons: [{ resource: "pwd", rule: { action: "shell", effect: "ask" } }],
+        },
+      ],
     })
     expect(yield* loaded()).toHaveLength(1)
   }),

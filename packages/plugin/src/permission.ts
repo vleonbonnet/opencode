@@ -7,6 +7,7 @@ export const AssertInput = Schema.Struct({
   agent: Agent.ID.pipe(Schema.optional),
   action: Permission.Request.fields.action,
   resources: Permission.Request.fields.resources,
+  alternates: Permission.Request.fields.alternates,
   save: Permission.Request.fields.save,
   metadata: Permission.Request.fields.metadata,
   source: Permission.Request.fields.source,

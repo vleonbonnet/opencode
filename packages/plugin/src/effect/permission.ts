@@ -12,6 +12,8 @@ export interface PermissionEvaluation {
   readonly agent?: Agent.ID
   readonly action: string
   readonly resources: ReadonlyArray<string>
+  // For each resource, by its index, its other spellings, which a hook deciding by resource should check as well.
+  readonly alternates?: ReadonlyArray<ReadonlyArray<string>>
   readonly metadata?: Record<string, unknown>
   readonly source?: Permission.Source
   effect: Permission.Effect
