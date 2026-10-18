@@ -19,12 +19,22 @@ type Command = {
   wordEnds?: number[]
   statementHead?: true
   declaration?: true
+  // A statement of variable assignments alone, which runs nothing but binds variables for the commands after it.
+  // Only `statements` reports these.
+  assignment?: true
   // Words after a trailing redirect are destinations in the legacy command span.
   redirectWordCount?: number
 }
 
 // Opaque describes a parsing limitation, not a permission decision.
 export type Result = { kind: "scanned"; commands: Command[] } | { kind: "opaque"; reason: OpaqueReason }
+
+// The variable assignments prefixed to a command, as written.
+export type Place = { assignments: string[] }
+
+export type Statements =
+  | { kind: "scanned"; commands: Command[]; places: ReadonlyMap<Command, Place> }
+  | { kind: "opaque"; reason: OpaqueReason }
 
 const BASH_REDIRECTS = ["&>>", "&>", "<<<", "<<-", "<<", "<>", "<&", ">&", ">|", ">>", ">", "<"]
 const BASH_LIST_OPERATORS = ["&&", "||", "|&"]
@@ -132,12 +142,14 @@ type Opaque = { kind: "opaque"; reason: OpaqueReason }
 type BashResult = { kind: "scanned"; commands: Command[]; end: number } | Opaque
 
 // Shared across one scan: the work budget, the shell dialect, and whether a bound expansion reaches a variable sink.
+// For permission checks it also keeps the assignments prefixed to each command.
 type BashContext = {
   remaining: number
   dialect: Dialect
   boundDollar?: boolean
   boundOpen?: boolean
   variableSink?: boolean
+  places: Map<Command, Place>
 }
 
 type BashHeredoc = {
@@ -206,13 +218,21 @@ type BashEvaluation = "arithmetic" | "binding" | "deferred"
 export type Dialect = "bash" | "zsh" | "posix"
 
 export function scan(input: string, dialect: Dialect = "posix"): Result {
+  const result = statements(input, dialect)
+  if (result.kind === "opaque") return result
+  return { kind: "scanned", commands: result.commands.filter((command) => !command.assignment) }
+}
+
+// The scan permission checks read: the commands, with the statements of assignments alone among them in source order,
+// since what they bind decides what the commands after them see, and the assignments prefixed to each command.
+export function statements(input: string, dialect: Dialect = "posix"): Statements {
   if (input.length > MAX_INPUT_LENGTH) return { kind: "opaque", reason: "invalid-structure" }
-  const context: BashContext = { remaining: MAX_INPUT_LENGTH * MAX_SUBSTITUTION_DEPTH, dialect }
+  const context: BashContext = { remaining: MAX_INPUT_LENGTH * MAX_SUBSTITUTION_DEPTH, dialect, places: new Map() }
   const result = scanBash(input, 0, 0, context)
   if (result.kind === "opaque") return result
   if (context.boundDollar && context.boundOpen && context.variableSink)
     return { kind: "opaque", reason: "dynamic-execution" }
-  return { kind: "scanned", commands: result.commands }
+  return { kind: "scanned", commands: result.commands, places: context.places }
 }
 
 function bashStatement(state: BashState) {
@@ -365,6 +385,7 @@ function finishBashCommand(state: BashState, boundary = false) {
         : {}),
     }
     state.commands.push(command)
+    state.context.places.set(command, { assignments: state.rawWords.slice(0, name) })
     const builtin = bashBuiltinIndex(state)
     const builtinName = state.words[builtin]
     const builtinArgs = state.words.slice(builtin + 1)
@@ -410,6 +431,15 @@ function finishBashCommand(state: BashState, boundary = false) {
       }
     }
   }
+  if (name < 0 && !inHeader && state.words.length > 0)
+    state.commands.push({
+      resource: state.input
+        .slice(state.commandStart, state.resourceEnd ?? state.wordEnd)
+        .replace(/^[ \t\n]+|[ \t\n]+$/g, ""),
+      words: state.words.slice(),
+      rawWords: state.rawWords.slice(),
+      assignment: true,
+    })
   if (boundary && !state.words.length && !state.hasRedirect && !state.compoundEnd && !inHeader)
     state.invalid ??= "invalid-structure"
   if (state.words.length > (state.ampersandRedirectWords ?? Infinity)) state.invalid ??= "invalid-redirect"

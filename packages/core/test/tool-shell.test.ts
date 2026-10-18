@@ -295,26 +295,37 @@ describe("ShellTool scanner permissions", () => {
   for (const portable of [false, true]) {
     const scanner = portable ? "native" : "legacy"
 
-    test(`${scanner}: declarations reuse approvals while substitutions retain reject/once/always behavior`, () =>
+    test(`${scanner}: declarations ask and reuse approvals while substitutions retain reject/once/always behavior`, () =>
       withScanner(portable, (registry, fixture) =>
         Effect.gen(function* () {
           const saved = yield* PermissionSaved.Service
           const location = yield* Location.Service
           yield* saved.add({ projectID: location.project.id, action: "shell", resources: ["printf *"] })
           const marker = path.join(fixture.active, "marker")
-          const approved = yield* runPermissionCommand(
-            registry,
-            "export SCAN_TEST=hello; unset SCAN_TEST; printf hello > marker",
-            marker,
-            [],
-          )
+          const declarations = "export SCAN_TEST=hello; unset SCAN_TEST; printf hello > marker"
+          const asked = yield* runPermissionCommand(registry, declarations, marker, ["always"])
+          expect(asked.requests).toMatchObject([
+            {
+              action: "shell",
+              resources: ["export SCAN_TEST=hello", "unset SCAN_TEST", "printf hello > marker", "printf hello"],
+              save: ["export SCAN_TEST=*", "unset SCAN_TEST", "printf *"],
+            },
+          ])
+          expect(asked.exit).toMatchObject({ _tag: "Success", value: { status: "completed", metadata: { exit: 0 } } })
+          expect(yield* Effect.promise(() => Bun.file(marker).text())).toBe("hello")
+          expect((yield* saved.list()).map((item) => item.resource).sort()).toEqual([
+            "export SCAN_TEST=*",
+            "printf *",
+            "unset SCAN_TEST",
+          ])
+          yield* Effect.promise(() => fs.rm(marker))
+          const approved = yield* runPermissionCommand(registry, declarations, marker, [])
           expect(approved.requests).toEqual([])
           expect(approved.exit).toMatchObject({
             _tag: "Success",
             value: { status: "completed", metadata: { exit: 0 } },
           })
           expect(yield* Effect.promise(() => Bun.file(marker).text())).toBe("hello")
-          expect((yield* saved.list()).map((item) => item.resource)).toEqual(["printf *"])
 
           yield* Effect.forEach(yield* saved.list(), (item) => saved.remove(item.id))
           const command = 'export SCAN_TEST=$(printf hello); printf %s "$SCAN_TEST" > marker'
@@ -345,11 +356,16 @@ describe("ShellTool scanner permissions", () => {
           for (const request of prompts) {
             expect(request).toMatchObject({
               action: "shell",
-              resources: ["printf hello", 'printf %s "$SCAN_TEST" > marker', 'printf %s "$SCAN_TEST"'],
-              save: ["printf *", "printf *"],
+              resources: [
+                "export SCAN_TEST=$(printf hello)",
+                "printf hello",
+                'printf %s "$SCAN_TEST" > marker',
+                'printf %s "$SCAN_TEST"',
+              ],
+              save: ["export SCAN_TEST=*", "printf *", "printf *"],
             })
           }
-          expect((yield* saved.list()).map((item) => item.resource)).toEqual(["printf *"])
+          expect((yield* saved.list()).map((item) => item.resource).sort()).toEqual(["export SCAN_TEST=*", "printf *"])
 
           const agents = yield* Agent.Service
           yield* agents.transform((editor) =>
@@ -727,13 +743,13 @@ describe("ShellTool ordinary shell syntax", () => {
           name: "parameter fallback",
           command: 'value=; printf %s "${value:-fallback}"',
           output: "fallback",
-          saved: ["printf *"],
+          saved: ["value=*", "printf *"],
         },
         {
           name: "arithmetic statement",
           command: 'count=1; ((count += 1)); printf %s "$count"',
           output: "2",
-          saved: ["((count += 1)) *", "printf *"],
+          saved: ["count=*", "((count += 1)) *", "printf *"],
         },
         { name: "ANSI-C quoting", command: "printf %s $'a\\nb'", output: "a\nb", saved: ["printf *"] },
       ]) {

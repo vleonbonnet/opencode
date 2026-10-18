@@ -95,17 +95,19 @@ describe("ShellParse", () => {
   )
 
   test.each(["declare", "typeset", "export", "readonly", "local", "unset", "unsetenv"])(
-    "preserves declaration permission behavior for %s without hiding nested commands",
+    "checks %s declarations as written without hiding nested commands",
     async (name) => {
       for (const command of [`${name} X`, `${name} "$(printf X)"; git status`]) {
         const legacy = await Effect.runPromise(ShellParse.scan(command, "/bin/bash", "/workspace"))
+        // A variable set without a value is saved exactly, and one named at run time as written.
         expect(legacy.commands).toEqual(
           command.includes("$(")
             ? [
+                { resource: `${name} "$(printf X)"`, save: `${name} "$(printf X)"` },
                 { resource: "printf X", save: "printf *" },
                 { resource: "git status", save: "git status *" },
               ]
-            : [],
+            : [{ resource: command, save: command }],
         )
         expect(
           await Effect.runPromise(ShellParse.scan(command, "/bin/bash", "/workspace", { portable: true })),
@@ -123,9 +125,15 @@ describe("ShellParse", () => {
     },
   )
 
-  test("declaration filtering retains directory checks inside command substitutions", async () => {
+  test("declarations retain directory checks inside command substitutions", async () => {
     const command = "export X=$(cd /outside; printf value)"
-    const expected = { commands: [{ resource: "printf value", save: "printf *" }], directories: ["/outside"] }
+    const expected = {
+      commands: [
+        { resource: command, save: "export X=*" },
+        { resource: "printf value", save: "printf *" },
+      ],
+      directories: ["/outside"],
+    }
     expect(await Effect.runPromise(ShellParse.scan(command, "/bin/bash", "/workspace"))).toEqual(expected)
     expect(await Effect.runPromise(ShellParse.scan(command, "/bin/bash", "/workspace", { portable: true }))).toEqual(
       expected,
@@ -311,5 +319,84 @@ describe("ShellParse commands behind a prefix", () => {
   test.each(["pwsh", "cmd"])("leaves %s commands as written", async (shell) => {
     const result = await Effect.runPromise(ShellParse.scan("env rm -rf build", shell, "/workspace"))
     expect(result.commands).toEqual([{ resource: "env rm -rf build", save: "env *" }])
+  })
+})
+
+describe("ShellParse statements that set or clear variables", () => {
+  test.each<{ name: string; command: string; resources: string[]; save?: string[] }>([
+    {
+      name: "an export before a command",
+      command: "export KUBECONFIG=~/.kube/admin; kubectl get pods",
+      resources: ["export KUBECONFIG=~/.kube/admin", "kubectl get pods"],
+      save: ["export KUBECONFIG=*"],
+    },
+    {
+      name: "an assignment statement before a command",
+      command: "KUBECONFIG=x; kubectl get pods",
+      resources: ["KUBECONFIG=x"],
+      save: ["KUBECONFIG=*"],
+    },
+    {
+      name: "assignments grouped before a command, one variable each",
+      command: "A=1 B=2; ls",
+      resources: ["A=1", "B=2"],
+      save: ["A=*", "B=*"],
+    },
+    {
+      name: "a declaration of several variables, one each",
+      command: "declare -x A=1 B; ls",
+      resources: ["declare -x A=1", "declare -x B"],
+      save: ["declare -x A=*", "declare -x B"],
+    },
+    {
+      name: "assignments with a redirect, as written and one variable each",
+      command: "A=1 B=2 > log",
+      resources: ["A=1 B=2 > log", "A=1", "B=2"],
+      save: ["A=1 B=2 > log", "A=*", "B=*"],
+    },
+    {
+      name: "an appending assignment",
+      command: "PATH+=:/opt/bin; ls",
+      resources: ["PATH+=:/opt/bin"],
+      save: ["PATH+=*"],
+    },
+    {
+      name: "an unset before a command",
+      command: "unset KUBECONFIG; ls",
+      resources: ["unset KUBECONFIG"],
+      save: ["unset KUBECONFIG"],
+    },
+    {
+      name: "a declaration inside a script",
+      command: `bash -c 'declare -x KUBECONFIG=x; kubectl get pods'`,
+      resources: ["declare -x KUBECONFIG=x", "kubectl get pods"],
+    },
+    { name: "a declaration in a compound statement", command: "if true; then local K=x; fi", resources: ["local K=x"] },
+    { name: "a declaration with a redirect", command: "export X=1 > log", resources: ["export X=1 > log"] },
+    { name: "an assignment in a substitution", command: "echo $(X=1)", resources: ["X=1"], save: ["X=*"] },
+  ])("checks $name", async ({ command, resources, save }) => {
+    const result = await scanned(command)
+    for (const resource of resources) expect(result.commands.map((item) => item.resource)).toContain(resource)
+    for (const item of save ?? []) expect(result.commands.map((entry) => entry.save)).toContain(item)
+  })
+
+  test("checks an assignment prefixed to a command with that command, and on its own", async () => {
+    expect((await scanned("FOO=1 ls")).commands).toEqual([
+      { resource: "FOO=1 ls", save: "ls *", alternates: ["ls"] },
+      { resource: "FOO=1", save: "FOO=*" },
+    ])
+  })
+
+  test("leaves the arithmetic of a C-style for loop alone", async () => {
+    expect((await scanned("for ((i=0; i<2; i++)); do printf ok; done")).commands).toEqual([
+      { resource: "printf ok", save: "printf *" },
+    ])
+  })
+
+  test("leaves cmd.exe statements to the commands they run", async () => {
+    for (const portable of [false, true])
+      expect(
+        await Effect.runPromise(ShellParse.scan("export X=1; Y=2; unset X", "cmd", "/workspace", { portable })),
+      ).toEqual({ commands: [], directories: [] })
   })
 })

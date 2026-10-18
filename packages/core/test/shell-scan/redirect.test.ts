@@ -163,10 +163,14 @@ describe("Bash redirect resource oracle", () => {
     const source = "printf ok | FOO=bar >output git status 3>tail"
     const legacy = await Effect.runPromise(ShellParse.scan(source, "/bin/bash", "/workspace"))
     const native = await Effect.runPromise(ShellParse.scanPortable(source, "/bin/bash", "/workspace"))
-    expect(legacy.commands).toEqual([{ resource: "printf ok", save: "printf *" }])
+    expect(legacy.commands).toEqual([
+      { resource: "printf ok", save: "printf *" },
+      { resource: "FOO=bar", save: "FOO=*" },
+    ])
     expect(native.commands).toEqual([
       { resource: "printf ok", save: "printf *" },
       { resource: "FOO=bar >output git status", save: "git status *", alternates: ["git status"] },
+      { resource: "FOO=bar", save: "FOO=*" },
     ])
   })
 

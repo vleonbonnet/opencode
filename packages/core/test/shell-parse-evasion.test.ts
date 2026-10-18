@@ -213,6 +213,77 @@ describe("ShellParse refuses scripts it cannot read", () => {
   })
 })
 
+// The patterns an "always" reply to COMMAND saves; both scanners must save the same ones.
+async function saves(command: string, shell = "/bin/bash") {
+  const results = (await scans(command, shell)).map((result) =>
+    result instanceof Error ? result : result.commands.flatMap((item) => (item.save === undefined ? [] : [item.save])),
+  )
+  expect(results[1], command).toEqual(results[0])
+  if (results[0] instanceof Error) throw results[0]
+  return results[0]
+}
+
+// Whether PATTERNS, saved as approvals, allow COMMAND in both scanners: each of its commands has a spelling one of
+// them matches.
+async function allows(patterns: readonly string[], command: string, shell = "/bin/bash") {
+  return (await scans(command, shell)).every(
+    (result) =>
+      !(result instanceof Error) &&
+      result.commands.every((item) =>
+        [item.resource, ...(item.alternates ?? [])].some((text) =>
+          patterns.some((pattern) => Wildcard.match(text, pattern)),
+        ),
+      ),
+  )
+}
+
+describe("ShellParse saved approvals", () => {
+  test.each([
+    "FOO=1 ls",
+    ">out ls",
+    '"kubectl" get pods',
+    "/opt/bin/kubectl get pods",
+    "kubectl $'get' pods",
+    "git $(printf diff) --stat",
+    "npm run 123",
+    "export X=1",
+    'export "A"=1',
+    "export -p > out",
+    "declare -x A=1 B=2",
+    "A=1 B=2",
+    "unset A B",
+    "KUBECONFIG=x kubectl get pods",
+    "sudo X=1 kubectl get pods",
+    "env A=1 B=2 ls",
+    "time -p git status",
+    "printf ok > out",
+    "pwsh -c 'Get-Item x'",
+  ])("an approval covers the command it was given for: %s", async (command) => {
+    expect(await allows(await saves(command), command)).toBe(true)
+  })
+
+  test.each([
+    ["export X=1", "export KUBECONFIG=x"],
+    ["export X=1", "export PATH=/tmp/x"],
+    ["A=1 B=2", "A=1 PATH=/tmp/x:$PATH"],
+    ["A=1", "A=1 PATH=/tmp/x ls"],
+    ["A=1 ls", "A=1 PATH=/tmp/x ls"],
+    ["env A=1 ls", "env PATH=/tmp/x ls"],
+    ["sudo A=1 ls", "sudo PATH=/tmp/x ls"],
+    ["unset A", "unset KUBECONFIG"],
+    ["declare A=1", "declare -n A=PATH"],
+    ['"kubectl" get pods', '"kubectl" delete pod x'],
+    ["/usr/bin/kubectl get pods", "/usr/bin/kubectl delete pod x"],
+    ["git $(printf diff) --stat", "git --stat"],
+    ["npm run 123", "npm run build"],
+    ["* x", "rm -rf /"],
+    ["l? -la", "ls -la"],
+    ["kubectl * pods", "kubectl delete pods"],
+  ])("an approval of %s does not cover %s", async (approved, other) => {
+    expect(await allows(await saves(approved), other)).toBe(false)
+  })
+})
+
 describe("ShellUnwrap.literal keeps expansions whole", () => {
   test.each([
     [`"$(printf '%s' "x")"`, `$(printf '%s' "x")`],

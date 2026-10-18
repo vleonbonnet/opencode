@@ -57,7 +57,7 @@ describe("ShellParse native parity", () => {
     expect(await Effect.runPromise(ShellParse.scan(command, shell, "/workspace", { portable: true }))).toEqual(native)
   })
 
-  test.each(["> output", "FOO=bar", "2>> output"])(
+  test.each(["> output", "2>> output"])(
     "returns an explicit empty result for statements without executable command nodes: %s",
     async (command) => {
       expect(ShellScan.scan(command)).toEqual({ kind: "scanned", commands: [] })
@@ -69,6 +69,16 @@ describe("ShellParse native parity", () => {
       )
     },
   )
+
+  test("checks an assignment on its own as written, though it runs no command", async () => {
+    expect(ShellScan.scan("FOO=bar")).toEqual({ kind: "scanned", commands: [] })
+    const native = await Effect.runPromise(ShellParse.scanPortable("FOO=bar", "bash", "/workspace"))
+    expect(native).toEqual({ commands: [{ resource: "FOO=bar", save: "FOO=*" }], directories: [] })
+    expect(await Effect.runPromise(ShellParse.scan("FOO=bar", "bash", "/workspace"))).toEqual(native)
+    expect(await Effect.runPromise(ShellParse.scan("FOO=bar", "bash", "/workspace", { portable: true }))).toEqual(
+      native,
+    )
+  })
 })
 
 describe("ShellParse malformed native syntax", () => {

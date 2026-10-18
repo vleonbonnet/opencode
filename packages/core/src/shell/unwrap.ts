@@ -15,6 +15,8 @@ export type View = { name: string; program: string; args: string[]; implied?: tr
 export type Unwrapped = {
   views: View[]
   scripts: Script[]
+  // The variable assignments a runner passes to the command it runs (`env A=1 cmd`, `sudo A=1 cmd`), as written.
+  assignments: string[]
   // Script text handed to a shell whose language is not POSIX shell (pwsh, cmd, fish, csh), checked as written.
   texts: string[]
   // More commands than MAX_VIEWS, so not all of them were found.
@@ -328,11 +330,11 @@ const FIND_EXECS = new Set(["-exec", "-execdir", "-ok", "-okdir"])
 
 // Every command a simple command runs, from its words as written: the command itself, then whatever its runners
 // (`env`, `sudo`, `xargs`, …), `find -exec` and container tools run in turn, together with the script strings it
-// hands to a shell's -c, to `eval`, to `env -S`, to `watch`, to `ssh` or to `su`. DIALECT is the shell reading the
-// words, which `eval` runs its script in. Each inner command has fewer words than the one running it, so the walk
-// ends.
+// hands to a shell's -c, to `eval`, to `env -S`, to `watch`, to `ssh` or to `su`, and the assignments its runners
+// pass. DIALECT is the shell reading the words, which `eval` runs its script in. Each inner command has fewer words
+// than the one running it, so the walk ends.
 export function unwrap(words: readonly string[], dialect: Dialect = "posix"): Unwrapped {
-  const result: Unwrapped = { views: [], scripts: [], texts: [] }
+  const result: Unwrapped = { views: [], scripts: [], assignments: [], texts: [] }
   if (!words.length) return result
   result.views.push(view(words, 0, dialect))
   for (let i = 0; i < result.views.length; i++) {
@@ -347,6 +349,7 @@ export function unwrap(words: readonly string[], dialect: Dialect = "posix"): Un
     for (const script of step.scripts)
       if (!result.scripts.some((known) => known.text === script.text && known.dialect === script.dialect))
         result.scripts.push(script)
+    for (const word of step.assignments) if (!result.assignments.includes(word)) result.assignments.push(word)
     for (const text of step.texts) if (!result.texts.includes(text)) result.texts.push(text)
   }
   return result
@@ -365,7 +368,7 @@ function implied(): View {
 }
 
 function empty(): Step {
-  return { views: [], scripts: [], texts: [] }
+  return { views: [], scripts: [], assignments: [], texts: [] }
 }
 
 // The commands and script strings one command runs on behalf of its words.
@@ -423,7 +426,8 @@ function runner(
     if (parse.options.some((option) => grammar.none?.includes(option.name))) continue
     let at = Math.min(item.args.length, parse.at + (grammar.operands ?? 0))
     if (after?.(parse, item.args.slice(at), step)) continue
-    while (at < item.args.length && !dynamic(item.args[at]) && ASSIGNMENT.test(literal(item.args[at]))) at++
+    while (at < item.args.length && !dynamic(item.args[at]) && ASSIGNMENT.test(literal(item.args[at])))
+      step.assignments.push(item.args[at++])
     if (at < item.args.length) step.views.push(view(item.args, at, dialect))
     else if (
       grammar.shell === true ||
@@ -1157,4 +1161,41 @@ export function spellings(item: View) {
 export function renamed(item: View): View | undefined {
   if (dynamic(item.program) || literal(item.program) === item.name) return
   return { name: item.name, program: quote(item.name), args: item.args }
+}
+
+// The words of ITEM unquoted when every one is static, else as written: the spelling an approval saves.
+export function words(item: View) {
+  const written = [item.program, ...item.args]
+  return written.some(dynamic) ? written : written.map(literal)
+}
+
+// The statements a declaration (`export`, `declare`, `local`, `readonly`, `typeset`, `unset`) makes, one for each
+// variable it sets or clears: its keyword and options with that one operand, and the approval saving that variable
+// alone (`export NAME=*`, `declare -x NAME=*`, `unset NAME`).
+export function declarations(words: readonly string[]) {
+  const [keyword = "", ...rest] = words
+  let at = 0
+  for (; at < rest.length && !dynamic(rest[at]) && /^[-+]./.test(literal(rest[at])); at++)
+    if (literal(rest[at]) === "--") {
+      at++
+      break
+    }
+  const head = [keyword, ...rest.slice(0, at)]
+  return rest.slice(at).map((operand) => ({ words: [...head, operand], save: variable([...head, operand]) }))
+}
+
+// The approval saving the variable an assignment sets: `NAME=*`.
+export function assignment(word: string) {
+  return variable([word])
+}
+
+// The approval saving the variable the last of WORDS sets or clears, after a declaration's keyword and options: the
+// words with that variable's value as a wildcard, or as written when it sets none; none when a wildcard in a name
+// would match other variables.
+function variable(words: readonly string[]) {
+  const values = words.map((word) => (dynamic(word) ? word : literal(word)))
+  const name = /^[A-Za-z_][A-Za-z0-9_]*(?:\[(?:[^\]\\]|\\.)*\])?\+?(?==)/.exec(values.at(-1) ?? "")?.[0]
+  const text = name ? [...values.slice(0, -1), name].join(" ") : values.join(" ")
+  if (/[*?]/.test(text)) return
+  return name ? `${text}=*` : text
 }

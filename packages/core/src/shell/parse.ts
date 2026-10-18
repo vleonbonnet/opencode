@@ -18,6 +18,24 @@ const POWERSHELL_PATH_FLAG_RE =
   /^-(?:p(?:ath|at|a)?|lp|l(?:i(?:t(?:e(?:r(?:a(?:l(?:p(?:a(?:t(?:h)?)?)?)?)?)?)?)?)?)?|psp(?:a(?:t(?:h)?)?)?):?$/i
 // A redirect operator after line continuations, which make a descriptor word before them part of the redirect.
 const CONTINUED_REDIRECT_RE = /(?:\\\n)+[<>]/y
+// Statements that change the environment of the commands after them, which bash parses apart from commands:
+// `export`, `declare`, `local`, `readonly`, `typeset`, `unset`, and `NAME=value` on its own. Their text decides what
+// the commands after them see (`export KUBECONFIG=…`), so it is checked as well.
+const LEGACY_STATEMENTS = [
+  "command",
+  "declaration_command",
+  "unset_command",
+  "variable_assignments",
+  "variable_assignment",
+]
+// An assignment prefixed to a command, in a declaration or among other assignments is checked with them; one in the
+// header of `for ((…))` is arithmetic, as in `((…))`.
+const LEGACY_ASSIGNMENT_OWNERS = new Set([
+  "command",
+  "declaration_command",
+  "variable_assignments",
+  "c_style_for_statement",
+])
 
 export type Result = {
   // Each command found: the resource as written; the prefix an approval saves, absent when no pattern would match
@@ -222,8 +240,21 @@ type Script = ShellUnwrap.Script
 function legacyCommands(output: Collector, root: Node, source: string, options: Options) {
   const text = (node: Node) => (node.parent?.type === "redirected_statement" ? node.parent.text : node.text).trim()
   const scripts: Script[] = []
-  for (const node of root.descendantsOfType("command")) {
+  for (const node of root.descendantsOfType(options.posix ? LEGACY_STATEMENTS : ["command"])) {
     if (!node) continue
+    if (node.type !== "command") {
+      if (node.type === "variable_assignment" && LEGACY_ASSIGNMENT_OWNERS.has(node.parent?.type ?? "")) continue
+      const words = joined(
+        node.type === "variable_assignment"
+          ? [node]
+          : node.type === "variable_assignments"
+            ? node.namedChildren
+            : node.children,
+        source,
+      )
+      variables(output, text(node), words, node.type === "declaration_command" || node.type === "unset_command")
+      continue
+    }
     const command = parts(node)
     const tokens = command.map((part) => part.text)
     if (tokens.length === 0) continue
@@ -237,7 +268,16 @@ function legacyCommands(output: Collector, root: Node, source: string, options: 
       output.command(text(node), save)
       continue
     }
-    scripts.push(...expand(output, text(node), save, legacyWords(node, source), options.dialect))
+    const words = legacyWords(node, source)
+    const assignments = node.children
+      .filter((child): child is Node => child?.type === "variable_assignment")
+      .map((child) => child.text)
+    // The grammar reads assignments with a redirect as a command with an empty name.
+    if (!words[0] && assignments.length) {
+      variables(output, text(node), assignments, false)
+      continue
+    }
+    scripts.push(...expand(output, text(node), save, words, options.dialect, assignments))
   }
   return scripts
 }
@@ -250,13 +290,7 @@ function legacyWords(node: Node, source: string) {
   const name = node.childForFieldName("name")
   if (!name) return []
   const nodes = [name, ...node.childrenForFieldName("argument").filter((item): item is Node => Boolean(item))]
-  return nodes
-    .reduce<Array<{ start: number; end: number }>>((words, item) => {
-      const last = words.at(-1)
-      if (last && /^(?:\\\n)*$/.test(source.slice(last.end, item.startIndex))) last.end = item.endIndex
-      else words.push({ start: item.startIndex, end: item.endIndex })
-      return words
-    }, [])
+  return wordRanges(nodes, source)
     .filter((word, index) => {
       if (index === 0 || !/^(?:\d+|\{[A-Za-z_][A-Za-z0-9_]*\})$/.test(source.slice(word.start, word.end))) return true
       CONTINUED_REDIRECT_RE.lastIndex = word.end
@@ -265,6 +299,26 @@ function legacyWords(node: Node, source: string) {
     .map((word) => source.slice(word.start, word.end))
 }
 
+// The words NODES make in SOURCE: nodes with nothing but line continuations between them are one word, which
+// Tree-sitter splits.
+function joined(nodes: readonly (Node | null)[], source: string) {
+  return wordRanges(
+    nodes.filter((item): item is Node => Boolean(item)),
+    source,
+  ).map((word) => source.slice(word.start, word.end))
+}
+
+function wordRanges(nodes: readonly Node[], source: string) {
+  return nodes.reduce<Range[]>((words, item) => {
+    const last = words.at(-1)
+    if (last && /^(?:\\\n)*$/.test(source.slice(last.end, item.startIndex))) last.end = item.endIndex
+    else words.push({ start: item.startIndex, end: item.endIndex })
+    return words
+  }, [])
+}
+
+type Range = { start: number; end: number }
+
 export const scanPortable = Effect.fnUntraced(function* (command: string, shell: string, cwd: string) {
   const { ShellScan } = yield* Effect.tryPromise({
     try: () => import("./scan.js"),
@@ -272,41 +326,46 @@ export const scanPortable = Effect.fnUntraced(function* (command: string, shell:
   })
   const powershell = ShellSelect.ps(shell)
   const options = { powershell, posix: posix(shell), cwd, shell, dialect: dialect(shell) }
-  const result = powershell ? ShellScan.scanPowerShell(command) : ShellScan.scan(command, options.dialect)
+  const result = powershell
+    ? statementsOf(ShellScan.scanPowerShell(command))
+    : ShellScan.statements(command, options.dialect)
   if (result.kind === "opaque")
     return yield* Effect.fail(new Error(`Portable shell scanner cannot analyze command: ${result.reason}`))
 
   const output = collector()
-  const scripts = portableCommands(output, result.commands, options)
+  const scripts = portableCommands(output, result, options)
   // A script is read in the dialect of the shell that runs it, and refused as the command would be when it cannot be.
   follow(output, scripts, (script) => {
-    const nested = ShellScan.scan(script.text, script.dialect)
+    const nested = ShellScan.statements(script.text, script.dialect)
     if (nested.kind === "opaque") {
       output.fail(`Portable shell scanner cannot analyze command: ${nested.reason} in a script it runs`)
       return []
     }
-    return portableCommands(output, nested.commands, {
-      ...options,
-      powershell: false,
-      posix: true,
-      dialect: script.dialect,
-    })
+    return portableCommands(output, nested, { ...options, powershell: false, posix: true, dialect: script.dialect })
   })
   return yield* finish(output)
 })
 
+type Portable = Extract<ShellScan.Statements, { kind: "scanned" }>
+type Command = Portable["commands"][number]
+
+// A PowerShell scan has no assignments prefixed to its commands.
+function statementsOf(result: ShellScan.Result): ShellScan.Statements {
+  return result.kind === "opaque" ? result : { ...result, places: new Map() }
+}
+
 // Adds the commands the portable scanner found and returns the script strings they hand to a shell.
-function portableCommands(
-  output: Collector,
-  commands: Extract<ShellScan.Result, { kind: "scanned" }>["commands"],
-  options: Options,
-) {
+function portableCommands(output: Collector, scanned: Portable, options: Options) {
   const { powershell, cwd, shell } = options
   const scripts: Script[] = []
-  for (const item of commands) {
-    // The legacy command walk skips declarations, not the substitutions within them.
-    if (item.declaration) continue
-    const words = item.redirectWordCount === undefined ? item.rawWords : item.rawWords.slice(0, item.redirectWordCount)
+  for (const item of scanned.commands) {
+    const resource = item.resource
+    // Declarations and assignments are checked as written, which the substitutions within them are as well.
+    if (item.declaration || item.assignment) {
+      if (options.posix) variables(output, resource, portableWords(item), Boolean(item.declaration))
+      continue
+    }
+    const words = portableWords(item)
     // The shipped PowerShell grammar treats bare statement-head foreach blocks as control flow.
     if (
       powershell &&
@@ -363,12 +422,18 @@ function portableCommands(
             return `${item.resource.slice(0, boundary)}${separator ?? " "}*`
           })()
     if (!options.posix) {
-      output.command(item.resource, save)
+      output.command(resource, save)
       continue
     }
-    scripts.push(...expand(output, item.resource, save, words, options.dialect))
+    const assignments = scanned.places.get(item)?.assignments ?? []
+    scripts.push(...expand(output, resource, save, words, options.dialect, assignments))
   }
   return scripts
+}
+
+// The words a command runs with, as written: without the redirect destinations after a trailing redirect.
+function portableWords(item: Command) {
+  return item.redirectWordCount === undefined ? item.rawWords : item.rawWords.slice(0, item.redirectWordCount)
 }
 
 // Bash-family shells; PowerShell and cmd.exe give runners, quoting and scripts other meanings.
@@ -424,29 +489,29 @@ function finish(output: Collector) {
 
 // Emits the command written as RESOURCE, with the other spellings of the command its WORDS run, and each command it
 // runs behind a runner (`sudo`, `env`, `xargs`, …), under a bare program name (`/bin/rm` as `rm`) or as a script
-// handed to a shell that is not POSIX. Rules match command text, so each is checked on its own: this only adds
-// resources and spellings, so it can add a prompt or a denial, never lift one. Returns the script strings the command
-// hands to a POSIX shell.
+// handed to a shell that is not POSIX, together with the ASSIGNMENTS prefixed to it and those its runners pass, each
+// a resource of its own. Rules match command text, so each is checked on its own: this only adds resources and
+// spellings, so it can add a prompt or a denial, never lift one. FALLBACK is saved for a statement with no command.
+// Returns the script strings the command hands to a POSIX shell.
 function expand(
   output: Collector,
   resource: string,
-  save: string,
+  fallback: string,
   words: readonly string[],
   dialect: ShellUnwrap.Dialect,
+  assignments: readonly string[] = [],
 ) {
   // The legacy grammar gives a statement of assignments with a redirect an empty command name.
   const found = ShellUnwrap.unwrap(words[0] ? words : [], dialect)
   if (found.truncated) output.fail("Shell command runs too many nested commands to check")
   const [head, ...rest] = found.views
-  output.command(resource, save, head ? ShellUnwrap.spellings(head) : [])
+  output.command(resource, head ? saved(head) : fallback, head ? ShellUnwrap.spellings(head) : [])
+  for (const word of [...assignments, ...found.assignments])
+    output.extra(word, ShellUnwrap.assignment(word), spelled([word]))
   if (head) renamed(output, head)
   for (const view of rest) {
     if (view.implied || !view.program || CWD.has(view.name)) continue
-    output.extra(
-      ShellUnwrap.text(view),
-      `${prefix([view.name, ...view.args]).join(" ")} *`,
-      ShellUnwrap.spellings(view),
-    )
+    output.extra(ShellUnwrap.text(view), saved(view), ShellUnwrap.spellings(view))
     renamed(output, view)
   }
   for (const text of found.texts) output.extra(text, exact(text))
@@ -456,12 +521,49 @@ function expand(
 // The command as its bare program name runs it, when that differs from the program as written.
 function renamed(output: Collector, view: ShellUnwrap.View) {
   const bare = ShellUnwrap.renamed(view)
-  if (bare)
-    output.extra(
-      ShellUnwrap.text(bare),
-      `${prefix([bare.name, ...bare.args]).join(" ")} *`,
-      ShellUnwrap.spellings(bare),
-    )
+  if (bare) output.extra(ShellUnwrap.text(bare), saved(bare), ShellUnwrap.spellings(bare))
+}
+
+// The prefix an approval of a command saves: its words, unquoted when every one is static, as far as the arity of
+// its program reaches, so the save matches the spelling the rules check; none when one of those words is a glob,
+// whose expansion no saved pattern can name.
+function saved(view: ShellUnwrap.View) {
+  const words = ShellUnwrap.words(view)
+  const length = prefix([view.name, ...words.slice(1)].slice(0, PREFIX_LENGTH)).length
+  const head = words.slice(0, length)
+  return head.some((word) => /[*?]/.test(word)) ? undefined : `${head.join(" ")} *`
+}
+
+// Emits a statement that sets or clears variables, RESOURCE as written from WORDS: one resource for each variable,
+// saved as that variable alone (`export NAME=*`, `NAME=*`, `unset NAME`), so approving one never covers another. A
+// statement of one variable is that resource as written, and one of none is saved exactly; one of several is listed
+// as written as well when its text holds more than its words, such as a redirect.
+function variables(output: Collector, resource: string, words: readonly string[], declaration: boolean) {
+  const statements = declaration
+    ? ShellUnwrap.declarations(words)
+    : words.map((word) => ({ words: [word], save: ShellUnwrap.assignment(word) }))
+  if (statements.length === 0) return output.command(resource, exact(resource), spelled(words))
+  if (statements.length === 1) return output.command(resource, statements[0].save, spelled(statements[0].words))
+  if (!bare(resource, words)) output.command(resource, exact(resource))
+  for (const statement of statements)
+    output.command(statement.words.join(" "), statement.save, spelled(statement.words))
+}
+
+// The spellings of WORDS: as written, and unquoted when every one is static.
+function spelled(words: readonly string[]) {
+  const text = words.join(" ")
+  return words.some(ShellUnwrap.dynamic) ? [text] : [text, words.map(ShellUnwrap.literal).join(" ")]
+}
+
+// Whether TEXT is WORDS alone, with nothing but blanks and line continuations between them.
+function bare(text: string, words: readonly string[]) {
+  let at = 0
+  for (const word of words) {
+    at += /^(?:[ \t]|\\\n)*/.exec(text.slice(at))![0].length
+    if (!text.startsWith(word, at)) return false
+    at += word.length
+  }
+  return /^(?:[ \t]|\\\n)*$/.test(text.slice(at))
 }
 
 // A pattern matching TEXT alone, when no wildcard in it would match more.
