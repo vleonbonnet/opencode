@@ -437,7 +437,8 @@ export function make(
         "http.request",
         (evt) =>
           Effect.gen(function* () {
-            if (evt.model.providerID !== Provider.ID.azure) return
+            // A dry run is captured before the network and never needs a token.
+            if (evt.model.providerID !== Provider.ID.azure || evt.dryRun) return
             const authorization = yield* bearer(evt.request.url)
             if (!authorization) return
             evt.request.headers.delete("api-key")

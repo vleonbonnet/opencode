@@ -150,14 +150,48 @@ const toolResult = (tool: SessionMessage.AssistantTool, providerMetadata: Provid
   }
 }
 
-const assistant = (message: SessionMessage.Assistant, model: Model.Ref, providerMetadataKey: string) => {
+/**
+ * Reasoning replayed as plain text when its signed form cannot be: its signature no longer matches the conversation
+ * and the user consented to drop it. The tag keeps the model from reading it as something it told the user.
+ */
+export const earlierReasoning = (text: string) => `<earlier-reasoning>\n${text}\n</earlier-reasoning>`
+
+/** A reasoning block later requests leave out, named by its assistant message and reasoning ordinal. */
+export interface DroppedReasoning {
+  readonly messageID: string
+  readonly ordinal: number
+  /** Replay its text as `<earlier-reasoning>`; otherwise omit it. */
+  readonly asText: boolean
+}
+
+export interface Options {
+  readonly dropped?: ReadonlyArray<DroppedReasoning>
+}
+
+const droppedKey = (messageID: string, ordinal: number) => `${messageID}#${ordinal}`
+
+const assistant = (
+  message: SessionMessage.Assistant,
+  model: Model.Ref,
+  providerMetadataKey: string,
+  dropped: ReadonlyMap<string, DroppedReasoning>,
+) => {
   const sameProvider = String(message.model.providerID) === String(model.providerID)
   const sameModel = sameProvider && String(message.model.id) === String(model.id)
   const reuseProviderMetadata = sameModel && message.error === undefined
   const reasoningInterrupted = message.content.some(
     (item) => item.type === "reasoning" && item.time !== undefined && item.time.completed === undefined,
   )
+  let ordinal = 0
   const content = message.content.flatMap((item): ContentPart[] => {
+    if (item.type === "reasoning") {
+      // Thinking the provider no longer accepts stays out of every later request. Dropped with consent, it was
+      // converted before the request that dropped it, so that request and every later one carry the same text;
+      // dropped by the provider, the thinking produced since is bound to a prompt without it.
+      const marker = dropped.get(droppedKey(message.id, ordinal++))
+      if (marker)
+        return marker.asText && item.text.trim().length > 0 ? [{ type: "text", text: earlierReasoning(item.text) }] : []
+    }
     if (item.type === "text")
       return [
         {
@@ -250,7 +284,12 @@ const modelSwitched = (message: SessionMessage.ModelSelected, model: Model.Ref):
   return [Message.effort({ effort: to.effort, previous: from.effort })]
 }
 
-function toLLMMessage(message: SessionMessage.Info, model: Model.Ref, providerMetadataKey: string): Message[] {
+function toLLMMessage(
+  message: SessionMessage.Info,
+  model: Model.Ref,
+  providerMetadataKey: string,
+  dropped: ReadonlyMap<string, DroppedReasoning>,
+): Message[] {
   switch (message.type) {
     case "agent-switched":
     case "idle":
@@ -302,7 +341,7 @@ function toLLMMessage(message: SessionMessage.Info, model: Model.Ref, providerMe
         }),
       ]
     case "assistant":
-      return assistant(message, model, providerMetadataKey)
+      return assistant(message, model, providerMetadataKey, dropped)
     case "compaction":
       if (message.status !== "completed") return []
       // History selection only keeps native windows the target model can replay.
@@ -331,4 +370,8 @@ export const toLLMMessages = (
   messages: readonly SessionMessage.Info[],
   model: Model.Ref,
   providerMetadataKey: string = model.providerID,
-) => messages.flatMap((message) => toLLMMessage(message, model, providerMetadataKey))
+  options: Options = {},
+) => {
+  const dropped = new Map((options.dropped ?? []).map((block) => [droppedKey(block.messageID, block.ordinal), block]))
+  return messages.flatMap((message) => toLLMMessage(message, model, providerMetadataKey, dropped))
+}

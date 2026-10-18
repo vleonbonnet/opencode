@@ -64,6 +64,8 @@ export type Outcome =
 
 export interface Interface extends State.Transformable<Editor> {
   readonly compact: (trigger: Trigger) => Effect.Effect<Outcome>
+  /** Whether a Step built from CONTEXT would compact automatically first. */
+  readonly due: (context: SessionContext.Loaded) => Effect.Effect<boolean>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/SessionCompaction") {}
@@ -666,6 +668,11 @@ export const layer = Layer.effect(
     return Service.of({
       transform: state.transform,
       reload: state.reload,
+      due: (context) =>
+        Effect.sync(() => {
+          const settings = state.get()
+          return settings.auto && due(context, calculateCeiling(context.model.limit, settings.buffer))
+        }),
       // A manual compaction settles through its `/compact` inbox item, which the runner owns.
       compact: (trigger) =>
         compact(trigger).pipe(
@@ -699,6 +706,7 @@ const transcript = (context: SessionContext.Loaded, messages: ReadonlyArray<Sess
     tools: context.tools,
     initial: context.initial,
     messages,
+    dropped: context.dropped,
   })
 
 /**

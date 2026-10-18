@@ -90,6 +90,10 @@ export const prepare = Effect.fn("SessionPrompt.prepare")(function* (request: {
   }).pipe(instances.provide(request.session))
 })
 
+/** Reads prompt attachments the way a prompt does, without the prompt hook: what a preflighted turn would attach. */
+export const attachments = (files: ReadonlyArray<PromptInput.FileAttachment>) =>
+  Effect.forEach(files, materializeAttachment, { concurrency: 8 })
+
 const materializeAttachment = Effect.fn("SessionPrompt.materializeAttachment")(function* (
   input: PromptInput.FileAttachment,
 ) {

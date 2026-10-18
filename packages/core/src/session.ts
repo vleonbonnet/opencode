@@ -47,6 +47,8 @@ import { SessionEvent } from "./session/event.js"
 import { SessionInbox } from "./session/inbox.js"
 import { InstructionState } from "./session/instruction-state.js"
 import { SessionGenerate } from "./session/generate.js"
+import { SessionCache } from "./session/cache/service.js"
+import { SessionPreflight } from "./session/cache/preflight.js"
 import { SessionCommand } from "./session/command.js"
 import {
   SessionMove,
@@ -196,6 +198,19 @@ export interface Interface {
   readonly prompt: (
     input: Parameters<Session.Handle["prompt"]>[0] & { sessionID: SessionSchema.ID },
   ) => ReturnType<Session.Handle["prompt"]>
+  /**
+   * Predicts how much of the provider's prompt cache the next turn reuses, and whether its thinking needs consent, by
+   * dry-running the request it would send. Admits, persists and sends nothing. While a turn runs the next request is
+   * not the one the client would send, so the report is unknown.
+   */
+  readonly preflight: (
+    input: SessionPreflight.Input & { readonly sessionID: SessionSchema.ID },
+  ) => Effect.Effect<
+    SessionCache.Report,
+    NotFoundError | AttachmentError | FileSystem.DirectoryNotFoundError | SessionPreflight.InvalidInputError
+  >
+  /** The reasoning blocks later requests leave out (dropped thinking), oldest first. */
+  readonly thinking: (sessionID: SessionSchema.ID) => Effect.Effect<ReadonlyArray<SessionCache.Dropped>, NotFoundError>
   /** Generates text from current Session context without admitting input or mutating history. */
   readonly generate: (input: {
     sessionID: SessionSchema.ID
@@ -267,6 +282,8 @@ const layer = Layer.effect(
     const jobs = yield* Job.Service
     const environments = yield* SessionEnvironment.Service
     const locations = yield* LocationServiceMap.Service
+    const cache = yield* SessionCache.Service
+    const fsUtil = yield* FSUtil.Service
     const sessions = yield* Session.make()
     const isDurableSessionEvent = Schema.is(SessionEvent.Durable)
 
@@ -457,6 +474,23 @@ const layer = Layer.effect(
           Effect.provideService(LLMClient.Service, llm),
         )
       }),
+      preflight: Effect.fn("Session.preflight")(function* (input) {
+        const { sessionID, ...request } = input
+        const session = yield* result.get(sessionID)
+        if (yield* execution.isActive(sessionID))
+          return { ...(yield* cache.unknown({ sessionID, reason: "a turn is running" })), running: true }
+        return yield* SessionPreflight.run({ session, request }).pipe(
+          Effect.provideService(Instance.Service, instances),
+          Effect.provideService(Database.Service, database),
+          Effect.provideService(LLMClient.Service, llm),
+          Effect.provideService(SessionCache.Service, cache),
+          Effect.provideService(FSUtil.Service, fsUtil),
+        )
+      }),
+      thinking: Effect.fn("Session.thinking")(function* (sessionID) {
+        yield* result.get(sessionID)
+        return yield* cache.dropped(sessionID)
+      }),
       command: Effect.fn("Session.command")(function* (input) {
         const session = yield* result.get(input.sessionID)
         return yield* SessionCommand.execute({ ...input, session }).pipe(
@@ -526,5 +560,6 @@ export const node: LayerNode.Provider<Service, never, typeof Node.tags.values.gl
     LocationServiceMap.node,
     FSUtil.node,
     App.node,
+    SessionCache.node,
   ],
 })

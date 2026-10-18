@@ -33,6 +33,11 @@ export interface SessionRequest {
 export interface SessionContext extends SessionRequest {
   readonly agent: Agent.ID
   tools: Record<string, { description: string; input: JsonSchema.JsonSchema }>
+  /**
+   * Set when the request is only built, never sent: a preflight predicting the next turn, or a check before a step.
+   * Shape the request as usual, but persist nothing and schedule no work.
+   */
+  readonly dryRun?: boolean
 }
 
 export interface SessionCompactionResult {
@@ -65,6 +70,8 @@ export interface SessionModelRequest {
   readonly agent: Agent.ID
   readonly model: Model.Ref
   readonly kind: SessionRequestKind
+  /** Set when the request is only built, never sent (see {@link SessionContext.dryRun}). */
+  readonly dryRun?: boolean
   baseURL?: string
   headers: Record<string, string>
 }
@@ -74,6 +81,11 @@ export interface SessionHttpRequest {
   readonly agent: Agent.ID
   readonly model: Model.Ref
   readonly kind: SessionRequestKind
+  /**
+   * Set when the request is only built, never sent: the prompt-cache check captures it here, after every hook, and
+   * nothing reaches the network. Skip work only a sent request needs, such as minting an access token.
+   */
+  readonly dryRun?: boolean
   request: Request
 }
 

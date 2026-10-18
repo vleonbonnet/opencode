@@ -2,7 +2,7 @@ export * as SessionContext from "./context.js"
 
 import { Model } from "../model.js"
 import { Permission } from "../permission.js"
-import { Context, Effect, Layer } from "effect"
+import { Context, Effect, Layer, Option } from "effect"
 import { Agent } from "../agent.js"
 import { CodeModeInstructions } from "../codemode/instructions.js"
 import { Database } from "../database/database.js"
@@ -16,6 +16,7 @@ import { McpTool } from "../tool/mcp.js"
 import { ReferenceInstructions } from "../reference/instructions.js"
 import { SkillInstructions } from "../skill/instructions.js"
 import { Tool } from "../tool.js"
+import { SessionCache } from "./cache/service.js"
 import { AgentNotFoundError } from "./error.js"
 import { SessionHistory } from "./history.js"
 import { SessionProviderContext } from "./provider-context.js"
@@ -40,6 +41,14 @@ export interface Loaded {
   readonly initial: string
   readonly messages: ReadonlyArray<SessionMessage.Info>
   readonly tools: Tool.Snapshot
+  /** Reasoning that requests leave out or replay as text: the Session's dropped-thinking markers. */
+  readonly dropped?: ReadonlyArray<SessionCache.Dropped>
+}
+
+/** A hypothetical selection: the agent or model the next turn would switch to. */
+export interface Overrides {
+  readonly agent?: Agent.ID
+  readonly model?: Model.Ref
 }
 
 /**
@@ -49,8 +58,8 @@ export interface Loaded {
  * capabilities they need; request preparation stays separate from selection.
  */
 export interface Interface {
-  /** Selects the Session, agent, instructions, and tools used by subsequent work. */
-  readonly select: (sessionID: SessionSchema.ID) => Effect.Effect<Selection, AgentNotFoundError>
+  /** Selects the Session, agent, instructions, and tools used by subsequent work; overrides only shape the result. */
+  readonly select: (sessionID: SessionSchema.ID, overrides?: Overrides) => Effect.Effect<Selection, AgentNotFoundError>
   /** Resolves the model and active history for that selection. */
   readonly load: (selection: Selection) => Effect.Effect<Loaded, SessionRunnerModel.Error>
   readonly resolveModel: (
@@ -89,6 +98,7 @@ const layer = Layer.effect(
     const skillInstructions = yield* SkillInstructions.Service
     const store = yield* SessionStore.Service
     const registry = yield* Tool.Service
+    const cache = Option.getOrUndefined(yield* Effect.serviceOption(SessionCache.Service))
 
     const resolveModel = (session: SessionSchema.Info) => models.resolve(session, model.available)
 
@@ -118,9 +128,14 @@ const layer = Layer.effect(
       return { agent, primary, selected }
     })
 
-    const select = Effect.fn("SessionContext.select")(function* (sessionID: SessionSchema.ID) {
-      const session = yield* store.get(sessionID)
-      if (!session) return yield* Effect.die(new Error(`Session not found: ${sessionID}`))
+    const select = Effect.fn("SessionContext.select")(function* (sessionID: SessionSchema.ID, overrides?: Overrides) {
+      const stored = yield* store.get(sessionID)
+      if (!stored) return yield* Effect.die(new Error(`Session not found: ${sessionID}`))
+      const session = {
+        ...stored,
+        ...(overrides?.agent === undefined ? {} : { agent: overrides.agent }),
+        ...(overrides?.model === undefined ? {} : { model: overrides.model }),
+      }
       if (session.location.directory !== location.directory || session.location.workspaceID !== location.workspaceID)
         return yield* Effect.interrupt
 
@@ -175,6 +190,7 @@ const layer = Layer.effect(
         initial: history.initial,
         messages: history.entries.map((entry) => entry.message),
         tools: selection.tools,
+        dropped: cache ? yield* cache.dropped(selection.session.id) : [],
       }
     })
 
@@ -201,6 +217,7 @@ export const node = makeLocationNode({
     ReferenceInstructions.node,
     SessionRunnerModel.node,
     SessionModelRequest.node,
+    SessionCache.node,
     SessionStore.node,
     SkillInstructions.node,
     Tool.node,

@@ -63,6 +63,8 @@ export const Plugin = define({
       // Before the user's prompt, matching where agent-switch reminders land.
       const at = event.messages.at(-1)?.role === "user" ? event.messages.length - 1 : event.messages.length
       event.messages.splice(at, 0, Message.user(text))
+      // A dry run predicts this request; the turn that sends it persists the reminder.
+      if (event.dryRun) return Effect.void
       return ctx.session
         .synthetic({ sessionID: event.sessionID, text, resume: false })
         .pipe(

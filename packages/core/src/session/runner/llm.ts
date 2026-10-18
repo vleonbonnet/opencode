@@ -1,10 +1,15 @@
 export * as SessionRunnerLLM from "./llm.js"
 
-import { Message } from "@opencode/ai"
+import { AIError, Message } from "@opencode/ai"
+import { STALE_THINKING_ERROR } from "@opencode/schema/session-cache"
 import { and, desc, eq, inArray, sql } from "drizzle-orm"
 import { Cause, Effect, Exit, FiberMap, Layer } from "effect"
 import { Database } from "../../database/database.js"
 import { Bus } from "../../bus.js"
+import { CacheGate } from "../cache/gate.js"
+import { CacheLedger } from "../cache/ledger.js"
+import { CacheModel } from "../cache/model.js"
+import { SessionCache } from "../cache/service.js"
 import { LocationLifecycle } from "../../location-lifecycle.js"
 import { InstructionState } from "../instruction-state.js"
 import { SessionCompaction } from "../compaction.js"
@@ -51,6 +56,20 @@ const layer = Layer.effect(
     const plugins = yield* Plugin.Service
     const title = yield* SessionTitle.Service
     const steps = yield* SessionStep.make
+    const gate = yield* CacheGate.make
+    // A thinking block the provider refused is the stale thinking a turn that asked first is refused for, with the
+    // same way out; the Step's own failure keeps the provider's words.
+    const attempt = (input: Parameters<typeof steps.attempt>[0]) =>
+      steps.attempt(input).pipe(
+        Effect.catchIf(
+          (error): error is AIError =>
+            error instanceof AIError && CacheLedger.isThinkingRefusal(toSessionError(error).message),
+          (error) =>
+            new StepFailedError({
+              error: { type: STALE_THINKING_ERROR, message: CacheLedger.refusalMessage(toSessionError(error).message) },
+            }),
+        ),
+      )
     // Title generation starts once input is visible and must not delay model execution.
     const titles = yield* FiberMap.make<SessionSchema.ID, void, never>()
 
@@ -134,6 +153,7 @@ const layer = Layer.effect(
                         model,
                         initial: history.initial,
                         messages: history.messages,
+                        dropped: yield* gate.dropped(sessionID),
                       },
                     })
                   }).pipe(
@@ -224,28 +244,43 @@ const layer = Layer.effect(
           continue
         }
         const stepLimitReached = loaded.agent.info.steps !== undefined && step >= loaded.agent.info.steps
-        const transcript = SessionModelRequest.baseTranscript({
-          agent: loaded.agent.info,
-          model: loaded.model,
-          tools: loaded.tools,
-          initial: loaded.initial,
+        // Stale thinking is refused, or dropped with the user's consent, before the request is sent.
+        const prepared = yield* gate.prepare({
+          sessionID,
+          step,
+          checks: CacheModel.checksThinking(loaded.model.model),
           messages: loaded.messages,
+          dropped: loaded.dropped,
+          build: (build) => {
+            const transcript = SessionModelRequest.baseTranscript({
+              agent: loaded.agent.info,
+              model: loaded.model,
+              tools: loaded.tools,
+              initial: loaded.initial,
+              messages: loaded.messages,
+              dropped: build.dropped,
+            })
+            return context.request.primary({
+              session: loaded.session,
+              agent: loaded.agent.id,
+              model: loaded.model,
+              tools: loaded.tools,
+              system: transcript.system,
+              messages: stepLimitReached
+                ? [...transcript.messages, Message.assistant(MAX_STEPS_PROMPT)]
+                : transcript.messages,
+              // Keep tool definitions on the final Step to preserve the provider's cached prefix.
+              toolChoice: stepLimitReached ? "none" : undefined,
+              webSocket: "session",
+              inputTokens: SessionCompaction.estimatePrompt(loaded),
+              dryRun: build.dryRun,
+              thinkingBinding: build.thinkingBinding,
+              thinkingMode: build.mode,
+              cacheKey: assistantMessageID,
+            })
+          },
         })
-        const prepared = yield* context.request.primary({
-          session: loaded.session,
-          agent: loaded.agent.id,
-          model: loaded.model,
-          tools: loaded.tools,
-          system: transcript.system,
-          messages: stepLimitReached
-            ? [...transcript.messages, Message.assistant(MAX_STEPS_PROMPT)]
-            : transcript.messages,
-          // Keep tool definitions on the final Step to preserve the provider's cached prefix.
-          toolChoice: stepLimitReached ? "none" : undefined,
-          webSocket: "session",
-          inputTokens: SessionCompaction.estimatePrompt(loaded),
-        })
-        const outcome = yield* steps.attempt({
+        const outcome = yield* attempt({
           isLocationClosed: lifecycle.isClosed,
           sessionID,
           assistantMessageID,
@@ -259,7 +294,8 @@ const layer = Layer.effect(
               agent: loaded.agent.id,
               model: loaded.model.ref,
               hook: prepared.retry,
-              retry: proposed,
+              // A thinking block the provider refused needs the user's consent, not a retry.
+              retry: proposed && !CacheLedger.isThinkingRefusal(error.message),
             }),
           recoverContinuation,
           recoverOverflow: Effect.suspend(() =>
@@ -319,6 +355,8 @@ const layer = Layer.effect(
           }),
           Compacted: Effect.fnUntraced(function* () {
             recoverOverflow = false
+            // The overflowing request ends no Step, so nothing confirms it.
+            yield* gate.discard(sessionID, assistantMessageID)
             assistantMessageID = SessionMessage.ID.create()
           }),
           RecoverFull: Effect.fnUntraced(function* () {
@@ -404,5 +442,6 @@ export const node = makeLocationNode({
     Snapshot.node,
     ToolOutput.node,
     Database.node,
+    SessionCache.node,
   ],
 })

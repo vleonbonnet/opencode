@@ -180,6 +180,18 @@ describe("plan plugin reminders", () => {
     }),
   )
 
+  it.effect("shapes a dry run's request like a real one without persisting the reminder", () =>
+    Effect.gen(function* () {
+      const { persisted, contextHook } = yield* run()
+      const messages = [Message.user("what agent are you?")]
+      yield* contextHook({ ...request(plan, messages), dryRun: true })
+      expect(messages).toHaveLength(2)
+      const first = messages[0]?.content[0]
+      expect(first?.type === "text" && first.text).toContain("You are in Plan mode")
+      expect(persisted).toHaveLength(0)
+    }),
+  )
+
   it.effect("does nothing when the transcript already has a live enter reminder", () =>
     Effect.gen(function* () {
       const { enter } = yield* reminders
