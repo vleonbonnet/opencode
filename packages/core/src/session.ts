@@ -11,6 +11,7 @@ import { Location } from "./location.js"
 import type { FileSystem } from "./filesystem.js"
 import { SessionMessage } from "./session/message.js"
 import { PromptInput } from "@opencode/schema/prompt-input"
+import type { PromptMetadata } from "@opencode/schema/session-cache"
 import { Bus } from "./bus.js"
 import { Instance } from "./instance/service.js"
 import { Database } from "./database/database.js"
@@ -207,6 +208,8 @@ export interface Interface {
     files?: PromptInput.Prompt["files"]
     agents?: PromptInput.Prompt["agents"]
     skills?: PromptInput.Prompt["skills"]
+    /** Forwarded to the prompt the command sends, such as `thinkingLoss`. */
+    metadata?: PromptMetadata
     delivery?: SessionInbox.Delivery
   }) => Effect.Effect<
     void,

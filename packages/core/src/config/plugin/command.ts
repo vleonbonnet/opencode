@@ -73,23 +73,29 @@ export const Plugin = define({
       for (const document of loaded.documents) {
         for (const [name, command] of Object.entries(document.commands ?? {})) {
           const subagent = command.subagent ?? command.subtask
+          const configured =
+            command.model === undefined
+              ? undefined
+              : {
+                  id: Model.ID.make(command.model.model),
+                  providerID: Provider.ID.make(command.model.providerID),
+                  ...(command.model.variant === undefined
+                    ? {}
+                    : { variant: Model.VariantID.make(command.model.variant) }),
+                }
           editor.add({
             name,
             description: command.description,
+            target: {
+              ...(command.agent === undefined ? {} : { agent: command.agent }),
+              ...(configured === undefined ? {} : { model: configured }),
+              ...(subagent === undefined ? {} : { subagent }),
+            },
             execute: (input) =>
               Effect.gen(function* () {
                 const agent = command.agent === undefined ? undefined : Agent.ID.make(command.agent)
                 const commandAgent = agent === undefined ? undefined : (yield* ctx.agent.get({ agentID: agent })).data
-                const model =
-                  command.model === undefined
-                    ? commandAgent?.model
-                    : {
-                        id: Model.ID.make(command.model.model),
-                        providerID: Provider.ID.make(command.model.providerID),
-                        ...(command.model.variant === undefined
-                          ? {}
-                          : { variant: Model.VariantID.make(command.model.variant) }),
-                      }
+                const model = configured ?? commandAgent?.model
                 const text = yield* evaluateTemplate(command.template, input.prompt.text, {
                   location,
                   processes,
@@ -131,6 +137,7 @@ export const Plugin = define({
                   sessionID: input.sessionID,
                   text,
                   delivery: input.delivery,
+                  ...(input.metadata === undefined ? {} : { metadata: input.metadata }),
                 })
               }).pipe(Effect.asVoid),
           })
