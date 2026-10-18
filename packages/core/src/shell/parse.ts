@@ -6,7 +6,9 @@ import os from "os"
 import path from "path"
 import type { Node } from "web-tree-sitter"
 import { shellParserWasm } from "#shell-parser-wasm"
+import type { ShellScan } from "./scan.js"
 import { ShellSelect } from "./select.js"
+import { ShellUnwrap } from "./unwrap.js"
 import { lazy } from "../util/lazy.js"
 import { Wildcard } from "../util/wildcard.js"
 
@@ -14,9 +16,14 @@ type Part = { type: string; text: string }
 const CWD = new Set(["cd", "chdir", "popd", "pushd", "push-location", "set-location"])
 const POWERSHELL_PATH_FLAG_RE =
   /^-(?:p(?:ath|at|a)?|lp|l(?:i(?:t(?:e(?:r(?:a(?:l(?:p(?:a(?:t(?:h)?)?)?)?)?)?)?)?)?)?|psp(?:a(?:t(?:h)?)?)?):?$/i
+// A redirect operator after line continuations, which make a descriptor word before them part of the redirect.
+const CONTINUED_REDIRECT_RE = /(?:\\\n)+[<>]/y
 
 export type Result = {
-  commands: Array<{ resource: string; save: string }>
+  // Each command found: the resource as written; the prefix an approval saves, absent when no pattern would match
+  // this command alone; and the other spellings of the same command, which the rules are checked against together
+  // with the resource, absent when it has none.
+  commands: Array<{ resource: string; save?: string; alternates?: string[] }>
   directories: string[]
 }
 
@@ -181,30 +188,82 @@ const scanLegacy = Effect.fnUntraced(function* (command: string, shell: string, 
   return yield* Effect.acquireUseRelease(
     Effect.succeed(tree),
     (tree) =>
-      Effect.sync(() =>
-        tree.rootNode.descendantsOfType("command").reduce(
-          (result, node) => {
-            if (!node) return result
-            const command = parts(node)
-            const tokens = command.map((part) => part.text)
-            if (tokens.length === 0) return result
-            const name = powershell ? tokens[0].toLowerCase() : tokens[0]
-            if (CWD.has(name)) {
-              result.directories.push(...directoryArgs(command, powershell, cwd, shell))
-              return result
-            }
-            result.commands.push({
-              resource: (node.parent?.type === "redirected_statement" ? node.parent.text : node.text).trim(),
-              save: `${prefix(tokens).join(" ")} *`,
+      Effect.sync(() => {
+        const output = collector()
+        const options = { powershell, posix: posix(shell), cwd, shell, dialect: dialect(shell) }
+        const scripts = legacyCommands(output, tree.rootNode, command, options)
+        // A script is read as the command is: what Tree-sitter finds in it, errors and all.
+        follow(output, scripts, (script) => {
+          const nested = parsers.bash.parse(script.text)
+          if (!nested) {
+            output.fail("Failed to parse shell command")
+            return []
+          }
+          try {
+            return legacyCommands(output, nested.rootNode, script.text, {
+              ...options,
+              posix: true,
+              dialect: script.dialect,
             })
-            return result
-          },
-          { commands: [] as Array<{ resource: string; save: string }>, directories: [] as string[] },
-        ),
-      ),
+          } finally {
+            nested.delete()
+          }
+        })
+        return output
+      }),
     (tree) => Effect.sync(() => tree.delete()),
-  )
+  ).pipe(Effect.flatMap(finish))
 })
+
+type Options = { powershell: boolean; posix: boolean; cwd: string; shell: string; dialect: ShellUnwrap.Dialect }
+type Script = ShellUnwrap.Script
+
+// Adds the commands of a tree parsed from SOURCE and returns the script strings they hand to a shell.
+function legacyCommands(output: Collector, root: Node, source: string, options: Options) {
+  const text = (node: Node) => (node.parent?.type === "redirected_statement" ? node.parent.text : node.text).trim()
+  const scripts: Script[] = []
+  for (const node of root.descendantsOfType("command")) {
+    if (!node) continue
+    const command = parts(node)
+    const tokens = command.map((part) => part.text)
+    if (tokens.length === 0) continue
+    const name = options.powershell ? tokens[0].toLowerCase() : tokens[0]
+    if (CWD.has(name)) {
+      output.result.directories.push(...directoryArgs(command, options.powershell, options.cwd, options.shell))
+      continue
+    }
+    const save = `${prefix(tokens).join(" ")} *`
+    if (!options.posix) {
+      output.command(text(node), save)
+      continue
+    }
+    scripts.push(...expand(output, text(node), save, legacyWords(node, source), options.dialect))
+  }
+  return scripts
+}
+
+// The words a command runs with, as written: its name and arguments, without assignments and redirects. Bash removes
+// line continuations before it reads words, which Tree-sitter does not: it can split one shell word into several
+// nodes (`$"…"`, a word continued on the next line), which are joined back here, and it reads the descriptor of a
+// redirect whose operator starts the next line (`2\` then `>out`) as an argument, which is left out.
+function legacyWords(node: Node, source: string) {
+  const name = node.childForFieldName("name")
+  if (!name) return []
+  const nodes = [name, ...node.childrenForFieldName("argument").filter((item): item is Node => Boolean(item))]
+  return nodes
+    .reduce<Array<{ start: number; end: number }>>((words, item) => {
+      const last = words.at(-1)
+      if (last && /^(?:\\\n)*$/.test(source.slice(last.end, item.startIndex))) last.end = item.endIndex
+      else words.push({ start: item.startIndex, end: item.endIndex })
+      return words
+    }, [])
+    .filter((word, index) => {
+      if (index === 0 || !/^(?:\d+|\{[A-Za-z_][A-Za-z0-9_]*\})$/.test(source.slice(word.start, word.end))) return true
+      CONTINUED_REDIRECT_RE.lastIndex = word.end
+      return !CONTINUED_REDIRECT_RE.test(source)
+    })
+    .map((word) => source.slice(word.start, word.end))
+}
 
 export const scanPortable = Effect.fnUntraced(function* (command: string, shell: string, cwd: string) {
   const { ShellScan } = yield* Effect.tryPromise({
@@ -212,15 +271,39 @@ export const scanPortable = Effect.fnUntraced(function* (command: string, shell:
     catch: (cause) => new Error(`Portable shell scanner failed to load: ${cause}`, { cause }),
   })
   const powershell = ShellSelect.ps(shell)
-  const name = ShellSelect.name(shell)
-  const result = powershell
-    ? ShellScan.scanPowerShell(command)
-    : ShellScan.scan(command, name === "bash" || name === "zsh" ? name : "posix")
+  const options = { powershell, posix: posix(shell), cwd, shell, dialect: dialect(shell) }
+  const result = powershell ? ShellScan.scanPowerShell(command) : ShellScan.scan(command, options.dialect)
   if (result.kind === "opaque")
     return yield* Effect.fail(new Error(`Portable shell scanner cannot analyze command: ${result.reason}`))
 
-  const output: Result = { commands: [], directories: [] }
-  for (const item of result.commands) {
+  const output = collector()
+  const scripts = portableCommands(output, result.commands, options)
+  // A script is read in the dialect of the shell that runs it, and refused as the command would be when it cannot be.
+  follow(output, scripts, (script) => {
+    const nested = ShellScan.scan(script.text, script.dialect)
+    if (nested.kind === "opaque") {
+      output.fail(`Portable shell scanner cannot analyze command: ${nested.reason} in a script it runs`)
+      return []
+    }
+    return portableCommands(output, nested.commands, {
+      ...options,
+      powershell: false,
+      posix: true,
+      dialect: script.dialect,
+    })
+  })
+  return yield* finish(output)
+})
+
+// Adds the commands the portable scanner found and returns the script strings they hand to a shell.
+function portableCommands(
+  output: Collector,
+  commands: Extract<ShellScan.Result, { kind: "scanned" }>["commands"],
+  options: Options,
+) {
+  const { powershell, cwd, shell } = options
+  const scripts: Script[] = []
+  for (const item of commands) {
     // The legacy command walk skips declarations, not the substitutions within them.
     if (item.declaration) continue
     const words = item.redirectWordCount === undefined ? item.rawWords : item.rawWords.slice(0, item.redirectWordCount)
@@ -235,7 +318,7 @@ export const scanPortable = Effect.fnUntraced(function* (command: string, shell:
       continue
     const name = powershell ? words[0]?.toLowerCase() : words[0]
     if (CWD.has(name)) {
-      output.directories.push(
+      output.result.directories.push(
         ...directoryArgs(
           powershell
             ? words.flatMap((raw, index): Part[] => {
@@ -279,13 +362,126 @@ export const scanPortable = Effect.fnUntraced(function* (command: string, shell:
             const separator = /^\s+(?:`(?:\r\n|\r|\n)\s*)?/.exec(item.resource.slice(boundary))?.[0]
             return `${item.resource.slice(0, boundary)}${separator ?? " "}*`
           })()
-    output.commands.push({
-      resource: item.resource,
-      save,
+    if (!options.posix) {
+      output.command(item.resource, save)
+      continue
+    }
+    scripts.push(...expand(output, item.resource, save, words, options.dialect))
+  }
+  return scripts
+}
+
+// Bash-family shells; PowerShell and cmd.exe give runners, quoting and scripts other meanings.
+function posix(shell: string) {
+  return !ShellSelect.ps(shell) && ShellSelect.name(shell) !== "cmd"
+}
+
+// The dialect a shell's commands are read in.
+function dialect(shell: string): ShellUnwrap.Dialect {
+  const name = ShellSelect.name(shell)
+  return name === "bash" || name === "zsh" ? name : "posix"
+}
+
+type Collector = ReturnType<typeof collector>
+
+// Permission resources in the order they are found. A command as written is always listed, as each command was
+// before; what it runs is listed unless the same resource already is. Each carries the other spellings of that one
+// command, apart from the resource itself. A command that cannot be checked fails the scan.
+function collector() {
+  const result: Result = { commands: [], directories: [] }
+  const seen = new Set<string>()
+  const failures: string[] = []
+  const push = (resource: string, save: string | undefined, alternates: readonly string[]) => {
+    const others = [...new Set(alternates)].filter((spelling) => spelling !== resource)
+    result.commands.push({
+      resource,
+      ...(save === undefined ? {} : { save }),
+      ...(others.length ? { alternates: others } : {}),
     })
   }
-  return output
-})
+  return {
+    result,
+    failures,
+    command(resource: string, save: string | undefined, alternates: readonly string[] = []) {
+      seen.add(resource)
+      push(resource, save, alternates)
+    },
+    extra(resource: string, save: string | undefined, alternates: readonly string[] = []) {
+      if (seen.has(resource)) return
+      seen.add(resource)
+      push(resource, save, alternates)
+    },
+    fail(reason: string) {
+      failures.push(reason)
+    },
+  }
+}
+
+function finish(output: Collector) {
+  if (output.failures.length) return Effect.fail(new Error(output.failures[0]))
+  return Effect.succeed(output.result)
+}
+
+// Emits the command written as RESOURCE, with the other spellings of the command its WORDS run, and each command it
+// runs behind a runner (`sudo`, `env`, `xargs`, …), under a bare program name (`/bin/rm` as `rm`) or as a script
+// handed to a shell that is not POSIX. Rules match command text, so each is checked on its own: this only adds
+// resources and spellings, so it can add a prompt or a denial, never lift one. Returns the script strings the command
+// hands to a POSIX shell.
+function expand(
+  output: Collector,
+  resource: string,
+  save: string,
+  words: readonly string[],
+  dialect: ShellUnwrap.Dialect,
+) {
+  // The legacy grammar gives a statement of assignments with a redirect an empty command name.
+  const found = ShellUnwrap.unwrap(words[0] ? words : [], dialect)
+  if (found.truncated) output.fail("Shell command runs too many nested commands to check")
+  const [head, ...rest] = found.views
+  output.command(resource, save, head ? ShellUnwrap.spellings(head) : [])
+  if (head) renamed(output, head)
+  for (const view of rest) {
+    if (view.implied || !view.program || CWD.has(view.name)) continue
+    output.extra(
+      ShellUnwrap.text(view),
+      `${prefix([view.name, ...view.args]).join(" ")} *`,
+      ShellUnwrap.spellings(view),
+    )
+    renamed(output, view)
+  }
+  for (const text of found.texts) output.extra(text, exact(text))
+  return found.scripts
+}
+
+// The command as its bare program name runs it, when that differs from the program as written.
+function renamed(output: Collector, view: ShellUnwrap.View) {
+  const bare = ShellUnwrap.renamed(view)
+  if (bare)
+    output.extra(
+      ShellUnwrap.text(bare),
+      `${prefix([bare.name, ...bare.args]).join(" ")} *`,
+      ShellUnwrap.spellings(bare),
+    )
+}
+
+// A pattern matching TEXT alone, when no wildcard in it would match more.
+function exact(text: string) {
+  return /[*?]/.test(text) ? undefined : text
+}
+
+// Script strings are checked command by command in the order they are found, down to MAX_SCRIPT_DEPTH levels of
+// nesting; a command nesting one deeper cannot be checked, so the scan fails.
+function follow(output: Collector, scripts: readonly Script[], visit: (script: Script) => Script[]) {
+  const queue = scripts.map((script) => ({ script, depth: 1 }))
+  for (let index = 0; index < queue.length; index++) {
+    const entry = queue[index]
+    if (entry.depth > ShellUnwrap.MAX_SCRIPT_DEPTH) {
+      output.fail(`Shell command nests scripts more than ${ShellUnwrap.MAX_SCRIPT_DEPTH} levels deep`)
+      return
+    }
+    queue.push(...visit(entry.script).map((script) => ({ script, depth: entry.depth + 1 })))
+  }
+}
 
 function parts(node: Node) {
   return Array.from({ length: node.childCount }).flatMap((_, index): Part[] => {

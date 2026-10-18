@@ -72,7 +72,7 @@ describe("ShellParse", () => {
   test("portable scanning handles heredocs with the existing permission resource", async () => {
     const command = "cat <<'EOF'\nstatic body\nEOF"
     const legacy = await Effect.runPromise(ShellParse.scan(command, "/bin/bash", "/workspace"))
-    expect(legacy.commands).toEqual([{ resource: command, save: "cat *" }])
+    expect(legacy.commands).toEqual([{ resource: command, save: "cat *", alternates: ["cat"] }])
     expect(await Effect.runPromise(ShellParse.scan(command, "/bin/bash", "/workspace", { portable: true }))).toEqual(
       legacy,
     )
@@ -82,8 +82,15 @@ describe("ShellParse", () => {
     "portable scanning keeps source-shaped command heads under shell authorization: %s",
     async (command) => {
       const portable = await Effect.runPromise(ShellParse.scan(command, "/bin/bash", "/workspace", { portable: true }))
-      expect(portable.commands.map((item) => item.resource)).toEqual([command])
+      // Bash runs `c"\d"` as the program `c\d`, which is checked as an alternate spelling, and under its bare name
+      // after the backslash a Windows path would separate.
+      expect(spellings(portable)).toEqual(
+        command.startsWith('c"') ? [command, "c\\d relative", "d relative"] : [command, "cd /tmp"],
+      )
       expect(portable.directories).toEqual([])
+      const legacy = await Effect.runPromise(ShellParse.scan(command, "/bin/bash", "/workspace"))
+      expect(spellings(legacy)).toEqual(spellings(portable))
+      expect(legacy.directories).toEqual([])
     },
   )
 
@@ -107,7 +114,8 @@ describe("ShellParse", () => {
 
       for (const command of [`"${name}" X`, `FOO=bar ${name} X`, `command ${name} X`, `>${name}.txt ${name} X`]) {
         const legacy = await Effect.runPromise(ShellParse.scan(command, "/bin/bash", "/workspace"))
-        expect(legacy.commands).toHaveLength(1)
+        expect(spellings(legacy)).toContain(`${name} X`)
+        expect(legacy.commands[0].resource).toBe(command)
         expect(
           await Effect.runPromise(ShellParse.scan(command, "/bin/bash", "/workspace", { portable: true })),
         ).toEqual(legacy)
@@ -168,13 +176,140 @@ describe("ShellParse", () => {
     expect(bash.directories).toEqual([path.join(os.homedir(), "src")])
 
     const backslash = await Effect.runPromise(ShellParse.scan("cd '~\\src'", "/bin/bash", "/workspace"))
-    expect(backslash.directories).toEqual(
-      process.platform === "win32" ? [path.join(os.homedir(), "src")] : ["~\\src"],
-    )
+    expect(backslash.directories).toEqual(process.platform === "win32" ? [path.join(os.homedir(), "src")] : ["~\\src"])
 
     const powershell = await Effect.runPromise(
       ShellParse.scan('Set-Location "$PWD/src"; Set-Location $PSHOME', "/usr/local/bin/pwsh", "/workspace"),
     )
     expect(powershell.directories).toEqual(["/workspace/src", "/usr/local/bin"])
+  })
+})
+
+// Both scanners must agree; returns the legacy result.
+async function scanned(command: string, shell = "/bin/bash") {
+  const legacy = await Effect.runPromise(ShellParse.scan(command, shell, "/workspace"))
+  expect(await Effect.runPromise(ShellParse.scan(command, shell, "/workspace", { portable: true })), command).toEqual(
+    legacy,
+  )
+  return legacy
+}
+
+// Every spelling the rules are checked against: each command's resource together with its alternate spellings.
+function spellings(result: { commands: ReadonlyArray<{ resource: string; alternates?: readonly string[] }> }) {
+  return result.commands.flatMap((command) => [command.resource, ...(command.alternates ?? [])])
+}
+
+describe("ShellParse commands behind a prefix", () => {
+  test.each<{ name: string; command: string; resources: string[]; save?: string[] }>([
+    {
+      name: "variable assignments",
+      command: "KUBECONFIG=x kubectl delete pod y",
+      resources: ["KUBECONFIG=x kubectl delete pod y", "kubectl delete pod y"],
+      save: ["kubectl delete *"],
+    },
+    {
+      name: "env with options and assignments",
+      command: "env -u FOO A=1 kubectl delete pod y",
+      resources: ["env -u FOO A=1 kubectl delete pod y", "kubectl delete pod y"],
+      save: ["env *", "kubectl delete *"],
+    },
+    { name: "env -S", command: "env -S 'kubectl delete pod x'", resources: ["kubectl delete pod x"] },
+    { name: "a directory before the program", command: "/opt/bin/kubectl get pods", resources: ["kubectl get pods"] },
+    { name: "a backslash before the program", command: "\\rm -r foo", resources: ["rm -r foo"] },
+    { name: "command", command: "command rm d -r", resources: ["rm d -r"] },
+    {
+      name: "timeout with its options and duration",
+      command: "timeout -s KILL 10 kubectl get pods",
+      resources: ["kubectl get pods"],
+    },
+    { name: "nice", command: "nice -n 5 git push", resources: ["git push"], save: ["git push *"] },
+    {
+      name: "sudo with a value option ending a cluster",
+      command: "sudo -Eu root rm -rf build",
+      resources: ["rm -rf build", "rm -r -f build"],
+      save: ["rm *"],
+    },
+    {
+      name: "xargs with value options",
+      command: "xargs -n 1 -I {} kubectl delete pod {}",
+      resources: ["kubectl delete pod {}"],
+    },
+    { name: "nested runners", command: "sudo env A=1 nohup kubectl apply -f x", resources: ["kubectl apply -f x"] },
+    {
+      name: "a shell's -c script",
+      command: `bash -lc "kubectl delete pod 'a b'"`,
+      resources: ["kubectl delete pod 'a b'"],
+    },
+    { name: "eval", command: `eval "kubectl delete pod x"`, resources: ["kubectl delete pod x"] },
+    { name: "watch", command: "watch -n 5 kubectl get pods", resources: ["kubectl get pods"] },
+    { name: "watch -x", command: "watch -x kubectl get pods", resources: ["kubectl get pods"] },
+    {
+      name: "find -exec",
+      command: "find . -name '*.log' -exec rm -f {} \\; -execdir kubectl delete pod {} +",
+      resources: ["rm -f {}", "kubectl delete pod {}"],
+    },
+    {
+      name: "a script inside a runner",
+      command: `xargs sh -c 'env kubectl delete pod "$1"' _`,
+      resources: [`kubectl delete pod "$1"`],
+    },
+    { name: "a program named at run time", command: "$cmd delete pod", resources: ["$cmd delete pod"] },
+    { name: "a word split by a line continuation", command: "\\\nrm -r fo\\\no", resources: ["rm -r fo\\\no"] },
+  ])("checks the command behind $name", async ({ command, resources, save }) => {
+    const result = await scanned(command)
+    for (const resource of resources) expect(spellings(result)).toContain(resource)
+    for (const item of save ?? []) expect(result.commands.map((entry) => entry.save)).toContain(item)
+  })
+
+  test("keeps the command as written first and spells each command once", async () => {
+    const result = await scanned("env kubectl get pods 2>&1")
+    expect(result.commands).toEqual([
+      { resource: "env kubectl get pods 2>&1", save: "env *", alternates: ["env kubectl get pods"] },
+      { resource: "kubectl get pods", save: "kubectl get *" },
+    ])
+  })
+
+  test("checks a command a script runs in its directory", async () => {
+    expect(await scanned("bash -c 'cd /outside && git status'")).toEqual({
+      commands: [
+        {
+          resource: "bash -c 'cd /outside && git status'",
+          save: "bash *",
+          alternates: ["bash -c cd /outside && git status"],
+        },
+        { resource: "git status", save: "git status *" },
+      ],
+      directories: ["/outside"],
+    })
+  })
+
+  test("refuses a command nesting scripts too deep", async () => {
+    const nest = (levels: number) =>
+      Array.from({ length: levels }).reduce<string>(
+        (acc) => `eval '${acc.replaceAll("'", `'\\''`)}'`,
+        "kubectl get pods",
+      )
+    const resources = async (command: string) => (await scanned(command)).commands.map((item) => item.resource)
+    expect(await resources(nest(2))).toContain("kubectl get pods")
+    expect(await resources(nest(4))).toContain("kubectl get pods")
+    for (const portable of [false, true])
+      expect(
+        await Effect.runPromise(Effect.result(ShellParse.scan(nest(5), "/bin/bash", "/workspace", { portable }))),
+      ).toMatchObject({ _tag: "Failure", failure: { message: "Shell command nests scripts more than 4 levels deep" } })
+  })
+
+  test("refuses a script the portable scanner cannot analyze, as it refuses the command", async () => {
+    const command = "bash -c 'echo \"unterminated'"
+    expect(
+      await Effect.runPromise(Effect.result(ShellParse.scan(command, "/bin/bash", "/workspace", { portable: true }))),
+    ).toMatchObject({
+      _tag: "Failure",
+      failure: { message: "Portable shell scanner cannot analyze command: unterminated-quote in a script it runs" },
+    })
+  })
+
+  test.each(["pwsh", "cmd"])("leaves %s commands as written", async (shell) => {
+    const result = await Effect.runPromise(ShellParse.scan("env rm -rf build", shell, "/workspace"))
+    expect(result.commands).toEqual([{ resource: "env rm -rf build", save: "env *" }])
   })
 })

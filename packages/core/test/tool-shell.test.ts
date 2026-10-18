@@ -345,7 +345,7 @@ describe("ShellTool scanner permissions", () => {
           for (const request of prompts) {
             expect(request).toMatchObject({
               action: "shell",
-              resources: ["printf hello", 'printf %s "$SCAN_TEST" > marker'],
+              resources: ["printf hello", 'printf %s "$SCAN_TEST" > marker', 'printf %s "$SCAN_TEST"'],
               save: ["printf *", "printf *"],
             })
           }
@@ -401,6 +401,30 @@ describe("ShellTool scanner permissions", () => {
             value: { status: "error", error: { message: expect.stringContaining("Permission denied: shell") } },
           })
           expect(yield* Effect.promise(() => Bun.file(marker).exists())).toBe(false)
+        }),
+      ))
+
+    test(`${scanner}: a denial reaches the command behind runners and an option cluster`, () =>
+      withScanner(portable, (registry, fixture) =>
+        Effect.gen(function* () {
+          const agents = yield* Agent.Service
+          yield* agents.transform((editor) =>
+            editor.update(toolIdentity.agent, (agent) => {
+              agent.permissions = [
+                { action: "shell", resource: "*", effect: "allow" },
+                { action: "shell", resource: "rm -r *", effect: "deny" },
+              ]
+            }),
+          )
+          const victim = path.join(fixture.active, "victim")
+          yield* Effect.promise(() => fs.mkdir(victim))
+          const result = yield* runPermissionCommand(registry, "env nice -n 5 rm -rf victim", victim, [])
+          expect(result.requests).toEqual([])
+          expect(result.exit).toMatchObject({
+            _tag: "Success",
+            value: { status: "error", error: { message: expect.stringContaining("Permission denied: shell") } },
+          })
+          expect(yield* Effect.promise(() => fs.stat(victim).then((stat) => stat.isDirectory()))).toBe(true)
         }),
       ))
 
@@ -573,7 +597,11 @@ describe("ShellTool conditional process substitution", () => {
               const command = '[[ -n <(printf reached > marker) ]]; wait "$!"'
               const result = yield* runPermissionCommand(registry, command, marker, [reply])
               expect(result.requests).toMatchObject([
-                { action: "shell", resources: ["printf reached > marker", 'wait "$!"'], save: ["printf *", "wait *"] },
+                {
+                  action: "shell",
+                  resources: ["printf reached > marker", "printf reached", 'wait "$!"'],
+                  save: ["printf *", "wait *"],
+                },
               ])
               if (reply === "reject") {
                 expect(Exit.isFailure(result.exit)).toBe(true)

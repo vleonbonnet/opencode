@@ -385,30 +385,41 @@ describe("Permission", () => {
   }
 })
 
+// The resources and saved prefixes of a scanned command, as the shell tool asks for them: each spelling of a command
+// is a resource of its own.
+function shellRequest(parsed: ShellParse.Result) {
+  return {
+    resources: parsed.commands.flatMap((command) => [command.resource, ...(command.alternates ?? [])]),
+    save: parsed.commands.flatMap((command) => (command.save === undefined ? [] : [command.save])),
+  }
+}
+
 describe("shell scanner permission impact", () => {
   // Fixed cases require matching outcomes; remaining differences are investigation snapshots, not contracts.
   // These service-level cases all have command resources; tool tests cover skipped checks and directories.
   // Outcome pairs are [legacy, native].
   for (const fixture of [
     {
-      name: "timed command preserves wrapper approvals",
+      // A wrapper approval no longer covers the command it runs, which is checked on its own.
+      name: "timed command checks the command it times",
       shell: "bash",
       command: "time -p git status",
       approved: ["time *"],
-      exact: ["time -p git status"],
-      denied: "time -p git status",
-      savedEffect: ["allow", "allow"],
+      exact: ["time -p git status", "git status"],
+      denied: "git status",
+      savedEffect: ["ask", "ask"],
       exactEffect: ["allow", "allow"],
       deniedEffect: ["deny", "deny"],
     },
     {
-      name: "coprocess command preserves wrapper approvals",
+      // As for `time`, the command a coprocess runs is checked on its own.
+      name: "coprocess command checks the command it runs",
       shell: "bash",
       command: "coproc git status",
       approved: ["coproc *"],
-      exact: ["coproc git status"],
-      denied: "coproc git status",
-      savedEffect: ["allow", "allow"],
+      exact: ["coproc git status", "git status"],
+      denied: "git status",
+      savedEffect: ["ask", "ask"],
       exactEffect: ["allow", "allow"],
       deniedEffect: ["deny", "deny"],
     },
@@ -568,19 +579,13 @@ describe("shell scanner permission impact", () => {
             const parsed = yield* ShellParse.scan(fixture.command, fixture.shell, "/project", { portable })
             expect(parsed.commands.length).toBeGreaterThan(0)
             expect(parsed.directories).toEqual([])
-            const result = yield* service.ask(
-              assertion({
-                action: "shell",
-                resources: parsed.commands.map((command) => command.resource),
-                save: parsed.commands.map((command) => command.save),
-              }),
-            )
+            const result = yield* service.ask(assertion({ action: "shell", ...shellRequest(parsed) }))
             expect(result.effect, portable ? "native" : "legacy").toBe(scenario.expected[index])
             const pending = yield* service.list()
             expect(pending).toHaveLength(result.effect === "ask" ? 1 : 0)
             if (result.effect !== "ask") continue
-            expect(pending[0]?.resources).toEqual(parsed.commands.map((command) => command.resource))
-            expect(pending[0]?.save).toEqual(parsed.commands.map((command) => command.save))
+            expect(pending[0]?.resources).toEqual(shellRequest(parsed).resources)
+            expect(pending[0]?.save).toEqual(shellRequest(parsed).save)
             yield* service.reply({ requestID: result.id, reply: "once" })
             expect(yield* service.list()).toEqual([])
           }
@@ -678,13 +683,7 @@ describe("shell scanner permission impact", () => {
           const service = yield* Permission.Service
           const saved = yield* PermissionSaved.Service
           const parsed = yield* ShellParse.scan(fixture.command, fixture.shell, "/project", { portable })
-          const first = yield* service.ask(
-            assertion({
-              action: "shell",
-              resources: parsed.commands.map((command) => command.resource),
-              save: parsed.commands.map((command) => command.save),
-            }),
-          )
+          const first = yield* service.ask(assertion({ action: "shell", ...shellRequest(parsed) }))
           expect(first.effect).toBe("ask")
           expect(yield* service.list()).toHaveLength(1)
           yield* service.reply({ requestID: first.id, reply: "always" })
@@ -696,13 +695,7 @@ describe("shell scanner permission impact", () => {
           for (const [index, target] of [false, true].entries()) {
             for (const command of [fixture.command, fixture.next]) {
               const parsed = yield* ShellParse.scan(command, fixture.shell, "/project", { portable: target })
-              const result = yield* service.ask(
-                assertion({
-                  action: "shell",
-                  resources: parsed.commands.map((command) => command.resource),
-                  save: parsed.commands.map((command) => command.save),
-                }),
-              )
+              const result = yield* service.ask(assertion({ action: "shell", ...shellRequest(parsed) }))
               expect(result.effect, `${target ? "native" : "legacy"}: ${command}`).toBe(
                 command === fixture.next ? fixture.nextEffect[origin] : fixture.repeat[origin]?.[index],
               )

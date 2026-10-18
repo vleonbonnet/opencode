@@ -137,8 +137,9 @@ export const Plugin = {
       if (parsed.commands.length > 0)
         yield* permission.assert({
           action: name,
-          resources: parsed.commands.map((command) => command.resource),
-          save: parsed.commands.map((command) => command.save),
+          // Each spelling of a command is checked as a resource of its own.
+          resources: parsed.commands.flatMap((command) => [command.resource, ...(command.alternates ?? [])]),
+          save: parsed.commands.flatMap((command) => (command.save === undefined ? [] : [command.save])),
           sessionID: context.sessionID,
           agent: context.agent,
           source,
