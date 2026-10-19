@@ -2184,7 +2184,7 @@
                     }
                   },
                   "metadata": {
-                    "type": "object"
+                    "$ref": "#/components/schemas/SessionCache.PromptMetadata"
                   },
                   "delivery": {
                     "anyOf": [
@@ -2318,6 +2318,9 @@
                       "$ref": "#/components/schemas/PromptInput.SkillAttachment"
                     }
                   },
+                  "metadata": {
+                    "$ref": "#/components/schemas/SessionCache.PromptMetadata_1"
+                  },
                   "delivery": {
                     "anyOf": [
                       {
@@ -2336,6 +2339,145 @@
           },
           "required": true
         }
+      }
+    },
+    "/api/experimental/session/{sessionID}/preflight": {
+      "post": {
+        "tags": ["session"],
+        "operationId": "experimental.session.preflight",
+        "parameters": [
+          {
+            "name": "sessionID",
+            "in": "path",
+            "schema": {
+              "$ref": "#/components/schemas/Session.ID"
+            },
+            "required": true
+          }
+        ],
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "SessionPreflightResponse",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionPreflightResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "InvalidRequestError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InvalidRequestErrorEncoded"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "UnauthorizedError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UnauthorizedErrorEncoded"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "SessionNotFoundError | LocationNotFoundError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/SessionNotFoundErrorEncoded"
+                    },
+                    {
+                      "$ref": "#/components/schemas/LocationNotFoundErrorEncoded"
+                    }
+                  ]
+                }
+              }
+            }
+          }
+        },
+        "description": "Predict how much of the provider's prompt cache the next turn reuses, and whether earlier signed thinking no longer matches the conversation, by dry-running the exact request it would send: the selected or given agent and model, the history, any pending instruction update, and a message built from text, files or a command. Nothing is enqueued, persisted or sent. While a turn runs the report is unknown. When staleThinking is present, a turn sent with metadata.thinkingLoss 'ask' fails with a thinking.stale error (unless its reason is 'unknown binding': those blocks are sent, and only a provider refusal fails the turn); with 'accept' it replays them as text, as staleThinking.consent predicts; without thinkingLoss the provider drops them. An unknown command or agent, or an unavailable model, is a 400.",
+        "summary": "Preflight the next turn",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SessionCache.PreflightInput"
+              }
+            }
+          },
+          "required": true
+        }
+      }
+    },
+    "/api/experimental/session/{sessionID}/thinking": {
+      "get": {
+        "tags": ["session"],
+        "operationId": "experimental.session.thinking",
+        "parameters": [
+          {
+            "name": "sessionID",
+            "in": "path",
+            "schema": {
+              "$ref": "#/components/schemas/Session.ID"
+            },
+            "required": true
+          }
+        ],
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "SessionThinkingResponse",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionThinkingResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "InvalidRequestError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InvalidRequestErrorEncoded"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "UnauthorizedError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UnauthorizedErrorEncoded"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "SessionNotFoundError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionNotFoundErrorEncoded"
+                }
+              }
+            }
+          }
+        },
+        "description": "Reasoning blocks that later requests leave out, oldest first. messageID and ordinal name a block as the session.reasoning events do: the ordinal-th reasoning item, from 0, of that assistant message's content. asText blocks were dropped with the user's consent and replay as <earlier-reasoning> text; the others were dropped by the provider and are omitted. reason says which, and whether anyone was asked: it starts with 'dropped with consent', 'dropped by the provider without asking' (the turn set no thinkingLoss) or 'dropped by the provider'.",
+        "summary": "List dropped thinking"
       }
     },
     "/api/experimental/session/{sessionID}/skill": {
@@ -18390,6 +18532,19 @@
         "required": ["_tag", "message"],
         "additionalProperties": false
       },
+      "Session.Delegator": {
+        "type": "object",
+        "properties": {
+          "sessionID": {
+            "$ref": "#/components/schemas/Session.ID"
+          },
+          "agent": {
+            "$ref": "#/components/schemas/Agent.ID"
+          }
+        },
+        "required": ["sessionID", "agent"],
+        "additionalProperties": false
+      },
       "Session.ForkBoundary": {
         "anyOf": [
           {
@@ -18720,6 +18875,12 @@
           },
           "permissions": {
             "$ref": "#/components/schemas/Permission.Ruleset"
+          },
+          "delegators": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Session.Delegator"
+            }
           },
           "revert": {
             "$ref": "#/components/schemas/Session.Revert"
@@ -19755,6 +19916,235 @@
         "required": ["_tag", "sessionID", "message"],
         "additionalProperties": false
       },
+      "SessionCache.ConsentOutcome": {
+        "type": "object",
+        "properties": {
+          "reusableTokens": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "lostTokens": {
+            "type": "integer",
+            "minimum": 0
+          }
+        },
+        "required": ["reusableTokens", "lostTokens"],
+        "additionalProperties": false
+      },
+      "SessionCache.Divergence": {
+        "type": "object",
+        "properties": {
+          "unit": {
+            "type": "string"
+          },
+          "index": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "previousUnit": {
+            "type": "string"
+          },
+          "excerpt": {
+            "type": "string"
+          },
+          "previousExcerpt": {
+            "type": "string"
+          }
+        },
+        "required": ["unit", "index"],
+        "additionalProperties": false
+      },
+      "SessionCache.DroppedThinking": {
+        "type": "object",
+        "properties": {
+          "messageID": {
+            "$ref": "#/components/schemas/Session.Message.ID"
+          },
+          "ordinal": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "reason": {
+            "type": "string"
+          },
+          "asText": {
+            "type": "boolean"
+          },
+          "time": {
+            "type": "integer",
+            "minimum": 0
+          }
+        },
+        "required": ["messageID", "ordinal", "reason", "asText", "time"],
+        "additionalProperties": false
+      },
+      "SessionCache.ModelRef": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "providerID": {
+            "$ref": "#/components/schemas/Provider.ID"
+          }
+        },
+        "required": ["id", "providerID"],
+        "additionalProperties": false
+      },
+      "SessionCache.PreflightInput": {
+        "type": "object",
+        "properties": {
+          "text": {
+            "type": "string"
+          },
+          "files": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PromptInput.FileAttachment"
+            }
+          },
+          "command": {
+            "type": "object",
+            "properties": {
+              "name": {
+                "type": "string"
+              },
+              "arguments": {
+                "type": "string"
+              }
+            },
+            "required": ["name"],
+            "additionalProperties": false
+          },
+          "agent": {
+            "$ref": "#/components/schemas/Agent.ID"
+          },
+          "model": {
+            "$ref": "#/components/schemas/Model.Ref"
+          }
+        },
+        "additionalProperties": false
+      },
+      "SessionCache.PreflightReport": {
+        "type": "object",
+        "properties": {
+          "status": {
+            "$ref": "#/components/schemas/SessionCache.PreflightStatus"
+          },
+          "format": {
+            "type": "string"
+          },
+          "model": {
+            "$ref": "#/components/schemas/SessionCache.ModelRef"
+          },
+          "previous": {
+            "type": "object",
+            "properties": {
+              "time": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "promptTokens": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "model": {
+                "$ref": "#/components/schemas/SessionCache.ModelRef"
+              },
+              "ageMs": {
+                "type": "integer",
+                "minimum": 0
+              }
+            },
+            "required": ["time", "promptTokens", "model", "ageMs"],
+            "additionalProperties": false
+          },
+          "reusableTokens": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "reusableExact": {
+            "type": "boolean"
+          },
+          "lostTokens": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "reasons": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "divergence": {
+            "$ref": "#/components/schemas/SessionCache.Divergence"
+          },
+          "staleThinking": {
+            "$ref": "#/components/schemas/SessionCache.StaleThinking"
+          },
+          "running": {
+            "type": "boolean"
+          }
+        },
+        "required": ["status", "reusableTokens", "reusableExact", "lostTokens", "reasons"],
+        "additionalProperties": false
+      },
+      "SessionCache.PreflightStatus": {
+        "type": "string",
+        "enum": ["hit", "partial", "miss", "unknown"]
+      },
+      "SessionCache.PromptMetadata": {
+        "type": "object",
+        "properties": {
+          "thinkingLoss": {
+            "$ref": "#/components/schemas/SessionCache.ThinkingLoss"
+          }
+        },
+        "allOf": [
+          {
+            "type": "object",
+            "additionalProperties": {}
+          }
+        ]
+      },
+      "SessionCache.PromptMetadata_1": {
+        "type": "object",
+        "properties": {
+          "thinkingLoss": {
+            "$ref": "#/components/schemas/SessionCache.ThinkingLoss"
+          }
+        },
+        "allOf": [
+          {
+            "type": "object",
+            "additionalProperties": {}
+          }
+        ]
+      },
+      "SessionCache.StaleThinking": {
+        "type": "object",
+        "properties": {
+          "count": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "reason": {
+            "type": "string"
+          },
+          "unit": {
+            "type": "string"
+          },
+          "consent": {
+            "$ref": "#/components/schemas/SessionCache.ConsentOutcome"
+          }
+        },
+        "required": ["count", "reason"],
+        "additionalProperties": false
+      },
+      "SessionCache.ThinkingLoss": {
+        "type": "string",
+        "enum": ["ask", "accept"]
+      },
       "SessionGenerateResponse": {
         "type": "object",
         "properties": {
@@ -19841,6 +20231,16 @@
           }
         },
         "required": ["_tag", "sessionID", "message"],
+        "additionalProperties": false
+      },
+      "SessionPreflightResponse": {
+        "type": "object",
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/SessionCache.PreflightReport"
+          }
+        },
+        "required": ["data"],
         "additionalProperties": false
       },
       "SessionStats.Activity": {
@@ -20055,6 +20455,26 @@
             "additionalProperties": false
           }
         ]
+      },
+      "SessionThinkingResponse": {
+        "type": "object",
+        "properties": {
+          "data": {
+            "type": "object",
+            "properties": {
+              "dropped": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/SessionCache.DroppedThinking"
+                }
+              }
+            },
+            "required": ["dropped"],
+            "additionalProperties": false
+          }
+        },
+        "required": ["data"],
+        "additionalProperties": false
       },
       "SessionTransfer.Data": {
         "type": "object",
