@@ -868,6 +868,69 @@ describe("SubagentTool", () => {
     ),
   )
 
+  it.live("asks for Code Mode's fetch as the acting agent, its Session's rules and its delegators decide", () =>
+    Effect.acquireRelease(
+      Effect.promise(() => tmpdir()),
+      (dir) => Effect.promise(() => dir[Symbol.asyncDispose]()),
+    ).pipe(
+      Effect.flatMap((dir) =>
+        Effect.gen(function* () {
+          const received: string[] = []
+          const server = yield* Effect.acquireRelease(
+            Effect.sync(() =>
+              Bun.serve({
+                port: 0,
+                fetch: (request) => {
+                  received.push(new URL(request.url).pathname)
+                  return new Response("fetched")
+                },
+              }),
+            ),
+            (server) => Effect.promise(() => server.stop(true)),
+          )
+          const url = (pathname: string) => new URL(pathname, server.url).href
+          const { parent, delegate, scope } = yield* planDelegation(dir.path, {
+            permissions: [{ action: "webfetch", resource: url("/blocked"), effect: "deny" }],
+            plan: [{ action: "webfetch", resource: "*", effect: "deny" }],
+          })
+          const registry = yield* Tool.Service.pipe(Effect.provide(scope))
+          const permission = yield* Permission.Service.pipe(Effect.provide(scope))
+          const fetchAs = (sessionID: Session.ID, agent: Agent.ID, pathname: string, asking = true) =>
+            registry.snapshot(undefined, undefined, undefined, asking ? permission.assert : undefined).pipe(
+              Effect.flatMap((tools) =>
+                tools.execute({
+                  sessionID,
+                  agent,
+                  messageID: toolIdentity.messageID,
+                  call: {
+                    type: "tool-call",
+                    id: `call-fetch-${agent}-${pathname.slice(1)}`,
+                    name: "execute",
+                    input: { code: `return await (await fetch(${JSON.stringify(url(pathname))})).text()` },
+                  },
+                }),
+              ),
+              Effect.map((result) => JSON.stringify(result.content)),
+            )
+
+          expect(yield* fetchAs(parent.id, toolIdentity.agent, "/data")).toContain("fetched")
+          // The Session's rules deny one URL, plan's own rules deny them all.
+          expect(yield* fetchAs(parent.id, toolIdentity.agent, "/blocked")).toContain("Permission denied: webfetch")
+          expect(yield* fetchAs(parent.id, planAgent, "/data")).toContain("Permission denied: webfetch")
+          const child = yield* delegate({ as: planAgent, agent: "reviewer", id: "call-plan" })
+          expect(yield* fetchAs(child, Agent.ID.make("reviewer"), "/data")).toContain(
+            "The plan agent that delegated this task does not permit it.",
+          )
+          // A snapshot that cannot ask for permissions refuses the request.
+          expect(yield* fetchAs(parent.id, toolIdentity.agent, "/data", false)).toContain(
+            "This request cannot ask for permissions.",
+          )
+          expect(received).toEqual(["/data"])
+        }),
+      ),
+    ),
+  )
+
   it.live("steers a running child session in the background", () =>
     Effect.acquireRelease(
       Effect.promise(() => tmpdir()),
