@@ -383,3 +383,16 @@ describe("ShellUnwrap.literal keeps expansions whole", () => {
     for (const result of await scans(command)) expect(result).not.toBeInstanceOf(Error)
   })
 })
+
+describe("ShellParse rules see the words after a redirect", () => {
+  // Bash takes one word after a redirect operator as its target; the words after it are the command's.
+  test.each([
+    ["rm >/dev/null -rf build", "rm -r *"],
+    ["rm 2>&1 -fr build", "rm * -r *"],
+    ["kubectl >/dev/null delete pod x", "kubectl delete *"],
+    ["printf ok | FOO=bar >output kubectl delete pod x", "kubectl delete *"],
+    ["sudo >/dev/null rm -rf build", "rm -r *"],
+  ])("%s", async (command, rule) => {
+    expect(await matched(command, rule)).toBe(true)
+  })
+})

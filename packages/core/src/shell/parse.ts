@@ -271,6 +271,14 @@ type Extent = typeof ShellScan.heredocExtent
 
 // Adds the commands of a tree parsed from SOURCE and returns the script strings they hand to a shell.
 function legacyCommands(output: Collector, root: Node, source: string, options: Options, extent: Extent) {
+  // The grammar reads the words after a redirect's target as more targets, where bash reads them as the command's.
+  if (
+    options.posix &&
+    root
+      .descendantsOfType("file_redirect")
+      .some((redirect) => (redirect?.childrenForFieldName("destination").length ?? 0) > 1)
+  )
+    output.misread = true
   const heredocs = options.posix ? legacyHeredocs(output, root, source, options, extent) : { ranges: [], reads: [] }
   const text = (node: Node) =>
     cut(node.parent?.type === "redirected_statement" ? node.parent : node, heredocs.ranges).trim()
@@ -666,9 +674,10 @@ function portableCommands(output: Collector, scanned: Portable, options: Options
   return [...emit(output, reads, options), ...scripts]
 }
 
-// The words a command runs with, as written: without the redirect destinations after a trailing redirect.
+// The words a command runs with, as written. Bash takes one word after a redirect operator as its target, which is
+// not among them; the words after it are the command's (`rm >/dev/null -rf build` runs `rm -rf build`).
 function portableWords(item: Command) {
-  return item.redirectWordCount === undefined ? item.rawWords : item.rawWords.slice(0, item.redirectWordCount)
+  return item.rawWords
 }
 
 // What the heredocs and here-strings of a scan hold: the spans of the heredoc bodies, with their closing delimiter,
