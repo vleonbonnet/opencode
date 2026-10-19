@@ -288,7 +288,7 @@ const planDelegation = (
       )
     const decide = (sessionID: Session.ID, action: string, resource: string) =>
       permission.ask({ sessionID, action, resources: [resource], save: [] }).pipe(Effect.map((result) => result.effect))
-    return { parent, sessions, scope, delegate, decide }
+    return { parent, sessions, scope, permission, delegate, decide }
   })
 
 describe("SubagentTool", () => {
@@ -652,6 +652,41 @@ describe("SubagentTool", () => {
           expect(yield* decide(keeper, "edit", path.join(plans, "next.md"))).toBe("deny")
           // The subagent's exception and plan's allow both cover the key, but plan denies it as a .pem file.
           expect(yield* decide(keeper, "edit", "keys/server.pem")).toBe("deny")
+        }),
+      ),
+    ),
+  )
+
+  it.live("holds plan-delegated children to plan's rules for every spelling and names the rule that asks", () =>
+    Effect.acquireRelease(
+      Effect.promise(() => tmpdir()),
+      (dir) => Effect.promise(() => dir[Symbol.asyncDispose]()),
+    ).pipe(
+      Effect.flatMap((dir) =>
+        Effect.gen(function* () {
+          const push: Permission.Rule = { action: "shell", resource: "git push *", effect: "ask" }
+          const { permission, delegate } = yield* planDelegation(dir.path, {
+            plan: [
+              { action: "subagent", resource: "reviewer", effect: "allow" },
+              { action: "shell", resource: "*", effect: "allow" },
+              { action: "shell", resource: "rm *", effect: "deny" },
+              push,
+            ],
+            subagents: { reviewer: [{ action: "shell", resource: "*", effect: "allow" }] },
+          })
+          const child = yield* delegate({ as: planAgent, agent: "reviewer", id: "call-spellings" })
+          const ask = (resource: string, alternate: string) =>
+            permission.ask({ sessionID: child, action: "shell", resources: [resource], alternates: [[alternate]] })
+
+          // Only the bare spelling matches plan's deny.
+          expect((yield* ask("/usr/bin/rm -rf src", "rm -rf src")).effect).toBe("deny")
+          // The child's own rules allow the push; plan's ask decides it, through the bare spelling.
+          const asked = yield* ask("/usr/bin/git push origin", "git push origin")
+          expect(asked.effect).toBe("ask")
+          expect((yield* permission.get(asked.id))?.reasons).toEqual([
+            { resource: "/usr/bin/git push origin", spelling: "git push origin", rule: push },
+          ])
+          yield* permission.reply({ requestID: asked.id, reply: "once" })
         }),
       ),
     ),

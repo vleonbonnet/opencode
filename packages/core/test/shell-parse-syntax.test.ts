@@ -29,7 +29,8 @@ describe("native shell syntax compatibility", () => {
     const legacy = await Effect.runPromise(ShellParse.scan(command, "pwsh", "/workspace"))
     const native = await Effect.runPromise(ShellParse.scan(command, "pwsh", "/workspace", { portable: true }))
     expect(native.commands.map((item) => item.resource)).toEqual(legacy.commands.map((item) => item.resource))
-    for (const item of native.commands) expect(Wildcard.match(item.resource, item.save), item.resource).toBe(true)
+    for (const item of native.commands)
+      expect(item.save !== undefined && Wildcard.match(item.resource, item.save), item.resource).toBe(true)
   })
 
   for (const shell of ["bash", "zsh"]) {
@@ -79,7 +80,8 @@ describe("native shell syntax compatibility", () => {
     const command = "cat <<FIRST <<'SECOND'\n$(printf first)\nFIRST\n$(not_a_command)\nSECOND"
     const expected = {
       commands: [
-        { resource: command, save: "cat *" },
+        // The quoted body is data for cat and left out; the unquoted one is kept.
+        { resource: "cat <<FIRST <<'SECOND'\n$(printf first)\nFIRST", save: "cat *", alternates: ["cat"] },
         { resource: "printf first", save: "printf *" },
       ],
       directories: [],

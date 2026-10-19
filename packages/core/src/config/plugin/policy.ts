@@ -48,7 +48,9 @@ export const Plugin = define({
     yield* ctx.permission.hook("evaluate", (event) =>
       Effect.sync(() => {
         const current = policies()
+        // A policy denying any spelling of a resource denies it.
         const denied = event.resources
+          .flatMap((resource, index) => [resource, ...(event.alternates?.[index] ?? [])])
           .map((resource) =>
             current.findLast(
               (policy) =>

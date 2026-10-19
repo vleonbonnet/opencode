@@ -763,17 +763,6 @@ export type Project = {
   sandboxes: Array<string>
 }
 
-export type PermissionRequest = {
-  id: PermissionID
-  sessionID: SessionID
-  action: string
-  resources: Array<string>
-  save?: Array<string>
-  metadata?: { [x: string]: JsonValue }
-  source?: PermissionSource
-  message?: string
-}
-
 export type PermissionSavedInfo = {
   id: PermissionSavedID
   projectID: ProjectID
@@ -961,6 +950,8 @@ export type ModelVariant = {
 }
 
 export type PermissionRuleset = Array<PermissionRule>
+
+export type PermissionReason = { resource: string; spelling?: string; rule?: PermissionRule }
 
 export type SessionThinkingResponse = { data: { dropped: Array<SessionCacheDroppedThinking> } }
 
@@ -1638,24 +1629,6 @@ export type ReferenceUpdated = {
   type: "reference.updated"
   location?: LocationRef
   data: {}
-}
-
-export type PermissionAsked = {
-  id: EventID
-  created: number
-  metadata?: { [x: string]: any }
-  type: "permission.asked"
-  location?: LocationRef
-  data: {
-    id: PermissionID
-    sessionID: SessionID
-    action: string
-    resources: Array<string>
-    save?: Array<string>
-    metadata?: { [x: string]: any }
-    source?: PermissionSource
-    message?: string
-  }
 }
 
 export type PermissionReplied = {
@@ -2411,6 +2384,39 @@ export type ConfigEntry =
       }
     }
   | { type: "directory"; path: AbsolutePath }
+
+export type PermissionRequest = {
+  id: PermissionID
+  sessionID: SessionID
+  action: string
+  resources: Array<string>
+  alternates?: Array<Array<string>>
+  save?: Array<string>
+  metadata?: { [x: string]: JsonValue }
+  source?: PermissionSource
+  message?: string
+  reasons?: Array<PermissionReason>
+}
+
+export type PermissionAsked = {
+  id: EventID
+  created: number
+  metadata?: { [x: string]: any }
+  type: "permission.asked"
+  location?: LocationRef
+  data: {
+    id: PermissionID
+    sessionID: SessionID
+    action: string
+    resources: Array<string>
+    alternates?: Array<Array<string>>
+    save?: Array<string>
+    metadata?: { [x: string]: any }
+    source?: PermissionSource
+    message?: string
+    reasons?: Array<PermissionReason>
+  }
+}
 
 export type SessionInboxUser = {
   id: SessionMessageID

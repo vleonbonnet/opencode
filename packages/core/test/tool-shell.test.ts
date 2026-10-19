@@ -295,26 +295,38 @@ describe("ShellTool scanner permissions", () => {
   for (const portable of [false, true]) {
     const scanner = portable ? "native" : "legacy"
 
-    test(`${scanner}: declarations reuse approvals while substitutions retain reject/once/always behavior`, () =>
+    test(`${scanner}: declarations ask and reuse approvals while substitutions retain reject/once/always behavior`, () =>
       withScanner(portable, (registry, fixture) =>
         Effect.gen(function* () {
           const saved = yield* PermissionSaved.Service
           const location = yield* Location.Service
           yield* saved.add({ projectID: location.project.id, action: "shell", resources: ["printf *"] })
           const marker = path.join(fixture.active, "marker")
-          const approved = yield* runPermissionCommand(
-            registry,
-            "export SCAN_TEST=hello; unset SCAN_TEST; printf hello > marker",
-            marker,
-            [],
-          )
+          const declarations = "export SCAN_TEST=hello; unset SCAN_TEST; printf hello > marker"
+          const asked = yield* runPermissionCommand(registry, declarations, marker, ["always"])
+          expect(asked.requests).toMatchObject([
+            {
+              action: "shell",
+              resources: ["export SCAN_TEST=hello", "unset SCAN_TEST", "printf hello > marker"],
+              alternates: [[], [], ["printf hello"]],
+              save: ["export SCAN_TEST=*", "unset SCAN_TEST", "printf *"],
+            },
+          ])
+          expect(asked.exit).toMatchObject({ _tag: "Success", value: { status: "completed", metadata: { exit: 0 } } })
+          expect(yield* Effect.promise(() => Bun.file(marker).text())).toBe("hello")
+          expect((yield* saved.list()).map((item) => item.resource).sort()).toEqual([
+            "export SCAN_TEST=*",
+            "printf *",
+            "unset SCAN_TEST",
+          ])
+          yield* Effect.promise(() => fs.rm(marker))
+          const approved = yield* runPermissionCommand(registry, declarations, marker, [])
           expect(approved.requests).toEqual([])
           expect(approved.exit).toMatchObject({
             _tag: "Success",
             value: { status: "completed", metadata: { exit: 0 } },
           })
           expect(yield* Effect.promise(() => Bun.file(marker).text())).toBe("hello")
-          expect((yield* saved.list()).map((item) => item.resource)).toEqual(["printf *"])
 
           yield* Effect.forEach(yield* saved.list(), (item) => saved.remove(item.id))
           const command = 'export SCAN_TEST=$(printf hello); printf %s "$SCAN_TEST" > marker'
@@ -345,11 +357,12 @@ describe("ShellTool scanner permissions", () => {
           for (const request of prompts) {
             expect(request).toMatchObject({
               action: "shell",
-              resources: ["printf hello", 'printf %s "$SCAN_TEST" > marker'],
-              save: ["printf *", "printf *"],
+              resources: ["export SCAN_TEST=$(printf hello)", "printf hello", 'printf %s "$SCAN_TEST" > marker'],
+              alternates: [[], [], ['printf %s "$SCAN_TEST"']],
+              save: ["export SCAN_TEST=*", "printf *", "printf *"],
             })
           }
-          expect((yield* saved.list()).map((item) => item.resource)).toEqual(["printf *"])
+          expect((yield* saved.list()).map((item) => item.resource).sort()).toEqual(["export SCAN_TEST=*", "printf *"])
 
           const agents = yield* Agent.Service
           yield* agents.transform((editor) =>
@@ -397,6 +410,64 @@ describe("ShellTool scanner permissions", () => {
           const denied = yield* runPermissionCommand(registry, command, marker, [])
           expect(denied.requests).toEqual([])
           expect(denied.exit).toMatchObject({
+            _tag: "Success",
+            value: { status: "error", error: { message: expect.stringContaining("Permission denied: shell") } },
+          })
+          expect(yield* Effect.promise(() => Bun.file(marker).exists())).toBe(false)
+        }),
+      ))
+
+    test(`${scanner}: a denial reaches the command behind runners and an option cluster`, () =>
+      withScanner(portable, (registry, fixture) =>
+        Effect.gen(function* () {
+          const agents = yield* Agent.Service
+          yield* agents.transform((editor) =>
+            editor.update(toolIdentity.agent, (agent) => {
+              agent.permissions = [
+                { action: "shell", resource: "*", effect: "allow" },
+                { action: "shell", resource: "rm -r *", effect: "deny" },
+              ]
+            }),
+          )
+          const victim = path.join(fixture.active, "victim")
+          yield* Effect.promise(() => fs.mkdir(victim))
+          const result = yield* runPermissionCommand(registry, "env nice -n 5 rm -rf victim", victim, [])
+          expect(result.requests).toEqual([])
+          expect(result.exit).toMatchObject({
+            _tag: "Success",
+            value: { status: "error", error: { message: expect.stringContaining("Permission denied: shell") } },
+          })
+          expect(yield* Effect.promise(() => fs.stat(victim).then((stat) => stat.isDirectory()))).toBe(true)
+        }),
+      ))
+
+    test(`${scanner}: a rule on heredoc text applies to bodies a shell runs, not to data`, () =>
+      withScanner(portable, (registry, fixture) =>
+        Effect.gen(function* () {
+          const agents = yield* Agent.Service
+          yield* agents.transform((editor) =>
+            editor.update(toolIdentity.agent, (agent) => {
+              agent.permissions = [
+                { action: "shell", resource: "*", effect: "allow" },
+                { action: "shell", resource: "*kanopy-oidc*", effect: "deny" },
+              ]
+            }),
+          )
+          const notes = path.join(fixture.active, "notes")
+          const data = yield* runPermissionCommand(registry, "cat > notes <<'EOF'\nkanopy-oidc\nEOF", notes, [])
+          expect(data.requests).toEqual([])
+          expect(data.exit).toMatchObject({ _tag: "Success", value: { status: "completed", metadata: { exit: 0 } } })
+          expect(yield* Effect.promise(() => Bun.file(notes).text())).toBe("kanopy-oidc\n")
+
+          const marker = path.join(fixture.active, "marker")
+          const script = yield* runPermissionCommand(
+            registry,
+            "sh <<'EOF'\nprintf kanopy-oidc > marker\nEOF",
+            marker,
+            [],
+          )
+          expect(script.requests).toEqual([])
+          expect(script.exit).toMatchObject({
             _tag: "Success",
             value: { status: "error", error: { message: expect.stringContaining("Permission denied: shell") } },
           })
@@ -573,7 +644,12 @@ describe("ShellTool conditional process substitution", () => {
               const command = '[[ -n <(printf reached > marker) ]]; wait "$!"'
               const result = yield* runPermissionCommand(registry, command, marker, [reply])
               expect(result.requests).toMatchObject([
-                { action: "shell", resources: ["printf reached > marker", 'wait "$!"'], save: ["printf *", "wait *"] },
+                {
+                  action: "shell",
+                  resources: ["printf reached > marker", 'wait "$!"'],
+                  alternates: [["printf reached"], []],
+                  save: ["printf *", "wait *"],
+                },
               ])
               if (reply === "reject") {
                 expect(Exit.isFailure(result.exit)).toBe(true)
@@ -699,13 +775,13 @@ describe("ShellTool ordinary shell syntax", () => {
           name: "parameter fallback",
           command: 'value=; printf %s "${value:-fallback}"',
           output: "fallback",
-          saved: ["printf *"],
+          saved: ["value=*", "printf *"],
         },
         {
           name: "arithmetic statement",
           command: 'count=1; ((count += 1)); printf %s "$count"',
           output: "2",
-          saved: ["((count += 1)) *", "printf *"],
+          saved: ["count=*", "((count += 1)) *", "printf *"],
         },
         { name: "ANSI-C quoting", command: "printf %s $'a\\nb'", output: "a\nb", saved: ["printf *"] },
       ]) {
@@ -1554,6 +1630,30 @@ describe("ShellTool", () => {
     { timeout: 15_000 },
   )
 
+  it.live("points a timed-out command at the background instead of a longer timeout", () =>
+    Effect.acquireUseRelease(
+      Effect.promise(() => tmpdir()),
+      (tmp) => {
+        reset()
+        return withSession(tmp.path, (registry) =>
+          Effect.gen(function* () {
+            const settled = yield* executeTool(registry, call({ command: idleCommand, timeout: 100 }))
+            expect(settled.status).toBe("completed")
+            expect(settled.metadata).toMatchObject({ timeout: true })
+            const text = settled.content?.map((item) => (item.type === "text" ? item.text : "")).join("\n") ?? ""
+            expect(text).toContain("Command exceeded timeout of 100 ms.")
+            expect(text).toContain("run it again with background: true and wait for the notification that it finished")
+            expect(text).toContain(
+              "Do not retry with a larger timeout or a longer sleep, and do not poll for completion",
+            )
+            expect(text).toContain("Timed out before completion")
+          }),
+        )
+      },
+      (tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]().then(() => undefined)),
+    ),
+  )
+
   it.live("returns the shell id for a background command", () =>
     Effect.acquireUseRelease(
       Effect.promise(() => tmpdir()),
@@ -1589,7 +1689,9 @@ describe("ShellTool", () => {
             expect((yield* shell.list()).map((info) => info.id)).toContain(id)
             expect((yield* shell.wait(id)).status).toBe("timeout")
             expect((yield* Fiber.join(admitted)).valueOrUndefined?.data.item.payload).toMatchObject({
-              text: expect.stringContaining("Timed out before completion"),
+              text: expect.stringMatching(
+                /Command exceeded timeout of 50 ms\. If it needs more time, run it again in the background without a timeout and wait for the notification that it finished\.\n\nTimed out before completion/,
+              ),
               description: idleCommand,
               metadata: {
                 source: "shell",

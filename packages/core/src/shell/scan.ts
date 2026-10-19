@@ -19,12 +19,58 @@ type Command = {
   wordEnds?: number[]
   statementHead?: true
   declaration?: true
+  // A statement of variable assignments alone, which runs nothing but binds variables for the commands after it.
+  // Only `statements` reports these.
+  assignment?: true
   // Words after a trailing redirect are destinations in the legacy command span.
   redirectWordCount?: number
 }
 
 // Opaque describes a parsing limitation, not a permission decision.
 export type Result = { kind: "scanned"; commands: Command[] } | { kind: "opaque"; reason: OpaqueReason }
+
+// Offsets into one of the texts a scan reads: the input, or the text of a backquoted substitution as unescaped or of
+// an unquoted heredoc body, each numbered by `text`.
+export type Span = { text: number; start: number; end: number }
+
+// Where a command lies: the start of its resource and of each of its raw words, in the text it was read from, and
+// the variable assignments prefixed to it, as written, with where each starts.
+export type Place = { text: number; start: number; words: number[]; assignments: Array<{ raw: string; start: number }> }
+
+export type Heredoc = {
+  // A quoted delimiter leaves the body unexpanded.
+  quoted: boolean
+  // The body as written; for `<<-`, after the tabs stripped from its first line, where the legacy grammar starts it.
+  // For a here-string (`<<<`), the word with a newline, as the reader gets it.
+  body: string
+  // The body with its closing delimiter, in the text it was read from and in each text around it; none for a
+  // here-string, whose word stays in the command's text.
+  spans: Span[]
+  // The commands that may read the body: those of the statement it is redirected to, those after that statement in
+  // the pipelines around it, and, once its output is substituted into a word, every command of the top-level
+  // statement, since where the word ends up is not followed.
+  readers: Command[]
+  // The text the redirect is read from, and where its operator starts in it.
+  text: number
+  at: number
+  // A `<<-` heredoc, whose reader gets each line without its leading tabs.
+  tabs: boolean
+  // Whether the statement's output is substituted into a word.
+  substituted: boolean
+  // The files the statement it is redirected to writes its output to, as their words read (`cat > file <<EOF`).
+  targets: string[]
+}
+
+export type Statements =
+  | {
+      kind: "scanned"
+      commands: Command[]
+      heredocs: Heredoc[]
+      places: ReadonlyMap<Command, Place>
+      // The commands each command's output may reach through the pipelines around it.
+      downstream: ReadonlyMap<Command, Command[]>
+    }
+  | { kind: "opaque"; reason: OpaqueReason }
 
 const BASH_REDIRECTS = ["&>>", "&>", "<<<", "<<-", "<<", "<>", "<&", ">&", ">|", ">>", ">", "<"]
 const BASH_LIST_OPERATORS = ["&&", "||", "|&"]
@@ -132,13 +178,43 @@ type Opaque = { kind: "opaque"; reason: OpaqueReason }
 type BashResult = { kind: "scanned"; commands: Command[]; end: number } | Opaque
 
 // Shared across one scan: the work budget, the shell dialect, and whether a bound expansion reaches a variable sink.
+// For permission checks it also keeps the innermost list being read, the heredoc bodies read, where each command
+// lies, and the number of each text read. Equal texts read alike, so they share a number.
 type BashContext = {
   remaining: number
   dialect: Dialect
   boundDollar?: boolean
   boundOpen?: boolean
   variableSink?: boolean
+  level?: BashState
+  bodies: BashBody[]
+  places: Map<Command, Place>
+  // The innermost stage each command was read in.
+  stages: Map<Command, BashStage>
+  texts: Map<string, number>
 }
+
+// A stage of a pipeline: a simple or compound statement, with every command read inside it. `parent` is the stage of
+// the enclosing list holding it, `substitution` tells that its list is a command or process substitution, and a
+// top-level stage has the commands of its and-or list.
+type BashStage = {
+  commands: Command[]
+  pipeline: BashStage[]
+  parent: BashStage | undefined
+  substitution: boolean
+  statement: Command[] | undefined
+}
+
+// The list a state reads: the stage holding it in the enclosing list, the stage being read, the pipeline that stage
+// continues, and at the top level the commands of the and-or list being read.
+type BashList = {
+  parent: BashStage | undefined
+  stage: BashStage | undefined
+  pipeline: BashStage[] | undefined
+  statement: Command[] | undefined
+}
+
+type BashBody = Omit<Heredoc, "readers" | "substituted"> & { stage: BashStage | undefined }
 
 type BashHeredoc = {
   delimiter: string
@@ -148,15 +224,22 @@ type BashHeredoc = {
   binding?: boolean
   command?: Command
   start?: number
+  // The statement the heredoc is redirected to, where its operator starts, and the files that statement writes.
+  stage?: BashStage
+  at: number
+  targets?: string[]
 }
 
 type BashState = {
   input: string
+  // The number of the text `input` is.
+  text: number
   context: BashContext
   commands: Command[]
   nestedCommands: Command[]
   words: string[]
   rawWords: string[]
+  wordStarts: number[]
   // Pending heredocs, shared with nested groups: a body starts after the next newline token at any nesting.
   heredocs: BashHeredoc[]
   structures: Array<{
@@ -167,7 +250,12 @@ type BashState = {
     sawIn?: boolean
     patternStarted?: boolean
     parenthesized?: boolean
+    // The list the compound statement is a stage of.
+    outer?: BashList
   }>
+  list: BashList
+  // The list is a command or process substitution's.
+  substitution: boolean
   word: string
   literal: string
   output: string
@@ -186,6 +274,9 @@ type BashState = {
   invalid: OpaqueReason | undefined
   redirectTarget: boolean
   hereString: boolean
+  // The redirect target being read is a file the command writes, and the files the command writes so far.
+  outputTarget: boolean
+  targets: string[]
   hasRedirect: boolean
   compoundEnd: boolean
   // A list operator (&&, ||, |, |&) still awaits its right-hand command.
@@ -206,13 +297,149 @@ type BashEvaluation = "arithmetic" | "binding" | "deferred"
 export type Dialect = "bash" | "zsh" | "posix"
 
 export function scan(input: string, dialect: Dialect = "posix"): Result {
+  const result = statements(input, dialect)
+  if (result.kind === "opaque") return result
+  return { kind: "scanned", commands: result.commands.filter((command) => !command.assignment) }
+}
+
+// The scan permission checks read: the commands, with the statements of assignments alone among them in source order,
+// since what they bind decides what the commands after them see; the heredocs and here-strings with the commands
+// that may read them; where each command lies, so a body can be left out of its text; and the commands each
+// command's output may reach.
+export function statements(input: string, dialect: Dialect = "posix"): Statements {
   if (input.length > MAX_INPUT_LENGTH) return { kind: "opaque", reason: "invalid-structure" }
-  const context: BashContext = { remaining: MAX_INPUT_LENGTH * MAX_SUBSTITUTION_DEPTH, dialect }
+  const context: BashContext = {
+    remaining: MAX_INPUT_LENGTH * MAX_SUBSTITUTION_DEPTH,
+    dialect,
+    bodies: [],
+    places: new Map(),
+    stages: new Map(),
+    texts: new Map(),
+  }
   const result = scanBash(input, 0, 0, context)
   if (result.kind === "opaque") return result
   if (context.boundDollar && context.boundOpen && context.variableSink)
     return { kind: "opaque", reason: "dynamic-execution" }
-  return { kind: "scanned", commands: result.commands }
+  const downstream = new Map<Command, Command[]>()
+  for (const [command, stage] of context.stages) {
+    const later = bashDownstream(stage)
+    if (later.length) downstream.set(command, later)
+  }
+  return {
+    kind: "scanned",
+    commands: result.commands,
+    heredocs: context.bodies.map(({ stage, ...body }) => ({
+      ...body,
+      readers: stage ? bashReaders(stage) : [],
+      substituted: stage !== undefined && bashSubstituted(stage),
+    })),
+    places: context.places,
+    downstream,
+  }
+}
+
+// The commands that may read what a statement reads on its input; see Heredoc.
+function bashReaders(stage: BashStage) {
+  const readers = [...stage.commands, ...bashDownstream(stage)]
+  if (bashSubstituted(stage)) {
+    let root = stage
+    while (root.parent) root = root.parent
+    readers.push(...(root.statement ?? []))
+  }
+  return readers
+}
+
+// The commands in the later stages of the pipelines around a stage, which its output reaches.
+function bashDownstream(stage: BashStage) {
+  const later: Command[] = []
+  for (let item: BashStage | undefined = stage; item; item = item.parent)
+    later.push(...item.pipeline.slice(item.pipeline.indexOf(item) + 1).flatMap((next) => next.commands))
+  return later
+}
+
+// Whether a stage's output is substituted into a word.
+function bashSubstituted(stage: BashStage) {
+  for (let item: BashStage | undefined = stage; item; item = item.parent) if (item.substitution) return true
+  return false
+}
+
+// The stage being read, begun when the first part of a statement is.
+function bashStage(state: BashState) {
+  const list = state.list
+  if (list.stage) return list.stage
+  const pipeline = list.pipeline ?? []
+  const stage: BashStage = {
+    commands: [],
+    pipeline,
+    parent: list.parent,
+    substitution: state.substitution,
+    statement: list.parent ? undefined : (list.statement ??= []),
+  }
+  pipeline.push(stage)
+  list.pipeline = pipeline
+  list.stage = stage
+  return stage
+}
+
+// Ends the stage being read at a list separator: a pipe continues its pipeline, `&&` and `||` its and-or list.
+function bashSeparate(state: BashState, separator: string) {
+  const list = state.list
+  if (separator === "|" || separator === "|&") list.pipeline = bashStage(state).pipeline
+  else {
+    list.pipeline = undefined
+    if (separator !== "&&" && separator !== "||") list.statement = undefined
+  }
+  list.stage = undefined
+}
+
+// A compound statement is a stage of the list it is written in, and the lists inside it are read within that stage.
+function bashOpen(state: BashState) {
+  const structure = state.structures.at(-1)
+  if (!structure) return
+  structure.outer = state.list
+  state.list = { parent: bashStage(state), stage: undefined, pipeline: undefined, statement: undefined }
+}
+
+function bashClose(state: BashState) {
+  const structure = state.structures.pop()
+  if (structure?.outer) state.list = structure.outer
+}
+
+// Records where a command lies and the stages holding it. NAME is the index of its command word: the words before it
+// are the assignments prefixed to it.
+function bashPlace(state: BashState, command: Command, start: number, name: number) {
+  const prefix = Math.max(name, 0)
+  state.context.places.set(command, {
+    text: state.text,
+    start,
+    words: state.wordStarts.slice(prefix),
+    assignments: state.rawWords.slice(0, prefix).map((raw, index) => ({ raw, start: state.wordStarts[index] })),
+  })
+  const stage = bashStage(state)
+  state.context.stages.set(command, stage)
+  let root = stage
+  for (let item: BashStage | undefined = stage; item; item = item.parent) {
+    item.commands.push(command)
+    root = item
+  }
+  root.statement?.push(command)
+}
+
+function bashTextNumber(context: BashContext, input: string) {
+  const known = context.texts.get(input)
+  if (known !== undefined) return known
+  context.texts.set(input, context.texts.size)
+  return context.texts.size - 1
+}
+
+// Gives the heredoc bodies read since FROM their spans in the text OUTER as well, for those in the text INNER, which
+// is read out of OUTER at the offsets MAP gives.
+function bashAlias(context: BashContext, from: number, inner: string, outer: string, map: (offset: number) => number) {
+  const text = bashTextNumber(context, inner)
+  const around = bashTextNumber(context, outer)
+  for (const body of context.bodies.slice(from))
+    for (const span of body.spans.filter((item) => item.text === text))
+      body.spans.push({ text: around, start: map(span.start), end: map(span.end - 1) + 1 })
 }
 
 function bashStatement(state: BashState) {
@@ -268,10 +495,25 @@ function finishBashWord(state: BashState) {
     state.words.push(state.word)
     // Unquoted trailing continuations are ignored syntax, not part of the raw token.
     state.rawWords.push(state.input.slice(state.wordStart, state.wordEnd))
+    state.wordStarts.push(state.wordStart)
     state.commandEnd = state.wordEnd
   }
+  if (state.redirectTarget && state.outputTarget) state.targets.push(state.word)
+  // A here-string is read as a heredoc body is; its word stays in the command's text.
+  if (state.redirectTarget && state.hereString)
+    state.context.bodies.push({
+      quoted: true,
+      body: `${state.word}\n`,
+      spans: [],
+      stage: bashStage(state),
+      text: state.text,
+      at: state.wordStart,
+      tabs: false,
+      targets: [],
+    })
   state.redirectTarget = false
   state.hereString = false
+  state.outputTarget = false
   state.word = ""
   state.literal = ""
   state.output = ""
@@ -341,6 +583,16 @@ function bashBuiltinIndex(state: BashState) {
   return name
 }
 
+// The text of the command being finished, and where it starts in the input.
+function bashResource(state: BashState) {
+  const from = state.commandStart ?? 0
+  const raw = state.input.slice(from, state.resourceEnd ?? state.wordEnd)
+  return {
+    resource: raw.replace(/^[ \t\n]+|[ \t\n]+$/g, ""),
+    start: from + raw.length - raw.replace(/^[ \t\n]+/, "").length,
+  }
+}
+
 function finishBashCommand(state: BashState, boundary = false) {
   finishBashWord(state)
   if (state.redirectTarget) state.invalid ??= "invalid-redirect"
@@ -350,9 +602,7 @@ function finishBashCommand(state: BashState, boundary = false) {
   const inHeader = bashInHeader(state)
   if (name >= 0 && !state.words[name]) state.invalid ??= "invalid-structure"
   if (name >= 0 && !inHeader) {
-    const resource = state.input
-      .slice(state.commandStart, state.resourceEnd ?? state.wordEnd)
-      .replace(/^[ \t\n]+|[ \t\n]+$/g, "")
+    const { resource, start } = bashResource(state)
     const command: Command = {
       resource,
       words: state.words.slice(name),
@@ -365,6 +615,7 @@ function finishBashCommand(state: BashState, boundary = false) {
         : {}),
     }
     state.commands.push(command)
+    bashPlace(state, command, start, name)
     const builtin = bashBuiltinIndex(state)
     const builtinName = state.words[builtin]
     const builtinArgs = state.words.slice(builtin + 1)
@@ -410,13 +661,28 @@ function finishBashCommand(state: BashState, boundary = false) {
       }
     }
   }
+  if (name < 0 && !inHeader && state.words.length > 0) {
+    const { resource, start } = bashResource(state)
+    const command: Command = {
+      resource,
+      words: state.words.slice(),
+      rawWords: state.rawWords.slice(),
+      assignment: true,
+    }
+    state.commands.push(command)
+    bashPlace(state, command, start, 0)
+  }
   if (boundary && !state.words.length && !state.hasRedirect && !state.compoundEnd && !inHeader)
     state.invalid ??= "invalid-structure"
   if (state.words.length > (state.ampersandRedirectWords ?? Infinity)) state.invalid ??= "invalid-redirect"
+  // A heredoc pending since this statement began belongs to it, and so do the files it writes.
+  for (const heredoc of state.heredocs) heredoc.targets ??= [...state.targets]
   state.commands.push(...state.nestedCommands.splice(0))
   if (!inHeader && (state.words.length > 0 || state.hasRedirect)) bashStatement(state)
   state.words.length = 0
   state.rawWords.length = 0
+  state.wordStarts.length = 0
+  state.targets.length = 0
   state.commandWordIndex = -1
   state.commandStart = undefined
   state.hasRedirect = false
@@ -436,17 +702,45 @@ function scanBash(
   // A group shares its parent's heredocs; a substitution starts its own.
   heredocs?: BashHeredoc[],
   outer?: BashText,
+  // A group is a statement of the list it is written in; any other nested list is a substitution, whose output
+  // becomes a word.
+  group = false,
+): BashResult {
+  const level = context.level
+  try {
+    return scanBashList(input, start, depth, context, close, heredocs, outer, {
+      parent: level && bashStage(level),
+      substitution: level !== undefined && !group,
+    })
+  } finally {
+    context.level = level
+  }
+}
+
+function scanBashList(
+  input: string,
+  start: number,
+  depth: number,
+  context: BashContext,
+  close: ")" | "}" | "nofork" | undefined,
+  heredocs: BashHeredoc[] | undefined,
+  outer: BashText | undefined,
+  nesting: { parent: BashStage | undefined; substitution: boolean },
 ): BashResult {
   if (depth > MAX_SUBSTITUTION_DEPTH || context.remaining < 0) return { kind: "opaque", reason: "invalid-structure" }
   const state: BashState = {
     input,
+    text: bashTextNumber(context, input),
     context,
     commands: [],
     nestedCommands: [],
     words: [],
     rawWords: [],
+    wordStarts: [],
     heredocs: heredocs ?? [],
     structures: [],
+    list: { parent: nesting.parent, stage: undefined, pipeline: undefined, statement: undefined },
+    substitution: nesting.substitution,
     word: "",
     literal: "",
     output: "",
@@ -464,11 +758,14 @@ function scanBash(
     invalid: undefined,
     redirectTarget: false,
     hereString: false,
+    outputTarget: false,
+    targets: [],
     hasRedirect: false,
     compoundEnd: false,
     dangling: false,
     outer,
   }
+  context.level = state
   for (let index = start; index < input.length; index++) {
     if (--context.remaining < 0) return { kind: "opaque", reason: "invalid-structure" }
     const char = input[index]
@@ -665,13 +962,14 @@ function scanBashOperatorOrSeparator(
     if (redirect === "<<" || redirect === "<<-") {
       const delimiter = bashHeredocDelimiter(input, index + redirect.length, redirect === "<<-")
       if (!delimiter) return { kind: "opaque", reason: "invalid-redirect" }
-      state.heredocs.push(delimiter)
+      state.heredocs.push({ ...delimiter, stage: bashStage(state), at: index })
       state.wordEnd = delimiter.end + 1
       state.redirectTarget = false
       return delimiter.end
     }
     state.redirectTarget = true
     state.hereString = redirect === "<<<"
+    state.outputTarget = /^(?:>|>>|>\||&>|&>>|>&)$/.test(redirect)
     return index + redirect.length - 1
   }
   if (state.structures.at(-1)?.phase === "pattern" && char === "|") {
@@ -685,6 +983,7 @@ function scanBashOperatorOrSeparator(
   const separator = operator ?? char
   if (caseBody && separator.startsWith(";") && separator.length > 1) {
     if (!endBashList(state)) return { kind: "opaque", reason: "invalid-structure" }
+    bashSeparate(state, ";")
     structure.phase = "pattern"
     structure.patternStarted = false
     return index + separator.length - 1
@@ -704,8 +1003,12 @@ function scanBashOperatorOrSeparator(
     if (structure.phase === "header" && !structure.sawIn && !state.wordStarted && state.words.length === 0)
       return { kind: "opaque", reason: "compound-command" }
   }
-  if (separator === "\n" && !pending(state)) return readBashHeredocs(state, index, depth, context)
+  if (separator === "\n" && !pending(state)) {
+    if (!state.dangling) bashSeparate(state, separator)
+    return readBashHeredocs(state, index, depth, context)
+  }
   finishBashCommand(state, true)
+  bashSeparate(state, separator)
   if (structure?.kind === "for" && structure.phase === "header") structure.phase = "do"
   state.dangling = separator !== "&" && separator !== ";" && separator !== "\n"
   // Reprocess the newline to read pending heredoc bodies.
@@ -721,13 +1024,32 @@ function bashCommandKey(command: Command) {
 function readBashHeredocs(state: BashState, index: number, depth: number, context: BashContext) {
   let end = index
   for (const heredoc of state.heredocs.splice(0)) {
-    const body = bashHeredoc(state.input, end + 1, heredoc)
+    const bodyStart = end + 1
+    const body = bashHeredoc(state.input, bodyStart, heredoc)
     if (!body) return { kind: "opaque", reason: "heredoc" } satisfies Opaque
     if (heredoc.command) heredoc.command.resource = state.input.slice(heredoc.start, body.end).trim()
+    // As in the legacy grammar, a `<<-` body starts after the tabs `<<-` strips from its first line.
+    const tabs = heredoc.tabs ? (/^\t*/.exec(body.source)?.[0].length ?? 0) : 0
+    context.bodies.push({
+      quoted: heredoc.quoted,
+      body: body.source.slice(tabs),
+      spans: [{ text: state.text, start: bodyStart + tabs, end: body.end }],
+      stage: heredoc.stage,
+      text: state.text,
+      at: heredoc.at,
+      tabs: heredoc.tabs,
+      targets: heredoc.targets ?? [],
+    })
     const text = heredoc.quoted ? { word: body.source, literal: body.source, output: "" } : bashText()
     if (!heredoc.quoted) {
+      // Commands substituted in the body belong to the statement the heredoc is redirected to.
+      const from = context.bodies.length
+      const stage = state.list.stage
+      state.list.stage = heredoc.stage ?? stage
       const expansion = scanBashSpan(body.source, 0, depth, context, state.commands, BASH_SPANS.heredoc, true, text)
+      state.list.stage = stage
       if (typeof expansion === "object") return expansion
+      bashAlias(context, from, body.source, state.input, (offset) => offset + bodyStart)
     }
     if (heredoc.binding) bashEvaluatesExpansion(text, "deferred", context)
     end = body.end
@@ -775,19 +1097,19 @@ function scanBashCommandStart(
     structure.phase = "do"
     structure.parenthesized = true
     DO_AHEAD_RE.lastIndex = end + 1
-    if (!DO_AHEAD_RE.test(input)) state.structures.pop()
+    if (!DO_AHEAD_RE.test(input)) bashClose(state)
     return end
   }
   if (structure?.kind === "repeat" && structure.phase === "do" && char !== "\n" && char !== "#" && char !== ";") {
     TOKEN_RE.lastIndex = index
-    if (TOKEN_RE.exec(input)?.[0] !== "do") state.structures.pop()
+    if (TOKEN_RE.exec(input)?.[0] !== "do") bashClose(state)
   }
   const keywordStep = scanBashKeyword(state, index, depth, context)
   if (keywordStep !== undefined) return keywordStep
   if (structure?.kind === "for" && structure.phase === "do" && char !== "\n" && char !== "#" && char !== ";") {
     SPACE_CONTINUATION_AHEAD_RE.lastIndex = index + 1
     if (char !== "{" || !SPACE_CONTINUATION_AHEAD_RE.test(input)) return { kind: "opaque", reason: "compound-command" }
-    state.structures.pop()
+    bashClose(state)
   }
   const atStart = atCommandStart(state)
   const functionHead = atStart && char === "(" ? bashFunctionHeadLength(input, index) : 0
@@ -808,7 +1130,7 @@ function scanBashCommandStart(
       if (bashCrossesHeredoc(state, index, end)) return { kind: "opaque", reason: "heredoc" }
       if (!forHeader && context.dialect === "posix") {
         // Dash reads `((` as two nested subshells, so posix reports both readings.
-        const subshells = scanBash(input, index + 1, depth + 1, context, ")")
+        const subshells = scanBash(input, index + 1, depth + 1, context, ")", undefined, undefined, true)
         if (subshells.kind === "opaque") return subshells
         if (subshells.end !== end) return { kind: "opaque", reason: "compound-command" }
         const seen = new Set(state.commands.map(bashCommandKey))
@@ -832,7 +1154,16 @@ function scanBashCommandStart(
     (char === "(" ||
       (char === "{" && ((SPACE_CONTINUATION_AHEAD_RE.lastIndex = index + 1), SPACE_CONTINUATION_AHEAD_RE.test(input))))
   ) {
-    const group = scanBash(input, index + 1, depth + 1, context, char === "{" ? "}" : ")", state.heredocs)
+    const group = scanBash(
+      input,
+      index + 1,
+      depth + 1,
+      context,
+      char === "{" ? "}" : ")",
+      state.heredocs,
+      undefined,
+      true,
+    )
     if (group.kind === "opaque") return group
     if (!input.slice(index + 1, group.end).trim()) return { kind: "opaque", reason: "invalid-structure" }
     state.commands.push(...group.commands)
@@ -888,7 +1219,7 @@ function scanBashKeyword(
     return end
   }
   if (structure?.phase === "pattern" && !structure.patternStarted && !state.words.length && token === "esac") {
-    state.structures.pop()
+    bashClose(state)
     bashStatement(state)
     state.compoundEnd = true
     return end
@@ -951,7 +1282,7 @@ function scanBashKeyword(
       (token === "esac" && (structure.kind !== "case" || structure.phase === "header"))
     )
       return { kind: "opaque", reason: "compound-command" }
-    state.structures.pop()
+    bashClose(state)
     bashStatement(state)
     state.compoundEnd = true
     return end
@@ -974,6 +1305,7 @@ function scanBashKeyword(
       phase: ["for", "select", "case", "repeat"].includes(token) ? "header" : "condition",
       count: 0,
     })
+    bashOpen(state)
     // The compound command itself satisfies a preceding list operator.
     state.dangling = false
     return end
@@ -1346,21 +1678,29 @@ function scanBashBacktick(
   text?: BashText,
 ): number | Opaque {
   let source = ""
+  // Where each character of the unescaped source is in the input.
+  const offsets: number[] = []
   for (let index = start + 1; index < input.length; index++) {
     if (--context.remaining < 0) return { kind: "opaque", reason: "invalid-structure" }
     if (input[index] === "`") {
+      const from = context.bodies.length
       const inner = scanBash(source, 0, depth, context, undefined, undefined, text)
       if (inner.kind === "opaque") return { kind: "opaque", reason: "command-substitution" }
       commands.push(...inner.commands)
+      bashAlias(context, from, source, input, (offset) => offsets[offset])
       return index
     }
     const next = input[index + 1] ?? "\0"
     if (input[index] === "\\" && ("$`\\\n".includes(next) || (quoted && next === '"'))) {
       index++
-      if (next !== "\n") source += next
+      if (next !== "\n") {
+        source += next
+        offsets.push(index)
+      }
       continue
     }
     source += input[index]
+    offsets.push(index)
   }
   return { kind: "opaque", reason: "command-substitution" }
 }
@@ -1685,6 +2025,15 @@ function bashHeredocDelimiter(input: string, start: number, tabs: boolean) {
     end = index
   }
   if (started && !quote) return { delimiter, dashDelimiter, quoted, tabs, end }
+}
+
+// How bash reads a heredoc whose delimiter word follows `<<`, or `<<-` when TABS, at START, and whose body begins on
+// the line starting at BODY: where that word ends, whether it quotes the body, and the newline ending the line that
+// closes the body, absent when no line does; undefined when the shells read the delimiter differently.
+export function heredocExtent(input: string, start: number, tabs: boolean, body: number) {
+  const delimiter = bashHeredocDelimiter(input, start, tabs)
+  if (!delimiter) return
+  return { word: delimiter.end + 1, quoted: delimiter.quoted, end: bashHeredoc(input, body, delimiter)?.end }
 }
 
 function bashHeredoc(

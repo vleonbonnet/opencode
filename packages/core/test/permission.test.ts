@@ -9,6 +9,7 @@ import { Location } from "@opencode/core/location"
 import { Permission } from "@opencode/core/permission"
 import { PermissionTable } from "@opencode/core/permission/sql"
 import { PermissionSaved } from "@opencode/core/permission/saved"
+import { PluginHooks } from "@opencode/core/plugin/hooks"
 import { Project } from "@opencode/core/project"
 import { ProjectTable } from "@opencode/core/project/sql"
 import { AbsolutePath } from "@opencode/core/schema"
@@ -26,7 +27,15 @@ const current = Layer.succeed(
 )
 const it = testEffect(
   AppNodeBuilder.build(
-    LayerNode.group([Database.node, Bus.node, SessionStore.node, PermissionSaved.node, Agent.node, Permission.node]),
+    LayerNode.group([
+      Database.node,
+      Bus.node,
+      SessionStore.node,
+      PermissionSaved.node,
+      Agent.node,
+      PluginHooks.node,
+      Permission.node,
+    ]),
     [Location.node.replace(current)],
   ),
 )
@@ -296,6 +305,72 @@ describe("Permission", () => {
     }),
   )
 
+  it.effect("reports the rule that asks for each resource that needs approval", () =>
+    Effect.gen(function* () {
+      yield* setup([
+        { action: "shell", resource: "*", effect: "allow" },
+        { action: "shell", resource: "*secret*", effect: "ask" },
+        { action: "shell", resource: "git *", effect: "ask" },
+        { action: "shell", resource: "git push", effect: "allow" },
+        { action: "edit", resource: "*", effect: "ask" },
+      ])
+      const saved = yield* PermissionSaved.Service
+      yield* saved.add({ projectID: Project.ID.global, action: "shell", resources: ["git status"] })
+      const { service, fiber, request } = yield* waitForRequest({
+        action: "shell",
+        resources: ["cat secret", "ls", "git push", "git status", "git log"],
+      })
+      const reasons: Permission.Reason[] = [
+        { resource: "cat secret", rule: { action: "shell", resource: "*secret*", effect: "ask" } },
+        { resource: "git log", rule: { action: "shell", resource: "git *", effect: "ask" } },
+      ]
+      expect(request.reasons).toEqual(reasons)
+      expect((yield* service.list()).map((item) => item.reasons)).toEqual([reasons])
+      expect((yield* service.forSession(request.sessionID)).map((item) => item.reasons)).toEqual([reasons])
+      yield* service.reply({ requestID: request.id, reply: "once" })
+      yield* Fiber.join(fiber)
+    }),
+  )
+
+  it.effect("reports a resource no rule matches without a rule", () =>
+    Effect.gen(function* () {
+      yield* setup([{ action: "edit", resource: "*", effect: "allow" }])
+      const { service, fiber, request } = yield* waitForRequest({ action: "shell", resources: ["ls", "pwd"] })
+      expect(request.reasons).toEqual([{ resource: "ls" }, { resource: "pwd" }])
+      yield* service.reply({ requestID: request.id, reply: "once" })
+      yield* Fiber.join(fiber)
+    }),
+  )
+
+  it.effect("leaves reasons out when the rules allow every resource and a plugin asks", () =>
+    Effect.gen(function* () {
+      yield* setup([{ action: "shell", resource: "*", effect: "allow" }])
+      const hooks = yield* PluginHooks.Service
+      yield* hooks.register("permission", "evaluate", (event) =>
+        Effect.sync(() => {
+          event.effect = "ask"
+        }),
+      )
+      const { service, fiber, request } = yield* waitForRequest({ action: "shell", resources: ["ls"] })
+      expect(request).not.toHaveProperty("reasons")
+      yield* service.reply({ requestID: request.id, reply: "once" })
+      yield* Fiber.join(fiber)
+    }),
+  )
+
+  it.effect("decides a resource by the last matching rule, or by none", () =>
+    Effect.sync(() => {
+      const rules: Permission.Ruleset = [
+        { action: "shell", resource: "*", effect: "ask" },
+        { action: "shell", resource: "git *", effect: "allow" },
+      ]
+      expect(Permission.deciding("shell", "git status", rules)).toEqual(rules[1])
+      expect(Permission.deciding("shell", "ls", rules)).toEqual(rules[0])
+      expect(Permission.deciding("edit", "ls", rules)).toBeUndefined()
+      expect(Permission.evaluate("edit", "ls", rules)).toEqual({ action: "edit", resource: "*", effect: "ask" })
+    }),
+  )
+
   it.effect("defects when an asked permission is declined", () =>
     Effect.gen(function* () {
       yield* setup()
@@ -385,61 +460,224 @@ describe("Permission", () => {
   }
 })
 
+describe("shell command spellings", () => {
+  // Asks for COMMAND as the shell tool does: each command's resource, with its other spellings beside it.
+  const ask = (command: string, portable: boolean, id = "per_test") =>
+    Effect.gen(function* () {
+      const parsed = yield* ShellParse.scan(command, "bash", "/project", { portable })
+      const service = yield* Permission.Service
+      const input = {
+        ...assertion({ id: Permission.ID.create(id), action: "shell" }),
+        resources: parsed.commands.map((item) => item.resource),
+        alternates: parsed.commands.map((item) => item.alternates ?? []),
+        save: parsed.commands.flatMap((item) => (item.save === undefined ? [] : [item.save])),
+      }
+      const result = yield* service.ask(input)
+      const request = yield* service.get(result.id)
+      if (result.effect === "ask") yield* service.reply({ requestID: result.id, reply: "once" })
+      return { effect: result.effect, request }
+    })
+  const rule = (resource: string, effect: Permission.Rule["effect"]): Permission.Rule => ({
+    action: "shell",
+    resource,
+    effect,
+  })
+
+  for (const portable of [false, true]) {
+    const scanner = portable ? "native" : "legacy"
+
+    it.live(`${scanner}: decides a command by the latest rule matching any of its spellings`, () =>
+      Effect.gen(function* () {
+        yield* setup([
+          rule("*", "ask"),
+          rule("ls -la *", "allow"),
+          rule("tar -xzf *", "allow"),
+          rule("kubectl get *", "allow"),
+          rule("kubectl * get *", "allow"),
+        ])
+        expect((yield* ask("ls -la src", portable)).effect).toBe("allow")
+        expect((yield* ask("tar -xzf a.tgz", portable)).effect).toBe("allow")
+        expect((yield* ask(`kubectl "get" pods`, portable)).effect).toBe("allow")
+        expect((yield* ask(`kubectl -n x 'get' pods`, portable)).effect).toBe("allow")
+        expect((yield* ask(`kubectl "delete" pod x`, portable)).effect).toBe("ask")
+        // Another file may run under a bare name, so its directory keeps the command asking.
+        expect((yield* ask("./kubectl get pods", portable)).effect).toBe("ask")
+      }),
+    )
+
+    it.live(`${scanner}: denies a command when a deny rule matches any of its spellings`, () =>
+      Effect.gen(function* () {
+        yield* setup([
+          rule("*", "allow"),
+          rule("rm -r *", "deny"),
+          rule("rm * -r *", "deny"),
+          rule("rm -R *", "deny"),
+          rule("rm * -R *", "deny"),
+          rule("rm --r*", "deny"),
+          rule("rm * --r*", "deny"),
+        ])
+        for (const command of ["rm -fr build", `rm "-rf" build`, "/bin/rm -rf build", "sudo X=1 rm -rf build"])
+          expect((yield* ask(command, portable)).effect, command).toBe("deny")
+        expect((yield* ask("rm -f build", portable)).effect).toBe("allow")
+        expect((yield* ask("rm -- -rf", portable)).effect).toBe("allow")
+      }),
+    )
+
+    it.live(`${scanner}: names the spelling and the rule that asks`, () =>
+      Effect.gen(function* () {
+        yield* setup([
+          rule("*", "allow"),
+          rule("kubectl *", "ask"),
+          rule("kubectl get *", "allow"),
+          rule("kubectl delete *", "ask"),
+        ])
+        const { effect, request } = yield* ask(`kubectl "delete" pod x`, portable)
+        expect(effect).toBe("ask")
+        expect(request?.reasons).toEqual([
+          {
+            resource: `kubectl "delete" pod x`,
+            spelling: "kubectl delete pod x",
+            rule: rule("kubectl delete *", "ask"),
+          },
+        ])
+      }),
+    )
+
+    it.live(`${scanner}: an approval saved for one spelling does not allow another command`, () =>
+      Effect.gen(function* () {
+        yield* setup([rule("*", "ask")])
+        const service = yield* Permission.Service
+        const parsed = yield* ShellParse.scan(`"kubectl" get pods`, "bash", "/project", { portable })
+        const result = yield* service.ask({
+          ...assertion({ action: "shell" }),
+          resources: parsed.commands.map((item) => item.resource),
+          alternates: parsed.commands.map((item) => item.alternates ?? []),
+          save: parsed.commands.flatMap((item) => (item.save === undefined ? [] : [item.save])),
+        })
+        yield* service.reply({ requestID: result.id, reply: "always" })
+        expect((yield* ask(`"kubectl" get pods -A`, portable, "per_again")).effect).toBe("allow")
+        expect((yield* ask(`"kubectl" delete pod x`, portable, "per_other")).effect).toBe("ask")
+      }),
+    )
+  }
+
+  it.effect("re-evaluates the reasons of a pending request after an always reply", () =>
+    Effect.gen(function* () {
+      yield* setup()
+      const bus = yield* Bus.Service
+      const asked: Permission.Request[] = []
+      const unsubscribe = yield* bus.listen((event) =>
+        Effect.sync(() => {
+          if (event.type === Permission.Event.Asked.type) asked.push(event.data as Permission.Request)
+        }),
+      )
+      yield* Effect.addFinalizer(() => unsubscribe)
+      const first = yield* waitForRequest({
+        id: Permission.ID.create("per_first"),
+        action: "shell",
+        resources: ["git status", "npm test"],
+        save: ["git status *", "npm test *"],
+      })
+      expect(first.request.reasons).toEqual([{ resource: "git status" }, { resource: "npm test" }])
+      const second = yield* waitForRequest({
+        id: Permission.ID.create("per_second"),
+        action: "shell",
+        resources: ["git status"],
+        save: ["git status *"],
+      })
+      yield* second.service.reply({ requestID: second.request.id, reply: "always" })
+      yield* Fiber.join(second.fiber)
+      const pending = yield* first.service.get(first.request.id)
+      expect(pending?.reasons).toEqual([{ resource: "npm test" }])
+      expect((yield* first.service.list()).map((item) => item.reasons)).toEqual([[{ resource: "npm test" }]])
+      // Clients show one prompt for each request asked, so the change is not asked again.
+      expect(asked.filter((item) => item.id === first.request.id)).toHaveLength(1)
+      yield* first.service.reply({ requestID: first.request.id, reply: "once" })
+      yield* Fiber.join(first.fiber)
+    }),
+  )
+})
+
+// The resources, their other spellings and the saved prefixes of a scanned command, as the shell tool asks for them.
+function shellRequest(parsed: ShellParse.Result) {
+  return {
+    resources: parsed.commands.map((command) => command.resource),
+    ...(parsed.commands.some((command) => command.alternates)
+      ? { alternates: parsed.commands.map((command) => command.alternates ?? []) }
+      : {}),
+    save: parsed.commands.flatMap((command) => (command.save === undefined ? [] : [command.save])),
+  }
+}
+
 describe("shell scanner permission impact", () => {
   // Fixed cases require matching outcomes; remaining differences are investigation snapshots, not contracts.
   // These service-level cases all have command resources; tool tests cover skipped checks and directories.
   // Outcome pairs are [legacy, native].
   for (const fixture of [
     {
-      name: "timed command preserves wrapper approvals",
+      // A wrapper approval no longer covers the command it runs, which is checked on its own.
+      name: "timed command checks the command it times",
       shell: "bash",
       command: "time -p git status",
       approved: ["time *"],
-      exact: ["time -p git status"],
-      denied: "time -p git status",
-      savedEffect: ["allow", "allow"],
+      exact: ["time -p git status", "git status"],
+      denied: "git status",
+      savedEffect: ["ask", "ask"],
       exactEffect: ["allow", "allow"],
       deniedEffect: ["deny", "deny"],
     },
     {
-      name: "coprocess command preserves wrapper approvals",
+      // As for `time`, the command a coprocess runs is checked on its own.
+      name: "coprocess command checks the command it runs",
       shell: "bash",
       command: "coproc git status",
       approved: ["coproc *"],
-      exact: ["coproc git status"],
-      denied: "coproc git status",
-      savedEffect: ["allow", "allow"],
+      exact: ["coproc git status", "git status"],
+      denied: "git status",
+      savedEffect: ["ask", "ask"],
       exactEffect: ["allow", "allow"],
       deniedEffect: ["deny", "deny"],
     },
     {
+      // Declarations decide what the commands after them see, so they are checked as written.
       name: "declarations and unset",
       shell: "bash",
       command: "export X=value; unset X; git status",
       approved: ["git status *"],
       exact: ["git status"],
       denied: "export *",
+      savedEffect: ["ask", "ask"],
+      exactEffect: ["ask", "ask"],
+      deniedEffect: ["deny", "deny"],
+    },
+    {
+      name: "approved declarations and unset",
+      shell: "bash",
+      command: "export X=value; unset X; git status",
+      approved: ["export *", "unset *", "git status *"],
+      exact: ["export X=value", "unset X", "git status"],
+      denied: "unset X",
       savedEffect: ["allow", "allow"],
       exactEffect: ["allow", "allow"],
-      deniedEffect: ["allow", "allow"],
+      deniedEffect: ["deny", "deny"],
     },
     {
       name: "export with an approved command substitution",
       shell: "bash",
       command: "export VERSION=$(git describe --tags); npm run build",
-      approved: ["git describe *", "npm run build *"],
-      exact: ["git describe --tags", "npm run build"],
+      approved: ["export *", "git describe *", "npm run build *"],
+      exact: ["export VERSION=$(git describe --tags)", "git describe --tags", "npm run build"],
       denied: "export *",
       savedEffect: ["allow", "allow"],
       exactEffect: ["allow", "allow"],
-      deniedEffect: ["allow", "allow"],
+      deniedEffect: ["deny", "deny"],
     },
     {
       name: "export retains checks on the command substitution",
       shell: "bash",
       command: "export VERSION=$(git describe --tags); npm run build",
-      approved: ["git describe *", "npm run build *"],
-      exact: ["git describe --tags", "npm run build"],
+      approved: ["export *", "git describe *", "npm run build *"],
+      exact: ["export VERSION=$(git describe --tags)", "git describe --tags", "npm run build"],
       denied: "git describe *",
       savedEffect: ["allow", "allow"],
       exactEffect: ["allow", "allow"],
@@ -468,14 +706,15 @@ describe("shell scanner permission impact", () => {
       deniedEffect: ["deny", "deny"],
     },
     {
+      // Native reads the assignment itself, which is checked as written; legacy misreads the line as one command.
       name: "assignment redirect followed by a command",
       shell: "bash",
       command: "FOO=bar > output; printf done",
       approved: ["printf *"],
       exact: ["printf done"],
       denied: "FOO=bar > output; printf done",
-      savedEffect: ["ask", "allow"],
-      exactEffect: ["ask", "allow"],
+      savedEffect: ["ask", "ask"],
+      exactEffect: ["ask", "ask"],
       deniedEffect: ["deny", "allow"],
     },
     {
@@ -485,9 +724,9 @@ describe("shell scanner permission impact", () => {
       approved: ["git describe *"],
       exact: ["git describe --tags"],
       denied: "VERSION=$(git describe --tags) > build/version.txt",
-      savedEffect: ["ask", "allow"],
-      exactEffect: ["ask", "allow"],
-      deniedEffect: ["deny", "allow"],
+      savedEffect: ["ask", "ask"],
+      exactEffect: ["ask", "ask"],
+      deniedEffect: ["deny", "deny"],
     },
     {
       name: "substitution in a saved prefix",
@@ -568,19 +807,13 @@ describe("shell scanner permission impact", () => {
             const parsed = yield* ShellParse.scan(fixture.command, fixture.shell, "/project", { portable })
             expect(parsed.commands.length).toBeGreaterThan(0)
             expect(parsed.directories).toEqual([])
-            const result = yield* service.ask(
-              assertion({
-                action: "shell",
-                resources: parsed.commands.map((command) => command.resource),
-                save: parsed.commands.map((command) => command.save),
-              }),
-            )
+            const result = yield* service.ask(assertion({ action: "shell", ...shellRequest(parsed) }))
             expect(result.effect, portable ? "native" : "legacy").toBe(scenario.expected[index])
             const pending = yield* service.list()
             expect(pending).toHaveLength(result.effect === "ask" ? 1 : 0)
             if (result.effect !== "ask") continue
-            expect(pending[0]?.resources).toEqual(parsed.commands.map((command) => command.resource))
-            expect(pending[0]?.save).toEqual(parsed.commands.map((command) => command.save))
+            expect(pending[0]?.resources).toEqual(shellRequest(parsed).resources)
+            expect(pending[0]?.save).toEqual(shellRequest(parsed).save)
             yield* service.reply({ requestID: result.id, reply: "once" })
             expect(yield* service.list()).toEqual([])
           }
@@ -595,40 +828,42 @@ describe("shell scanner permission impact", () => {
       name: "numeric npm script prefix",
       shell: "bash",
       command: "npm run 123",
-      grants: [["npm run *"], ["npm run 123 *"]],
+      // Both scanners save the script named, so the grant does not cover another script.
+      grants: [["npm run 123 *"], ["npm run 123 *"]],
       repeat: [
         ["allow", "allow"],
         ["allow", "allow"],
       ],
       next: "npm run build",
-      nextEffect: ["allow", "ask"],
+      nextEffect: ["ask", "ask"],
     },
     {
       name: "numeric AWS option prefix",
       shell: "bash",
       command: "aws --cli-read-timeout 60 s3 ls",
-      grants: [["aws --cli-read-timeout s3 *"], ["aws --cli-read-timeout 60 *"]],
+      grants: [["aws --cli-read-timeout 60 *"], ["aws --cli-read-timeout 60 *"]],
       repeat: [
-        ["ask", "ask"],
+        ["allow", "allow"],
         ["allow", "allow"],
       ],
       next: "aws --cli-read-timeout 60 ec2 describe-instances",
-      nextEffect: ["ask", "allow"],
+      nextEffect: ["allow", "allow"],
     },
     {
       name: "substitution prefix",
       shell: "bash",
       command: "git $(printf diff) --stat",
+      // Both scanners save the substitution as written, so the grant does not cover the command without it.
       grants: [
-        ["git --stat *", "printf *"],
+        ["git $(printf diff) *", "printf *"],
         ["git $(printf diff) *", "printf *"],
       ],
       repeat: [
-        ["ask", "ask"],
+        ["allow", "allow"],
         ["allow", "allow"],
       ],
       next: "git --stat",
-      nextEffect: ["allow", "ask"],
+      nextEffect: ["ask", "ask"],
     },
     {
       name: "redirect prefix",
@@ -649,11 +884,14 @@ describe("shell scanner permission impact", () => {
       name: "assignment redirect prefix",
       shell: "bash",
       command: "FOO=bar > output; printf done",
-      grants: [["printf *"], ["printf *"]],
-      // Identical saved rules cover only the native resource, regardless of which parser saved them.
+      // Both scanners read the assignment and save its variable.
+      grants: [
+        ["FOO=*", "printf *"],
+        ["FOO=*", "printf *"],
+      ],
       repeat: [
-        ["ask", "allow"],
-        ["ask", "allow"],
+        ["allow", "allow"],
+        ["allow", "allow"],
       ],
       next: "printf next",
       nextEffect: ["allow", "allow"],
@@ -678,13 +916,7 @@ describe("shell scanner permission impact", () => {
           const service = yield* Permission.Service
           const saved = yield* PermissionSaved.Service
           const parsed = yield* ShellParse.scan(fixture.command, fixture.shell, "/project", { portable })
-          const first = yield* service.ask(
-            assertion({
-              action: "shell",
-              resources: parsed.commands.map((command) => command.resource),
-              save: parsed.commands.map((command) => command.save),
-            }),
-          )
+          const first = yield* service.ask(assertion({ action: "shell", ...shellRequest(parsed) }))
           expect(first.effect).toBe("ask")
           expect(yield* service.list()).toHaveLength(1)
           yield* service.reply({ requestID: first.id, reply: "always" })
@@ -696,13 +928,7 @@ describe("shell scanner permission impact", () => {
           for (const [index, target] of [false, true].entries()) {
             for (const command of [fixture.command, fixture.next]) {
               const parsed = yield* ShellParse.scan(command, fixture.shell, "/project", { portable: target })
-              const result = yield* service.ask(
-                assertion({
-                  action: "shell",
-                  resources: parsed.commands.map((command) => command.resource),
-                  save: parsed.commands.map((command) => command.save),
-                }),
-              )
+              const result = yield* service.ask(assertion({ action: "shell", ...shellRequest(parsed) }))
               expect(result.effect, `${target ? "native" : "legacy"}: ${command}`).toBe(
                 command === fixture.next ? fixture.nextEffect[origin] : fixture.repeat[origin]?.[index],
               )

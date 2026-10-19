@@ -16,7 +16,7 @@ import { PluginHooks } from "./plugin/hooks.js"
 
 const PermissionEffect = Permission.Effect
 export { PermissionEffect as Effect }
-export { Rule, Ruleset } from "@opencode/schema/permission"
+export { Reason, Rule, Ruleset } from "@opencode/schema/permission"
 const missingAgentPermissions: Permission.Ruleset = [{ action: "*", resource: "*", effect: "deny" }]
 
 export const ID = Permission.ID
@@ -29,6 +29,7 @@ const RequestFields = {
   sessionID: Permission.Request.fields.sessionID,
   action: Permission.Request.fields.action,
   resources: Permission.Request.fields.resources,
+  alternates: Permission.Request.fields.alternates,
   save: Permission.Request.fields.save,
   metadata: Permission.Request.fields.metadata,
   source: Permission.Request.fields.source,
@@ -87,14 +88,37 @@ export type Error = BlockedError | CorrectedError
 
 export function evaluate(action: string, resource: string, ...rulesets: Permission.Ruleset[]): Permission.Rule {
   return (
-    rulesets
-      .flat()
-      .findLast((rule) => Wildcard.match(action, rule.action) && Wildcard.match(resource, rule.resource)) ?? {
+    deciding(action, resource, ...rulesets) ?? {
       action,
       resource: "*",
       effect: "ask",
     }
   )
+}
+
+// The rule that decides ACTION on RESOURCE, the last one matching; none when no rule matches, and asking is the
+// default.
+export function deciding(action: string, resource: string, ...rulesets: Permission.Ruleset[]) {
+  return rulesets
+    .flat()
+    .findLast((rule) => Wildcard.match(action, rule.action) && Wildcard.match(resource, rule.resource))
+}
+
+// The spellings of the resource at INDEX of a request: the resource, then its alternates.
+export function spellings(input: Pick<Request, "resources" | "alternates">, index: number) {
+  return [input.resources[index], ...(input.alternates?.[index] ?? [])]
+}
+
+// The rule that decides ACTION on a resource written as SPELLINGS: the latest rule in the merged order that matches
+// any of them, with the spelling it matched; none when no rule matches any, and asking is the default.
+export function decidingAny(action: string, spellings: readonly string[], ...rulesets: Permission.Ruleset[]) {
+  const rules = rulesets.flat()
+  for (let index = rules.length - 1; index >= 0; index--) {
+    const rule = rules[index]
+    if (!Wildcard.match(action, rule.action)) continue
+    const spelling = spellings.find((item) => Wildcard.match(item, rule.resource))
+    if (spelling !== undefined) return { rule, spelling }
+  }
 }
 
 export function merge(...rulesets: Permission.Ruleset[]): Permission.Ruleset {
@@ -143,7 +167,7 @@ export interface Interface {
 export class Service extends Context.Service<Service, Interface>()("@opencode/Permission") {}
 
 interface Pending {
-  readonly request: Request
+  request: Request
   readonly agent?: Agent.ID
   readonly deferred: Deferred.Deferred<void, DeclinedError | CorrectedError>
 }
@@ -216,8 +240,11 @@ const layer = Layer.effect(
       }
     })
 
-    function denied(input: Pick<Request, "action" | "resources">, rules: Permission.Ruleset) {
-      return input.resources.some((resource) => evaluate(input.action, resource, rules).effect === "deny")
+    // A resource is denied when the configured rule deciding any of its spellings denies it.
+    function denied(input: Pick<Request, "action" | "resources" | "alternates">, rules: Permission.Ruleset) {
+      return input.resources.some((_, index) =>
+        spellings(input, index).some((spelling) => evaluate(input.action, spelling, rules).effect === "deny"),
+      )
     }
 
     function relevant(input: AssertInput, rules: Permission.Ruleset) {
@@ -226,37 +253,59 @@ const layer = Layer.effect(
 
     const evaluateInput = Effect.fnUntraced(function* (input: AssertInput) {
       const { rules, ceilings } = yield* configured(input.sessionID, input.agent)
-      if (denied(input, rules)) return { effect: "deny" as const, rules }
+      if (denied(input, rules)) return { effect: "deny" as const, rules, reasons: [] }
       const ceiling = ceilings.find((item) => denied(input, item.rules))
       if (ceiling)
-        return { effect: "deny" as const, rules: ceiling.rules, message: delegatedDenial(input.action, ceiling) }
+        return {
+          effect: "deny" as const,
+          rules: ceiling.rules,
+          message: delegatedDenial(input.action, ceiling),
+          reasons: [],
+        }
       const saved = yield* savedRules()
       const all = [...rules, ...saved]
-      // Saved approvals answer a delegator's ask as they answer the delegator's own; no deny remains to override.
-      const effects = input.resources.map((resource) => decide(input.action, resource, rules, ceilings, saved))
-      const effect: Permission.Effect = effects.includes("ask") ? "ask" : "allow"
+      // Saved approvals answer a delegator's ask as they answer the delegator's own; no deny remains to override. A
+      // resource asks when, under its own rules or any ceiling, the rule deciding it across its spellings asks or no
+      // rule does; the first ruleset that asks gives the reason.
+      const rulesets = [all, ...ceilings.map((item) => [...item.rules, ...saved])]
+      const reasons = input.resources.flatMap((resource, index): Permission.Reason[] => {
+        for (const ruleset of rulesets) {
+          const decided = decidingAny(input.action, spellings(input, index), ruleset)
+          if (!decided) return [{ resource }]
+          if (decided.rule.effect !== "ask") continue
+          return [
+            { resource, ...(decided.spelling !== resource ? { spelling: decided.spelling } : {}), rule: decided.rule },
+          ]
+        }
+        return []
+      })
+      const effect: Permission.Effect = reasons.length > 0 ? "ask" : "allow"
       const event = yield* hooks.trigger("permission", "evaluate", {
         sessionID: input.sessionID,
         agent: input.agent,
         action: input.action,
         resources: input.resources,
+        ...(input.alternates ? { alternates: input.alternates } : {}),
         metadata: input.metadata,
         source: input.source,
         effect,
       })
-      return { effect: event.effect, message: event.message, rules: all }
+      return { effect: event.effect, message: event.message, rules: all, reasons }
     })
 
-    function request(input: AssertInput, message?: string): Request {
+    function request(input: AssertInput, result: { message?: string; reasons: Permission.Reason[] }): Request {
       return {
         id: input.id ?? ID.create(),
         sessionID: input.sessionID,
         action: input.action,
         resources: input.resources,
+        ...(input.alternates ? { alternates: input.alternates } : {}),
         save: input.save,
         metadata: input.metadata,
         source: input.source,
-        message,
+        message: result.message,
+        // None when the rules allow every resource and a plugin asks.
+        ...(result.reasons.length > 0 ? { reasons: result.reasons } : {}),
       }
     }
 
@@ -282,7 +331,7 @@ const layer = Layer.effect(
     const ask = Effect.fn("Permission.ask")(function* (input: AssertInput) {
       if (closed) return { id: input.id ?? ID.create(), effect: "deny" as const }
       const result = yield* evaluateInput(input)
-      const value = request(input, result.message)
+      const value = request(input, result)
       if (result.effect === "ask") yield* create(value, input.agent)
       return { id: value.id, effect: result.effect }
     })
@@ -302,7 +351,7 @@ const layer = Layer.effect(
               })
             }
             if (result.effect === "allow") return
-            const item = yield* create(request(input, result.message), input.agent)
+            const item = yield* create(request(input, result), input.agent)
             return yield* restore(Deferred.await(item.deferred)).pipe(
               // Deliberate defect tunnel: leaves wrap execution in blanket `mapError`, which
               // must not convert a user's decline into model-facing tool output. The decline
@@ -370,7 +419,14 @@ const layer = Layer.effect(
             const result = yield* evaluateInput({ ...item.request, agent: item.agent }).pipe(
               Effect.catchTag("Session.NotFoundError", () => Effect.undefined),
             )
-            if (result?.effect !== "allow") continue
+            if (!result) continue
+            if (result.effect !== "allow") {
+              // The approval may answer some of what the request asks for; it lists only what is left.
+              const { reasons: _, ...rest } = item.request
+              if (result.effect === "ask")
+                item.request = result.reasons.length ? { ...rest, reasons: result.reasons } : rest
+              continue
+            }
             yield* bus.publish(Permission.Event.Replied, {
               sessionID: item.request.sessionID,
               requestID: item.request.id,

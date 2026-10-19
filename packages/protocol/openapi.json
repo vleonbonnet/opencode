@@ -17231,6 +17231,22 @@
         "type": "string",
         "pattern": "^per"
       },
+      "Permission.Reason": {
+        "type": "object",
+        "properties": {
+          "resource": {
+            "type": "string"
+          },
+          "spelling": {
+            "type": "string"
+          },
+          "rule": {
+            "$ref": "#/components/schemas/Permission.Rule"
+          }
+        },
+        "required": ["resource"],
+        "additionalProperties": false
+      },
       "Permission.Reply": {
         "type": "string",
         "enum": ["once", "always", "reject"]
@@ -17253,6 +17269,15 @@
               "type": "string"
             }
           },
+          "alternates": {
+            "type": "array",
+            "items": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          },
           "save": {
             "type": "array",
             "items": {
@@ -17267,6 +17292,12 @@
           },
           "message": {
             "type": "string"
+          },
+          "reasons": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Permission.Reason"
+            }
           }
         },
         "required": ["id", "sessionID", "action", "resources"],

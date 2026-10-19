@@ -14,15 +14,19 @@ describe("Bash redirect resource oracle", () => {
   test.each([
     ["printf hello | cat > marker", ["printf hello", "cat"]],
     ["printf ok && git status > output", ["printf ok", "git status"]],
-    ["cat > output", ["cat > output"]],
-    ["cat > output | cat", ["cat > output", "cat"]],
-    ["pwd | > output cat > tail", ["pwd", "> output cat"]],
-    ["pwd && cat > output file", ["pwd", "cat"]],
-    ["pwd; cat > output", ["pwd", "cat > output"]],
-    ["pwd\ncat > output", ["pwd", "cat > output"]],
+    // A command is also checked without its redirects, as the program runs it.
+    ["cat > output", ["cat > output", "cat"]],
+    ["cat > output | cat", ["cat > output", "cat", "cat"]],
+    ["pwd | > output cat > tail", ["pwd", "> output cat", "cat"]],
+    // Bash takes one word as a redirect's target; `file` is cat's.
+    ["pwd && cat > output file", ["pwd", "cat", "cat file"]],
+    ["pwd; cat > output", ["pwd", "cat > output", "cat"]],
+    ["pwd\ncat > output", ["pwd", "cat > output", "cat"]],
   ] as const)("matches exact permission resources: %s", async (source, resources) => {
     const legacy = await Effect.runPromise(ShellParse.scan(source, "/bin/bash", "/workspace"))
-    expect(legacy.commands.map((command) => command.resource)).toEqual([...resources])
+    // The redirect-free spelling of a command is an alternate of the resource as written, not a separate resource.
+    const spellings = legacy.commands.flatMap((command) => [command.resource, ...(command.alternates ?? [])])
+    expect(spellings).toEqual([...resources])
     await parity(source)
   })
 
@@ -116,7 +120,9 @@ describe("Bash redirect resource oracle", () => {
     expect(legacy.commands[1]).toEqual({ resource: "cat", save: "cat *" })
     const native = await Effect.runPromise(ShellParse.scanPortable(source, "/bin/bash", "/workspace"))
     expect(native).toEqual(legacy)
-    expect(native.commands.every((command) => Wildcard.match(command.resource, command.save))).toBe(true)
+    expect(
+      native.commands.every((command) => command.save !== undefined && Wildcard.match(command.resource, command.save)),
+    ).toBe(true)
   })
 
   test.each(["cat\\\n", "cat \\\n", "cat\\\n\\\n", "cat\\\n;", "cat >out\\\n", "cat >out \\\n"])(
@@ -128,8 +134,17 @@ describe("Bash redirect resource oracle", () => {
       if (result.kind !== "scanned") throw new Error(result.reason)
       expect(result.commands[0]?.rawWords).toEqual(["cat"])
       const native = await Effect.runPromise(ShellParse.scanPortable(source, "/bin/bash", "/workspace"))
-      expect(native.commands[0]).toEqual({ resource: source.includes(">out") ? "cat >out" : "cat", save: "cat *" })
-      expect(native.commands.every((command) => Wildcard.match(command.resource, command.save))).toBe(true)
+      // With a redirect, the redirect-free spelling is an alternate of the command as written.
+      expect(native.commands[0]).toEqual(
+        source.includes(">out")
+          ? { resource: "cat >out", save: "cat *", alternates: ["cat"] }
+          : { resource: "cat", save: "cat *" },
+      )
+      expect(
+        native.commands.every(
+          (command) => command.save !== undefined && Wildcard.match(command.resource, command.save),
+        ),
+      ).toBe(true)
     },
   )
 
@@ -145,22 +160,25 @@ describe("Bash redirect resource oracle", () => {
     },
   )
 
-  test("known gap: assignment then redirect on a pipeline RHS retains the native command", async () => {
+  // The grammar reads the words after a redirect's target as more targets; the legacy scan then reads the command as
+  // the portable scanner does, as bash runs it.
+  test("retains the command after an assignment and a redirect on a pipeline RHS", async () => {
     const source = "printf ok | FOO=bar >output git status 3>tail"
-    const legacy = await Effect.runPromise(ShellParse.scan(source, "/bin/bash", "/workspace"))
-    const native = await Effect.runPromise(ShellParse.scanPortable(source, "/bin/bash", "/workspace"))
-    expect(legacy.commands).toEqual([{ resource: "printf ok", save: "printf *" }])
-    expect(native.commands).toEqual([
+    const expected = [
       { resource: "printf ok", save: "printf *" },
-      { resource: "FOO=bar >output git status", save: "git status *" },
-    ])
+      { resource: "FOO=bar >output git status", save: "git status *", alternates: ["git status"] },
+      { resource: "FOO=bar", save: "FOO=*" },
+    ]
+    expect((await Effect.runPromise(ShellParse.scan(source, "/bin/bash", "/workspace"))).commands).toEqual(expected)
+    expect((await Effect.runPromise(ShellParse.scanPortable(source, "/bin/bash", "/workspace"))).commands).toEqual(
+      expected,
+    )
   })
 
-  test("known gap: redirect before cd operand retains the target directory natively", async () => {
+  test("retains the target directory of a redirect before the cd operand", async () => {
     const source = "pwd && cd >out /outside"
-    const legacy = await Effect.runPromise(ShellParse.scan(source, "/bin/bash", "/workspace"))
-    const native = await Effect.runPromise(ShellParse.scanPortable(source, "/bin/bash", "/workspace"))
-    expect(legacy).toEqual({ commands: [{ resource: "pwd", save: "pwd *" }], directories: [] })
-    expect(native).toEqual({ commands: [{ resource: "pwd", save: "pwd *" }], directories: ["/outside"] })
+    const expected = { commands: [{ resource: "pwd", save: "pwd *" }], directories: ["/outside"] }
+    expect(await Effect.runPromise(ShellParse.scan(source, "/bin/bash", "/workspace"))).toEqual(expected)
+    expect(await Effect.runPromise(ShellParse.scanPortable(source, "/bin/bash", "/workspace"))).toEqual(expected)
   })
 })

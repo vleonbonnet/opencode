@@ -132,61 +132,46 @@ describe("portable shell parser compatibility", () => {
   })
 })
 
+describe("closed native and legacy parity gaps", () => {
+  // Both scanners save the prefix of the words the command runs, and read assignments with a redirect as assignments.
+  test.each<{ command: string; commands: ShellParse.Result["commands"] }>([
+    {
+      command: "FOO=bar > output",
+      commands: [{ resource: "FOO=bar > output", save: "FOO=*", alternates: ["FOO=bar"] }],
+    },
+    {
+      command: "FOO=$(printf value) > output",
+      commands: [
+        { resource: "FOO=$(printf value) > output", save: "FOO=*", alternates: ["FOO=$(printf value)"] },
+        { resource: "printf value", save: "printf *" },
+      ],
+    },
+    { command: "git 2 status", commands: [{ resource: "git 2 status", save: "git 2 *" }] },
+    {
+      command: "git $(printf status) diff",
+      commands: [
+        { resource: "git $(printf status) diff", save: "git $(printf status) *" },
+        { resource: "printf status", save: "printf *" },
+      ],
+    },
+  ])("$command", async ({ command, commands }) => {
+    for (const portable of [false, true])
+      expect(await Effect.runPromise(ShellParse.scan(command, "bash", "/workspace", { portable }))).toEqual({
+        commands,
+        directories: [],
+      })
+  })
+})
+
 describe("current native and legacy parity gaps", () => {
   // These are observed parser gaps, not permission-policy changes that must be preserved.
   for (const fixture of [
     {
-      name: "native omits the legacy empty command-name node for an assignment with redirection",
-      shell: "bash",
-      command: "FOO=bar > output",
-      legacy: { commands: [{ resource: "FOO=bar > output", save: " *" }], directories: [] },
-      native: { commands: [], directories: [] },
-    },
-    {
-      name: "native retains nested executable commands without the legacy empty assignment command-name node",
-      shell: "bash",
-      command: "FOO=$(printf value) > output",
-      legacy: {
-        commands: [
-          { resource: "FOO=$(printf value) > output", save: " *" },
-          { resource: "printf value", save: "printf *" },
-        ],
-        directories: [],
-      },
-      native: { commands: [{ resource: "printf value", save: "printf *" }], directories: [] },
-    },
-    {
-      name: "native keeps numeric arguments in saved prefixes",
-      shell: "bash",
-      command: "git 2 status",
-      legacy: { commands: [{ resource: "git 2 status", save: "git status *" }], directories: [] },
-      native: { commands: [{ resource: "git 2 status", save: "git 2 *" }], directories: [] },
-    },
-    {
-      name: "native keeps numeric directory names and operator-shaped arguments",
+      name: "native keeps numeric directory names",
       shell: "bash",
       command: "cd 123; git == value",
-      legacy: { commands: [{ resource: "git == value", save: "git value *" }], directories: [] },
+      legacy: { commands: [{ resource: "git == value", save: "git == *" }], directories: [] },
       native: { commands: [{ resource: "git == value", save: "git == *" }], directories: ["123"] },
-    },
-    {
-      name: "native preserves substitution source in saved prefixes instead of skipping the argument",
-      shell: "bash",
-      command: "git $(printf status) diff",
-      legacy: {
-        commands: [
-          { resource: "git $(printf status) diff", save: "git diff *" },
-          { resource: "printf status", save: "printf *" },
-        ],
-        directories: [],
-      },
-      native: {
-        commands: [
-          { resource: "git $(printf status) diff", save: "git $(printf status) *" },
-          { resource: "printf status", save: "printf *" },
-        ],
-        directories: [],
-      },
     },
     {
       name: "directory line continuations remain unresolved source rather than legacy split operands",
