@@ -3,6 +3,7 @@ export * as Agent from "./agent.js"
 import { makeLocationNode } from "@opencode/util/effect/app-node"
 import { Array, Context, Effect, Layer, Types } from "effect"
 import { Agent } from "@opencode/schema/agent"
+import type { Session } from "@opencode/schema/session"
 import { Bus } from "./bus.js"
 import { State } from "./state.js"
 
@@ -23,6 +24,27 @@ export interface Selection {
   readonly id: ID
   readonly info: Info | undefined
 }
+
+/** Agents a user switches between within one Session. */
+export const isSelectable = (agent: Pick<Info, "mode" | "hidden">) => agent.mode !== "subagent" && !agent.hidden
+
+/**
+ * Rulesets deciding what a request from `agent` in `session` shows the model: tools, the Code Mode catalog, skills, MCP
+ * instructions, and subagents. In a root Session, selectable agents share one exposure, so switching between them
+ * keeps the request prefix and the provider's prompt cache, while each agent's own rules still decide its calls. An
+ * agent running as a subagent in a child Session, whatever its mode, and a hidden agent keep their own.
+ */
+export const exposure = (
+  agent: Info,
+  agents: ReadonlyArray<Info>,
+  session: Pick<Session.Info, "parentID">,
+): ReadonlyArray<Info["permissions"]> =>
+  session.parentID === undefined && isSelectable(agent)
+    ? [
+        agent.permissions,
+        ...agents.filter((item) => item.id !== agent.id && isSelectable(item)).map((item) => item.permissions),
+      ]
+    : [agent.permissions]
 
 type Data = {
   agents: Map<ID, Types.DeepMutable<Info>>
@@ -71,8 +93,7 @@ const layer = Layer.effect(
       }),
       notify: () => bus.publish(Agent.Event.Updated, {}).pipe(Effect.asVoid),
     })
-    const selectable = (agent: Info | undefined) =>
-      agent && agent.mode !== "subagent" && !agent.hidden ? agent : undefined
+    const selectable = (agent: Info | undefined) => (agent && isSelectable(agent) ? agent : undefined)
     const selectedDefault = () => {
       const data = state.get()
       const configured = data.default ? selectable(data.agents.get(data.default)) : undefined

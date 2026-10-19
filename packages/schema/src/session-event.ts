@@ -25,6 +25,7 @@ import { SessionInbox } from "./session-inbox.js"
 import { Project } from "./project.js"
 import { SessionFork } from "./session-fork.js"
 import { Permission } from "./permission.js"
+import { SessionDelegator } from "./session-delegator.js"
 
 export const Source = Schema.Struct({
   start: NonNegativeInt,
@@ -61,6 +62,8 @@ export const Created = Event.durable({
     /** Host-supplied annotations resolved at creation, including any inherited from a parent. */
     metadata: SessionMetadata.pipe(optional),
     permissions: Permission.Ruleset.pipe(optional),
+    /** Who delegated work to the new Session; descendants inherit them through their ancestry. */
+    delegators: Schema.Array(SessionDelegator.Info).pipe(optional),
     version: Schema.String,
   },
 })
@@ -127,6 +130,17 @@ export const Permissions = Event.durable({
   },
 })
 export type Permissions = typeof Permissions.Type
+
+/** A delegator continued the Session through the subagent tool; recorded once per Session and agent. */
+export const Delegated = Event.durable({
+  type: "session.delegated",
+  ...options,
+  schema: {
+    ...Base,
+    delegator: SessionDelegator.Info,
+  },
+})
+export type Delegated = typeof Delegated.Type
 
 export const Viewed = Event.durable({
   type: "session.viewed",
@@ -657,6 +671,7 @@ export const Definitions = Event.inventory(
   Renamed,
   MetadataUpdated,
   Permissions,
+  Delegated,
   Viewed,
   UsageUpdated,
   Deleted,

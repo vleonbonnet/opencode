@@ -7,6 +7,7 @@ import { makeGlobalNode, makeLocationNode } from "@opencode/util/effect/app-node
 import { FSUtil } from "@opencode/util/fs-util"
 import { Global } from "@opencode/util/global"
 import { Identifier } from "@opencode/schema/identifier"
+import type { SessionError } from "@opencode/schema/session-error"
 import { FileRetention } from "./file-retention.js"
 import { State } from "./state.js"
 
@@ -30,10 +31,15 @@ export type Editor = {
 
 export interface Interface extends State.Transformable<Editor> {
   readonly truncate: (result: Result) => Effect.Effect<Result>
+  /** Bounds a failed call's model-visible error text with the same limits, saving any text it cuts. */
+  readonly truncateError: (error: SessionError.Error) => Effect.Effect<SessionError.Error>
   readonly cleanup: () => Effect.Effect<void>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/ToolOutput") {}
+
+const preview = (cut: { readonly kept: string; readonly marker: string }) =>
+  cut.kept === "" ? cut.marker : `${cut.kept}\n${cut.marker}`
 
 const cleanup = Effect.fn("ToolOutput.cleanup")(function* (fs: FSUtil.Interface, directory: string) {
   const entries = yield* fs.readDirectory(directory).pipe(
@@ -64,16 +70,16 @@ const layer = Layer.effect(
       }),
     })
 
-    const truncate = Effect.fnUntraced(function* (result: Result) {
-      if (result.metadata?.truncated !== undefined) return result
-      const content = result.content
-      const text = content.flatMap((item) => (item.type === "text" ? [item.text] : [])).join("\n")
+    /**
+     * The leading lines of text that exceed the limits; undefined when it fits. With `partial`, a first line too long
+     * to fit keeps as many leading characters as fit instead of nothing.
+     */
+    const bound = (text: string, partial: boolean) => {
       const limits = state.get()
       const lines = text.split("\n")
       if (text.endsWith("\n")) lines.pop()
       const totalBytes = Buffer.byteLength(text, "utf-8")
-      if (lines.length <= limits.maxLines && totalBytes <= limits.maxBytes)
-        return { ...result, metadata: { ...result.metadata, truncated: false } }
+      if (lines.length <= limits.maxLines && totalBytes <= limits.maxBytes) return undefined
 
       const kept: string[] = []
       let bytes = 0
@@ -83,13 +89,59 @@ const layer = Layer.effect(
         kept.push(line)
         bytes += size
       }
+      if (kept.length > 0 || !partial || lines[0] === undefined)
+        return {
+          kept: kept.join("\n"),
+          shown: `${kept.length > 0 ? `lines 1-${kept.length}` : "0 lines"} of ${lines.length}`,
+        }
+      // encodeInto stops before a character that would not fit, so the kept text never ends in a split one.
+      const first = lines[0]
+      const prefix = new TextEncoder().encodeInto(first, new Uint8Array(limits.maxBytes))
+      return {
+        kept: first.slice(0, prefix.read),
+        shown: `${prefix.written} of ${Buffer.byteLength(first, "utf-8")} bytes of line 1 of ${lines.length}`,
+      }
+    }
+
+    const save = Effect.fnUntraced(function* (text: string) {
       const file = path.join(directory, fileName())
-      yield* fs.ensureDir(directory).pipe(Effect.orDie)
-      yield* fs.writeFileString(file, text).pipe(Effect.orDie)
-      const shown = kept.length > 0 ? `lines 1-${kept.length}` : "0 lines"
-      const marker = `[showing ${shown} of ${lines.length}; full output saved to ${file}]`
+      yield* fs.ensureDir(directory)
+      yield* fs.writeFileString(file, text)
+      return file
+    })
+
+    /** Saves text that exceeds the limits and returns the leading lines that fit; undefined when it fits. */
+    const cut = Effect.fnUntraced(function* (text: string, label: string) {
+      const bounded = bound(text, false)
+      if (bounded === undefined) return undefined
+      const file = yield* save(text).pipe(Effect.orDie)
+      return { kept: bounded.kept, file, marker: `[showing ${bounded.shown}; full ${label} saved to ${file}]` }
+    })
+
+    // A failed save must not turn the tool's error into a defect, so the bounded text says the rest is lost instead.
+    const cutError = Effect.fnUntraced(function* (text: string, label: string) {
+      const bounded = bound(text, true)
+      if (bounded === undefined) return undefined
+      const saved = yield* save(text).pipe(
+        Effect.map((file) => `full ${label} saved to ${file}`),
+        Effect.catch((error) =>
+          Effect.logWarning("failed to save truncated tool error", { error }).pipe(
+            Effect.as(`the full ${label} could not be saved`),
+          ),
+        ),
+      )
+      return { kept: bounded.kept, marker: `[showing ${bounded.shown}; ${saved}]` }
+    })
+
+    const truncate = Effect.fnUntraced(function* (result: Result) {
+      if (result.metadata?.truncated !== undefined) return result
+      const content = result.content
+      const text = content.flatMap((item) => (item.type === "text" ? [item.text] : [])).join("\n")
+      const saved = yield* cut(text, "output")
+      if (saved === undefined) return { ...result, metadata: { ...result.metadata, truncated: false } }
+      const { file, marker } = saved
       const bounded: Tool.Content[] = []
-      let remaining = kept.join("\n").length
+      let remaining = saved.kept.length
       let seenText = false
       let marked = false
       for (const item of content) {
@@ -117,10 +169,23 @@ const layer = Layer.effect(
       }
     })
 
+    // The model reads an error's message and any provider response body, so each is bounded like output.
+    const truncateError = Effect.fnUntraced(function* (error: SessionError.Error) {
+      const message = yield* cutError(error.message, "error")
+      const body = error.response === undefined ? undefined : yield* cutError(error.response.body, "response body")
+      if (message === undefined && body === undefined) return error
+      return {
+        ...error,
+        ...(message === undefined ? {} : { message: preview(message) }),
+        ...(body === undefined ? {} : { response: { ...error.response, body: preview(body) } }),
+      }
+    })
+
     return Service.of({
       transform: state.transform,
       reload: state.reload,
       truncate,
+      truncateError,
       cleanup: () => cleanup(fs, directory),
     })
   }),

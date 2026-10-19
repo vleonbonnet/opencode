@@ -267,7 +267,14 @@ const permissionFail = {
       }),
     }),
 }
-const permission = permissionLayer()
+// Code Mode's fetch asks through the Session's permission service; scenarios read what it asked.
+const asserted: Permission.AssertInput[] = []
+const permission = permissionLayer({
+  assert: (input) =>
+    Effect.sync(() => {
+      asserted.push(input)
+    }),
+})
 const transformTools = (registry: Tool.Interface, tools: Readonly<Record<string, ToolInfo>>, options?: Tool.Options) =>
   registry.transform((editor) =>
     Object.entries(tools).forEach(([name, tool]) => editor.add({ ...tool, name, options: options ?? tool.options })),
@@ -367,8 +374,8 @@ const layer = Layer.unwrap(
       load: () => Effect.succeed(Instructions.empty),
     })
     const skillInstructions = Layer.mock(SkillInstructions.Service, {
-      load: (permissions) => {
-        // `setup` tags each agent's ruleset with a `skill` rule naming that agent.
+      load: ([permissions = []]) => {
+        // `setup` tags each agent's ruleset with a `skill` rule naming that agent; the acting agent's comes first.
         const baseline = permissions
           .filter((rule) => rule.action === "skill")
           .map((rule) => state.skillBaselines.get(Agent.ID.make(rule.resource)))
@@ -1891,6 +1898,92 @@ describe("SessionRunnerLLM", () => {
     expect(systemTexts(s.requests[1])).toContainEqual(expect.stringContaining("Reviewer skills"))
   })
 
+  scenario("asks the Session's permission service before Code Mode fetches", function* (s) {
+    asserted.length = 0
+    const received: string[] = []
+    const server = yield* Effect.acquireRelease(
+      Effect.sync(() =>
+        Bun.serve({
+          port: 0,
+          fetch: (request) => {
+            received.push(new URL(request.url).pathname)
+            return new Response("fetched")
+          },
+        }),
+      ),
+      (server) => Effect.promise(() => server.stop(true)),
+    )
+    const url = new URL("/data", server.url).href
+    yield* s.llm.push(
+      TestLLM.tool("call-fetch", "execute", { code: `return await (await fetch(${JSON.stringify(url)})).text()` }),
+      TestLLM.stop(),
+    )
+    yield* s.runPrompt("Fetch the data")
+
+    expect(asserted).toEqual([
+      {
+        action: "webfetch",
+        resources: [url],
+        save: ["*"],
+        metadata: { method: "GET", url },
+        sessionID,
+        agent: Agent.ID.make("build"),
+        source: { type: "tool", messageID: expect.any(String), id: "call-fetch" },
+      },
+    ])
+    expect(received).toEqual(["/data"])
+  })
+
+  scenario("sends plan and build the same tools while each agent's rules decide its calls", function* (s) {
+    const agents = yield* Agent.Service
+    const plan = Agent.ID.make("plan")
+    // Plan wholly denies two write tools that build allows; alone, plan's request would leave them out.
+    yield* agents.transform((editor) =>
+      editor.update(plan, (agent) => {
+        agent.mode = "primary"
+        agent.permissions.push(
+          { action: "note_write", resource: "*", effect: "deny" },
+          { action: "catalog_write", resource: "*", effect: "deny" },
+        )
+      }),
+    )
+    const registry = yield* Tool.Service
+    const writes: string[] = []
+    const writer = (name: string): ToolInfo => ({
+      name,
+      description: "Write a note",
+      input: Schema.Struct({ text: Schema.String }),
+      output: Schema.Struct({ text: Schema.String }),
+      execute: ({ text }) => Effect.sync(() => (writes.push(text), { output: { text } })),
+    })
+    yield* transformTools(registry, { note_write: writer("note_write") }, { codemode: false })
+    yield* transformTools(registry, { catalog_write: writer("catalog_write") }, { codemode: true })
+
+    yield* s.llm.push(TestLLM.tool("call-build-note", "note_write", { text: "build" }), TestLLM.stop())
+    yield* s.runPrompt("Build writes")
+    yield* s.bus.publish(SessionEvent.AgentSelected, { sessionID, agent: plan })
+    yield* s.llm.push(TestLLM.tool("call-plan-note", "note_write", { text: "plan" }), TestLLM.stop())
+    yield* s.runPrompt("Plan writes")
+
+    expect(s.requests).toHaveLength(4)
+    const [build, , planned] = s.requests
+    expect(build?.tools.map((tool) => tool.name)).toContain("note_write")
+    expect(build?.system.map((part) => part.text).join("\n")).toContain("catalog_write")
+    // Byte-identical tools and system prompt, and no instruction update: the Code Mode catalog did not change.
+    expect(planned?.tools).toEqual(build?.tools)
+    expect(planned?.system).toEqual(build?.system)
+    expect(systemTexts(planned!)).toEqual([])
+    expect(writes).toEqual(["build"])
+    expect((yield* s.context).at(-2)).toMatchObject(
+      Expected.assistant({}, [
+        Expected.failedTool(
+          { id: "call-plan-note" },
+          { error: { type: "permission.rejected", message: "The plan agent is not permitted to use note_write." } },
+        ),
+      ]),
+    )
+  })
+
   scenario("keeps the sampled agent when selection changes during observation", function* (s) {
     s.skillBaselines.set(Agent.ID.make("build"), "Build skills")
     s.skillBaselines.set(Agent.ID.make("reviewer"), "Reviewer skills")
@@ -2565,11 +2658,18 @@ describe("SessionRunnerLLM", () => {
           "generation",
           "providerOptions",
           "toolChoice",
-          "cache",
           "promptCacheKey",
           "http",
         ] as const)
           expect(compact[field]).toEqual(normal[field])
+        // Compaction keeps the turn's breakpoints, so it reads the turn's cache, at the default TTL: the next turn
+        // starts from the summary, so a one-hour write of the compaction prompt would never be read.
+        expect(normal.cache).toEqual(
+          route === AnthropicMessages.route
+            ? { tools: true, system: true, messages: { tail: 1 }, ttlSeconds: 3600 }
+            : undefined,
+        )
+        expect(compact.cache).toBeUndefined()
         expect(compact.toolChoice).toBeUndefined()
         expect(compact.system.map((part) => part.text)).toContain("Review the project carefully.")
         expect(requestAgents[2]).toBe(agentID)

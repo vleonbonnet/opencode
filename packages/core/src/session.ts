@@ -90,6 +90,8 @@ type CreateBaseInput = {
   model?: Model.Ref
   metadata?: SessionSchema.Metadata
   permissions?: Permission.Ruleset
+  /** Who delegates the new Session's work; ancestors' delegators bind it without being copied. */
+  delegators?: ReadonlyArray<SessionSchema.Delegator>
 }
 type CreateInput = CreateBaseInput &
   ({ location: Location.Ref; parentID?: never } | { parentID: SessionSchema.ID; location?: never })
@@ -190,6 +192,11 @@ export interface Interface {
   readonly setPermissions: (input: {
     sessionID: SessionSchema.ID
     permissions: Permission.Ruleset
+  }) => Effect.Effect<void, NotFoundError>
+  /** Records a delegator unless the Session already lists it. */
+  readonly delegate: (input: {
+    sessionID: SessionSchema.ID
+    delegator: SessionSchema.Delegator
   }) => Effect.Effect<void, NotFoundError>
   readonly move: SessionMove.Interface["move"]
   readonly prompt: (
@@ -295,6 +302,7 @@ const layer = Layer.effect(
               // location, so host policies that read them treat the family uniformly.
               metadata: input.metadata ?? parent?.metadata,
               permissions: input.permissions ?? parent?.permissions,
+              delegators: input.delegators?.length ? input.delegators : undefined,
               model: input.model
                 ? {
                     id: Model.ID.make(input.model.id),
@@ -467,6 +475,7 @@ const layer = Layer.effect(
       rename: (input) => sessions.forSession(input.sessionID).rename(input),
       setMetadata: (input) => sessions.forSession(input.sessionID).setMetadata(input),
       setPermissions: (input) => sessions.forSession(input.sessionID).setPermissions(input),
+      delegate: (input) => sessions.forSession(input.sessionID).delegate(input),
       move: moves.move,
       compact: (input) => sessions.forSession(input.sessionID).compact(input),
       wait: (sessionID) => sessions.forSession(sessionID).wait(),

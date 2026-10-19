@@ -83,6 +83,7 @@ const layer = Layer.effect(
     const location = yield* Location.Service
     const mcpInstructions = yield* McpInstructions.Service
     const mcpTools = yield* McpTool.Service
+    const permission = yield* Permission.Service
     const models = yield* SessionRunnerModel.Service
     const request = yield* SessionModelRequest.Service
     const referenceInstructions = yield* ReferenceInstructions.Service
@@ -129,14 +130,20 @@ const layer = Layer.effect(
       if (!agent.info) return yield* new AgentNotFoundError({ sessionID: session.id, agent: session.agent ?? agent.id })
       // Session permissions narrow discovery the same way they narrow the tool snapshot.
       const permissions = Permission.merge(agent.info.permissions, session.permissions ?? [])
+      // Agents the user switches between expose the same tools and guidance, so a switch keeps the prompt cache.
+      const exposure = Agent.exposure(agent.info, yield* agents.list(), session).map((rules) =>
+        Permission.merge(rules, session.permissions ?? []),
+      )
+      // What a delegator may not do is neither listed nor allowed for any agent of the Session.
+      const ceilings = yield* permission.ceilings(session)
       const loaded = yield* Effect.all(
         {
-          tools: registry.snapshot(permissions),
+          tools: registry.snapshot(permissions, exposure, ceilings, permission.assert),
           builtins: builtins.load(),
           discovery: discovery.load(),
-          skills: skillInstructions.load(permissions),
+          skills: skillInstructions.load(exposure, ceilings),
           references: referenceInstructions.load(),
-          mcp: mcpInstructions.load(permissions),
+          mcp: mcpInstructions.load(exposure, ceilings),
           entries: entries.load(sessionID),
         },
         { concurrency: "unbounded" },
@@ -198,6 +205,7 @@ export const node = makeLocationNode({
     Location.node,
     McpInstructions.node,
     McpTool.node,
+    Permission.node,
     ReferenceInstructions.node,
     SessionRunnerModel.node,
     SessionModelRequest.node,

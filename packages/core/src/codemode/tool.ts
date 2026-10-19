@@ -1,6 +1,6 @@
 export * as CodeModeTool from "./tool.js"
 
-import { CodeMode, Namespace, Tool, toolError } from "@opencode/codemode"
+import { CodeMode, type Extension, Namespace, Tool, toolError } from "@opencode/codemode"
 import type {
   Content,
   Context,
@@ -11,6 +11,7 @@ import type {
   Result,
 } from "@opencode/schema/tool"
 import { Effect, Ref, Schema, Semaphore } from "effect"
+import type { Permission } from "../permission.js"
 import { definition, normalizedName } from "../tool/runtime.js"
 import { CodeModeCatalog } from "./catalog.js"
 import { CodeModeWeb } from "./web.js"
@@ -68,9 +69,14 @@ const description = [
   "Await every call whose completion matters; pending calls are interrupted when execution ends. Run independent calls concurrently with `Promise.allSettled`.",
 ].join("\n")
 
+/**
+ * The execute tool over `inventory`. `executeTool` runs the program's tool calls; `assert` asks for the permissions the
+ * runtime's own globals need, such as webfetch for `fetch`, for the acting agent and Session of the execute call.
+ */
 export const create = (
   inventory: Inventory,
   executeTool: (name: string, tool: Info, input: unknown, context: Context) => Effect.Effect<Result, Error>,
+  assert: (input: Permission.AssertInput) => Effect.Effect<void, unknown>,
 ) => {
   return {
     name: "execute",
@@ -87,6 +93,13 @@ export const create = (
           lock.withPermit(
             Ref.updateAndGet(calls, update).pipe(Effect.tap((toolCalls) => context.progress({ toolCalls }))),
           )
+        // Aborted once the execution settles or is interrupted, ending a pending permission request and the fetch.
+        const ended = new AbortController()
+        const run = Effect.runPromiseWith(yield* Effect.context<never>())
+        const web = CodeModeWeb.extension(
+          (request) => run(assert(CodeModeWeb.permission(request, context)), { signal: ended.signal }),
+          ended.signal,
+        )
         const result = yield* runtime(
           inventory,
           (name, tool, input) =>
@@ -105,7 +118,10 @@ export const create = (
               return text === "" ? null : text
             }),
           progressHooks(record),
-        ).execute(code)
+          [web],
+        )
+          .execute(code)
+          .pipe(Effect.ensuring(Effect.sync(() => ended.abort())))
         const toolCalls = yield* Ref.get(calls)
         const collected = (yield* Ref.get(files))
           .toSorted((left, right) => left.index - right.index)
@@ -222,6 +238,7 @@ function runtime(
   inventory: Inventory,
   executeTool: (name: string, tool: Info, input: unknown) => Effect.Effect<unknown, unknown>,
   hooks?: CodeMode.Hooks,
+  extensions: ReadonlyArray<Extension.Extension> = [],
 ) {
   // A path may carry namespace metadata, a callable tool, child tools, or all three.
   const root: ToolNode = { children: new Map() }
@@ -236,7 +253,7 @@ function runtime(
     })
   }
   const tools = renderTools(root)
-  return CodeMode.make<typeof tools>({ tools, extensions: [CodeModeWeb.extension], hooks })
+  return CodeMode.make<typeof tools>({ tools, extensions, hooks })
 }
 
 function getNode<T>(root: Node<T>, path: string) {

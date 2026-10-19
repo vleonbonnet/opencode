@@ -126,8 +126,16 @@ export const make = Effect.gen(function* () {
               restore(executeTool(event)).pipe(
                 Effect.flatMap(toolOutput.truncate),
                 Effect.flatMap((outcome) => publisher.toolExecution(event.id, event.name, outcome)),
+                // Error text reaches the model like output, and an MCP server can return an error of any size. A tool
+                // that reports a truncation state bounded its own text, as with output.
                 Effect.catchTag("Tool.Error", (error) =>
-                  publisher.failTool(event.id, toSessionError(error), error.metadata).pipe(Effect.asVoid),
+                  (error.metadata?.truncated === undefined
+                    ? toolOutput.truncateError(toSessionError(error))
+                    : Effect.succeed(toSessionError(error))
+                  ).pipe(
+                    Effect.flatMap((bounded) => publisher.failTool(event.id, bounded, error.metadata)),
+                    Effect.asVoid,
+                  ),
                 ),
               ),
             ).pipe(Effect.forkScoped),
@@ -221,7 +229,8 @@ export const make = Effect.gen(function* () {
             : recorded.providerFailed
               ? TOOLS_INTERRUPTED
               : undefined
-        if (toolFailure) yield* publisher.failUnsettledTools(toolFailure)
+        // A defect's message reaches the model as well, so it is bounded like a tool error.
+        if (toolFailure) yield* publisher.failUnsettledTools(yield* toolOutput.truncateError(toolFailure))
         if (interrupted) yield* publisher.failAssistant(STEP_INTERRUPTED)
 
         // Parsers may leave unfinished calls without an execution event.

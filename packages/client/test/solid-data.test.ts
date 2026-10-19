@@ -291,6 +291,51 @@ test("revalidates after an event overtakes an active session read", async () => 
   }
 })
 
+test("records each delegator of a remembered session once", async () => {
+  const listeners = new Set<Parameters<CreateDataInput["event"]["listen"]>[0]>()
+  const api = OpenCode.make({
+    baseUrl: "http://opencode.local",
+    fetch: async (input, init) => {
+      throw new Error(`Unexpected request: ${(input instanceof Request ? input : new Request(input, init)).url}`)
+    },
+  })
+  const setup = createRoot((dispose) => ({
+    data: createData({
+      api: () => api,
+      directory: "/project",
+      event: {
+        on: () => () => {},
+        listen(handler) {
+          listeners.add(handler)
+          return () => listeners.delete(handler)
+        },
+      },
+    }),
+    dispose,
+  }))
+  const delegated = (seq: number, agent: string): OpenCodeEvent => ({
+    id: `evt_delegated_${seq}`,
+    created: seq,
+    type: "session.delegated",
+    durable: { aggregateID: "ses_refresh", seq, version: 1 },
+    data: { sessionID: "ses_refresh", delegator: { sessionID: "ses_parent", agent } },
+  })
+
+  try {
+    setup.data.session.remember(session(1))
+    for (const event of [delegated(1, "plan"), delegated(2, "plan"), delegated(3, "build")])
+      listeners.forEach((listener) => listener({ name: event.type, details: event }))
+
+    await wait(() => setup.data.session.get("ses_refresh")?.delegators?.length === 2)
+    expect(setup.data.session.get("ses_refresh")?.delegators).toEqual([
+      { sessionID: "ses_parent", agent: "plan" },
+      { sessionID: "ses_parent", agent: "build" },
+    ])
+  } finally {
+    setup.dispose()
+  }
+})
+
 test("preserves a live session rename across concurrent session and family reads", async () => {
   const family = Promise.withResolvers<void>()
   const renamed = Promise.withResolvers<void>()

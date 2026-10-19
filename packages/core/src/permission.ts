@@ -11,6 +11,7 @@ import { SessionSchema } from "./session/schema.js"
 import { SessionStore } from "./session/store.js"
 import { Wildcard } from "./util/wildcard.js"
 import { PermissionSaved } from "./permission/saved.js"
+import { PermissionDelegation } from "./permission/delegation.js"
 import { PluginHooks } from "./plugin/hooks.js"
 
 const PermissionEffect = Permission.Effect
@@ -100,11 +101,40 @@ export function merge(...rulesets: Permission.Ruleset[]): Permission.Ruleset {
   return rulesets.flat()
 }
 
+export type Ceiling = PermissionDelegation.Ceiling
+
+const strictness = { allow: 0, ask: 1, deny: 2 } as const satisfies Record<Permission.Effect, number>
+
+/**
+ * The decision under `rules` (an agent's merged with its Session's) and the Session's delegation ceilings, with `extra`
+ * following each: deny when any of them denies, else ask when any asks.
+ */
+export function decide(
+  action: string,
+  resource: string,
+  rules: Permission.Ruleset,
+  ceilings: ReadonlyArray<Ceiling>,
+  ...extra: Permission.Ruleset[]
+): Permission.Effect {
+  return ceilings.reduce<Permission.Effect>((effect, ceiling) => {
+    const bound = evaluate(action, resource, ceiling.rules, ...extra).effect
+    return strictness[bound] > strictness[effect] ? bound : effect
+  }, evaluate(action, resource, rules, ...extra).effect)
+}
+
+const delegatedDenial = (action: string, ceiling: Ceiling) =>
+  `Permission denied: ${action}. The ${ceiling.delegator.agent} agent that delegated this task does not permit it.`
+
 export interface Interface {
   readonly close: Effect.Effect<void>
   readonly ask: (input: AssertInput) => Effect.Effect<AskResult, SessionErrors.NotFoundError>
   readonly assert: (input: AssertInput) => Effect.Effect<void, Error | SessionErrors.NotFoundError>
   readonly reply: (input: ReplyInput) => Effect.Effect<void, NotFoundError>
+  /**
+   * Ceilings the Session's delegators, and its ancestors', impose on every agent acting in it, from the delegating
+   * agents' and Sessions' current rules.
+   */
+  readonly ceilings: (session: SessionSchema.Info) => Effect.Effect<ReadonlyArray<Ceiling>>
   readonly get: (id: ID) => Effect.Effect<Request | undefined>
   readonly forSession: (sessionID: SessionSchema.ID) => Effect.Effect<ReadonlyArray<Request>>
   readonly list: () => Effect.Effect<ReadonlyArray<Request>>
@@ -155,11 +185,35 @@ const layer = Layer.effect(
       )
     })
 
+    const ceilings = Effect.fn("Permission.ceilings")(function* (session: SessionSchema.Info) {
+      // Descendants answer to every delegator recorded up their ancestry, including ones added after they started.
+      const lineage = new Map<SessionSchema.ID, SessionSchema.Info>()
+      const delegators: SessionSchema.Delegator[] = []
+      let current: SessionSchema.Info | undefined = session
+      while (current !== undefined && !lineage.has(current.id)) {
+        lineage.set(current.id, current)
+        delegators.push(...(current.delegators ?? []))
+        current = current.parentID === undefined ? undefined : yield* sessions.get(current.parentID)
+      }
+      return yield* Effect.forEach(PermissionDelegation.distinct(delegators), (delegator) =>
+        Effect.gen(function* () {
+          return PermissionDelegation.ceiling({
+            delegator,
+            session: lineage.get(delegator.sessionID) ?? (yield* sessions.get(delegator.sessionID)),
+            agent: delegator.agent === PermissionDelegation.plan ? yield* agents.get(delegator.agent) : undefined,
+          })
+        }),
+      )
+    })
+
     const configured = Effect.fnUntraced(function* (sessionID: SessionSchema.ID, agentID?: Agent.ID) {
       const session = yield* sessions.get(sessionID)
       if (!session) return yield* new SessionErrors.NotFoundError({ sessionID })
       const agent = yield* agents.resolve(agentID ?? session.agent)
-      return merge(agent?.permissions ?? missingAgentPermissions, session.permissions ?? [])
+      return {
+        rules: merge(agent?.permissions ?? missingAgentPermissions, session.permissions ?? []),
+        ceilings: yield* ceilings(session),
+      }
     })
 
     function denied(input: Pick<Request, "action" | "resources">, rules: Permission.Ruleset) {
@@ -171,10 +225,15 @@ const layer = Layer.effect(
     }
 
     const evaluateInput = Effect.fnUntraced(function* (input: AssertInput) {
-      const rules = yield* configured(input.sessionID, input.agent)
+      const { rules, ceilings } = yield* configured(input.sessionID, input.agent)
       if (denied(input, rules)) return { effect: "deny" as const, rules }
-      const all = [...rules, ...(yield* savedRules())]
-      const effects = input.resources.map((resource) => evaluate(input.action, resource, all).effect)
+      const ceiling = ceilings.find((item) => denied(input, item.rules))
+      if (ceiling)
+        return { effect: "deny" as const, rules: ceiling.rules, message: delegatedDenial(input.action, ceiling) }
+      const saved = yield* savedRules()
+      const all = [...rules, ...saved]
+      // Saved approvals answer a delegator's ask as they answer the delegator's own; no deny remains to override.
+      const effects = input.resources.map((resource) => decide(input.action, resource, rules, ceilings, saved))
       const effect: Permission.Effect = effects.includes("ask") ? "ask" : "allow"
       const event = yield* hooks.trigger("permission", "evaluate", {
         sessionID: input.sessionID,
@@ -336,7 +395,7 @@ const layer = Layer.effect(
       return Array.from(pending.values(), (item) => item.request).filter((request) => request.sessionID === sessionID)
     })
 
-    return Service.of({ ask, assert, reply, get, forSession, list, close })
+    return Service.of({ ask, assert, reply, ceilings, get, forSession, list, close })
   }),
 )
 

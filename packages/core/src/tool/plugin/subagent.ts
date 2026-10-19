@@ -166,9 +166,19 @@ export const Plugin = {
                   message: `Session ${existing.id} is not a child of the current session`,
                 })
               const override = input.model === undefined ? undefined : yield* resolveModel(input.model)
+              // The child, and every Session below it, answers to each agent that delegates to it, so plan mode is not
+              // bypassed through a subagent whose own rules allow more. A continuation records it before the child runs.
+              const delegator = { sessionID: context.sessionID, agent: context.agent }
               // Continuing with a different agent switches the child, mirroring create semantics
               // where an explicit model wins over the agent's configured model, which wins over the inherited one.
               if (existing !== undefined) {
+                yield* sessions
+                  .delegate({ sessionID: existing.id, delegator })
+                  .pipe(
+                    Effect.mapError(
+                      (error) => new ToolFailure({ message: `Failed to delegate to subagent: ${existing.id}`, error }),
+                    ),
+                  )
                 const switched = existing.agent !== agent.id
                 const model = override ?? (switched ? agent.model : undefined)
                 yield* Effect.all([
@@ -190,6 +200,7 @@ export const Plugin = {
                     title: input.description,
                     agent: Agent.ID.make(input.agent),
                     model,
+                    delegators: [delegator],
                   })
                   .pipe(
                     Effect.mapError(
@@ -285,12 +296,18 @@ export const Plugin = {
         if (!tool) return
         const selected = yield* agents.resolve(event.agent)
         if (!selected) return
-        const available = (yield* agents.list())
+        const session = yield* sessions.get(event.sessionID).pipe(Effect.orElseSucceed(() => undefined))
+        if (!session) return
+        const all = yield* agents.list()
+        // Listed for every agent sharing the exposure; launching still answers to the acting agent's rules.
+        const exposure = Agent.exposure(selected, all, session)
+        const ceilings = yield* permission.ceilings(session)
+        const available = all
           .filter(
             (agent) =>
               agent.mode !== "primary" &&
               !agent.hidden &&
-              Permission.evaluate(name, agent.id, selected.permissions).effect !== "deny",
+              exposure.some((permissions) => Permission.decide(name, agent.id, permissions, ceilings) !== "deny"),
           )
           .toSorted((a, b) => a.id.localeCompare(b.id))
         if (available.length === 0) return

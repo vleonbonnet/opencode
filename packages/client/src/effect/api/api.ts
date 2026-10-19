@@ -450,6 +450,7 @@ export type SessionLogOutput =
             readonly model?: Model.Ref | undefined
             readonly metadata?: Session.Metadata | undefined
             readonly permissions?: Permission.Ruleset | undefined
+            readonly delegators?: ReadonlyArray<Session.Delegator> | undefined
             readonly version: string
           }
         }
@@ -531,6 +532,17 @@ export type SessionLogOutput =
             | { readonly directory: AbsolutePath; readonly workspaceID?: Workspace.ID | undefined }
             | undefined
           readonly data: { readonly sessionID: Session.ID; readonly permissions: Permission.Ruleset }
+        }
+      | {
+          readonly id: Event.ID
+          readonly created: number
+          readonly metadata?: { readonly [x: string]: unknown } | undefined
+          readonly type: "session.delegated"
+          readonly durable: { readonly aggregateID: string; readonly seq: Event.Seq; readonly version: Event.Version }
+          readonly location?:
+            | { readonly directory: AbsolutePath; readonly workspaceID?: Workspace.ID | undefined }
+            | undefined
+          readonly data: { readonly sessionID: Session.ID; readonly delegator: Session.Delegator }
         }
       | {
           readonly id: Event.ID

@@ -60,7 +60,7 @@ describe("Skill", () => {
       expect(yield* skills.get(Skill.ID.make("deploy"))).toBeUndefined()
       expect(yield* skills.get(Skill.ID.make("team:review"))).toEqual(info("team:review", "Review"))
       const instructions = yield* SkillInstructions.Service
-      const guidance = yield* instructions.load([]).pipe(Effect.flatMap(readInitial))
+      const guidance = yield* instructions.load([[]]).pipe(Effect.flatMap(readInitial))
       expect(guidance.text).toContain("<id>team:review</id>")
       expect(guidance.text).not.toContain("deploy")
 

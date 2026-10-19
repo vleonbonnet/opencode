@@ -10,6 +10,7 @@ import type { Context } from "@opencode/plugin/effect/plugin"
 import { ToolFailure } from "@opencode/ai"
 import { FileDiff } from "@opencode/schema/file-diff"
 import { Bom } from "@opencode/util/bom"
+import { LineEnding } from "@opencode/util/line-ending"
 import { Effect, Schema } from "effect"
 import { Environment } from "../../environment/index.js"
 import { FileMutation } from "../../file-mutation.js"
@@ -101,14 +102,6 @@ const findLineOccurrences = (content: string, search: string) => {
   }, [])
 }
 
-/** The dominant line ending in text, or fallback when there is none. */
-const lineEnding = (text: string, fallback: string) => {
-  const crlfCount = text.split(crlf).length - 1
-  const lfCount = text.split("\n").length - 1 - crlfCount
-  if (crlfCount === lfCount) return fallback
-  return crlfCount > lfCount ? crlf : "\n"
-}
-
 /**
  * Joins the replacement's lines with line endings taken from the matched source region. A replacement line that
  * keeps a region line (longest common subsequence, compared like the trailing-whitespace tier) reuses that line's
@@ -120,45 +113,8 @@ const withRegionEndings = (region: string, replacement: string, fallback: string
   const endings = [...region.matchAll(/\r?\n/g)].map((match) => match[0])
   const after = replacement.split("\n")
   const key = (line: string) => normalizeForMatch(line.trimEnd())
-  const source = alignLines(before.map(key), after.map(key))
+  const source = LineEnding.align(before.map(key), after.map(key))
   return after.map((line, index) => (index === after.length - 1 ? line : line + (endings[source[index]!] ?? fallback))).join("")
-}
-
-/**
- * For each line of `after`, the index of the `before` line it keeps (longest common subsequence) or, between kept
- * lines, the line it takes the place of; undefined for lines with no counterpart.
- */
-const alignLines = (before: string[], after: string[]) => {
-  const width = after.length + 1
-  const table = new Uint32Array((before.length + 1) * width)
-  for (let i = before.length - 1; i >= 0; i--)
-    for (let j = after.length - 1; j >= 0; j--)
-      table[i * width + j] =
-        before[i] === after[j]
-          ? table[(i + 1) * width + j + 1] + 1
-          : Math.max(table[(i + 1) * width + j], table[i * width + j + 1])
-  const result: (number | undefined)[] = []
-  const gap = { before: [] as number[], after: [] as number[] }
-  const flush = () => {
-    gap.after.forEach((j, k) => (result[j] = gap.before[k]))
-    gap.before = []
-    gap.after = []
-  }
-  let i = 0
-  let j = 0
-  while (i < before.length && j < after.length) {
-    if (before[i] === after[j]) {
-      flush()
-      result[j++] = i++
-      continue
-    }
-    if (table[(i + 1) * width + j] >= table[i * width + j + 1]) gap.before.push(i++)
-    else gap.after.push(j++)
-  }
-  while (i < before.length) gap.before.push(i++)
-  while (j < after.length) gap.after.push(j++)
-  flush()
-  return result
 }
 
 /**
@@ -168,7 +124,7 @@ const alignLines = (before: string[], after: string[]) => {
 const matchView = (source: string, oldString: string, newString: string) => {
   const view = source.replaceAll(crlf, "\n")
   const removed = [...source.matchAll(/\r\n/g)].map((match, index) => match.index - index)
-  const fileEnding = lineEnding(source, "\n")
+  const fileEnding = LineEnding.dominant(source, "\n")
   const search = oldString.replaceAll(crlf, "\n")
   const replacement = newString.replaceAll(crlf, "\n")
   const exact = findOccurrences(view, search)
@@ -182,7 +138,7 @@ const matchView = (source: string, oldString: string, newString: string) => {
     })),
     replace: (match: Match) => {
       const region = source.slice(match.start, match.end)
-      return withRegionEndings(region, replacement, lineEnding(region, fileEnding))
+      return withRegionEndings(region, replacement, LineEnding.dominant(region, fileEnding))
     },
   }
 }
