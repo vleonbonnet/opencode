@@ -10,10 +10,15 @@ import {
   LLMRequest,
   type Media,
   Message,
+  mergeHttpOptions,
+  mergeJsonRecords,
+  mergeProviderOptions,
   SystemPart,
 } from "@opencode/ai"
 import { AnthropicMessages } from "@opencode/ai/protocols/anthropic-messages"
+import { BedrockConverse } from "@opencode/ai/protocols/bedrock-converse"
 import { BedrockCache } from "@opencode/ai/protocols/utils/bedrock-cache"
+import { claudeVersion } from "@opencode/ai/protocols/utils/claude-model"
 import type { StreamOptions } from "@opencode/ai/route"
 import type {
   SessionCompaction,
@@ -252,6 +257,59 @@ export const cachePolicy = (
     ? ONE_HOUR_CACHE
     : undefined
 
+const SUMMARIZED = { display: "summarized" } as const
+
+const record = (value: unknown) =>
+  typeof value === "object" && value !== null && !Array.isArray(value) ? (value as Record<string, unknown>) : undefined
+
+// Claude 5 and later think adaptively when a request leaves thinking out.
+const thinksByDefault = (model: LanguageModel) => (claudeVersion(model.id)?.major ?? 0) >= 5
+
+const withOptions = (request: LLMRequest, thinking: Record<string, unknown>) =>
+  LLMRequest.update(request, { providerOptions: mergeProviderOptions(request.providerOptions, { thinking }) })
+
+const withBody = (request: LLMRequest, body: Record<string, unknown>) =>
+  LLMRequest.update(request, { http: mergeHttpOptions(request.http, new HttpOptions({ body })) })
+
+/**
+ * Adaptive thinking returns every thinking block empty unless the request asks to show it, since Claude 4.7 and later
+ * default `display` to "omitted". A Claude request on Anthropic Messages, or on Bedrock Converse, which takes the same
+ * thinking object in `additionalModelRequestFields`, that thinks adaptively without choosing a display asks for the
+ * summarized text, as v1 did. That includes a Claude 5 request that leaves thinking out, as it thinks adaptively. The
+ * summary is display only, and every request kind gets the same thinking, so none changes the prefix the others cache.
+ */
+export const summarizedThinking = (request: LLMRequest): LLMRequest => {
+  const model = request.model
+  if (!/claude/i.test(model.id)) return request
+  const options = mergeProviderOptions(
+    model.route.defaults.providerOptions,
+    model.defaults?.providerOptions,
+    request.providerOptions,
+  )
+  const body = mergeHttpOptions(model.route.defaults.http, model.defaults?.http, request.http)?.body
+  if (model.route.protocol === AnthropicMessages.protocol.id) {
+    // The body overlays the thinking the options lower to, field by field.
+    const overlaid = record(body?.thinking)
+    const thinking = mergeJsonRecords(record(options?.thinking), overlaid)
+    if (thinking === undefined)
+      return thinksByDefault(model) ? withOptions(request, { type: "adaptive", ...SUMMARIZED }) : request
+    if (thinking.type !== "adaptive" || thinking.display !== undefined) return request
+    return overlaid?.type === undefined ? withOptions(request, SUMMARIZED) : withBody(request, { thinking: SUMMARIZED })
+  }
+  if (model.route.protocol === BedrockConverse.protocol.id) {
+    // Converse options spell only a manual budget; adaptive thinking reaches it through the body.
+    const overlaid = record(record(body?.additionalModelRequestFields)?.thinking)
+    const type = overlaid?.type ?? (options?.thinking === undefined ? undefined : "enabled")
+    if (type === undefined)
+      return thinksByDefault(model)
+        ? withBody(request, { additionalModelRequestFields: { thinking: { type: "adaptive", ...SUMMARIZED } } })
+        : request
+    if (type !== "adaptive" || overlaid?.display !== undefined) return request
+    return withBody(request, { additionalModelRequestFields: { thinking: SUMMARIZED } })
+  }
+  return request
+}
+
 type Definitions = PluginHooks.Domains["session"]["context"]["tools"]
 
 /** Builds the model request for each session flow. Each entry runs its own plugin hook. */
@@ -349,13 +407,15 @@ export const layer = Layer.effect(
         modelHook.baseURL !== undefined && modelHook.baseURL !== baseURL
           ? base.model.route.with({ endpoint: { baseURL: modelHook.baseURL } })
           : base.model.route
-      const request = LLMRequest.update(base, {
-        model: route === base.model.route ? base.model : LanguageModel.update(base.model, { route }),
-        http: new HttpOptions({
-          ...base.http,
-          headers: Object.keys(modelHook.headers).length === 0 ? undefined : modelHook.headers,
+      const request = summarizedThinking(
+        LLMRequest.update(base, {
+          model: route === base.model.route ? base.model : LanguageModel.update(base.model, { route }),
+          http: new HttpOptions({
+            ...base.http,
+            headers: Object.keys(modelHook.headers).length === 0 ? undefined : modelHook.headers,
+          }),
         }),
-      })
+      )
       // History selects native windows against the catalog route before hooks run. A newly installed
       // routing hook must not send an existing opaque window to another deployment; `prepare` has no
       // error channel, so like hook failures this surfaces as a defect.
