@@ -69,6 +69,28 @@ describe("Bedrock Converse thinking block binding", () => {
     }),
   )
 
+  it.effect("follows the request-level prefix mismatch behavior", () =>
+    Effect.gen(function* () {
+      const fieldsWith = (thinkingPrefixMismatch: "error" | "drop_block") =>
+        compileRequest(
+          LLM.request({
+            model: bedrock("global.anthropic.claude-fable-5-1"),
+            prompt: "Say hello.",
+            cache: "none",
+            thinkingPrefixMismatch,
+          }),
+        ).pipe(Effect.map((prepared) => prepared.body.additionalModelRequestFields))
+      expect(yield* fieldsWith("error")).toEqual({
+        thinking: { type: "adaptive", block_binding: { prefix_mismatch_behavior: "error" } },
+        anthropic_beta: beta,
+      })
+      expect(yield* fieldsWith("drop_block")).toEqual({
+        thinking: { type: "adaptive", block_binding: binding },
+        anthropic_beta: beta,
+      })
+    }),
+  )
+
   it.effect("does not bind disabled thinking", () =>
     Effect.gen(function* () {
       expect(

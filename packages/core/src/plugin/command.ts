@@ -36,6 +36,7 @@ export const Plugin = define({
               sessionID: input.sessionID,
               text: append(PROMPT_INITIALIZE.replace("${path}", location.project.directory), input.prompt.text),
               delivery: input.delivery,
+              ...(input.metadata === undefined ? {} : { metadata: input.metadata }),
             })
             .pipe(Effect.asVoid),
       })
@@ -49,6 +50,7 @@ export const Plugin = define({
               sessionID: input.sessionID,
               text: append(PROMPT_REVIEW.replace("${path}", location.project.directory), input.prompt.text),
               delivery: input.delivery,
+              ...(input.metadata === undefined ? {} : { metadata: input.metadata }),
             })
             .pipe(Effect.asVoid),
       })
@@ -75,6 +77,7 @@ export const Plugin = define({
                   .join("\n")
                   .trim(),
                 delivery: input.delivery,
+                ...(input.metadata === undefined ? {} : { metadata: input.metadata }),
               })
             }).pipe(Effect.asVoid),
         })

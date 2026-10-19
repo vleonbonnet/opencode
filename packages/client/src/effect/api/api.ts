@@ -15,6 +15,7 @@ import type { SessionMessage } from "@opencode/schema/session-message"
 import type { SessionInbox } from "@opencode/schema/session-inbox"
 import type { PromptInput } from "@opencode/schema/prompt-input"
 import type { AgentAttachment } from "@opencode/schema/prompt"
+import type { SessionCache } from "@opencode/schema/session-cache"
 import type { Skill } from "@opencode/schema/skill"
 import type { FileDiff } from "@opencode/schema/file-diff"
 import type { InstructionEntry } from "@opencode/schema/instruction-entry"
@@ -276,7 +277,7 @@ export type SessionPromptInput = {
   readonly files?: ReadonlyArray<PromptInput.FileAttachment> | undefined
   readonly agents?: ReadonlyArray<AgentAttachment> | undefined
   readonly skills?: ReadonlyArray<PromptInput.SkillAttachment> | undefined
-  readonly metadata?: { readonly [x: string]: unknown } | undefined
+  readonly metadata?: SessionCache.PromptMetadata | undefined
   readonly delivery?: SessionInbox.Delivery | undefined
   readonly resume?: boolean | undefined
 }
@@ -290,10 +291,30 @@ export type SessionCommandInput = {
   readonly files?: ReadonlyArray<PromptInput.FileAttachment> | undefined
   readonly agents?: ReadonlyArray<AgentAttachment> | undefined
   readonly skills?: ReadonlyArray<PromptInput.SkillAttachment> | undefined
+  readonly metadata?: SessionCache.PromptMetadata | undefined
   readonly delivery?: SessionInbox.Delivery | undefined
 }
 export type SessionCommandOutput = void
 export type SessionCommandOperation<E = never> = (input: SessionCommandInput) => Effect.Effect<SessionCommandOutput, E>
+
+export type SessionPreflightInput = {
+  readonly sessionID: Session.ID
+  readonly text?: string | undefined
+  readonly files?: ReadonlyArray<PromptInput.FileAttachment> | undefined
+  readonly command?: { readonly name: string; readonly arguments?: string | undefined } | undefined
+  readonly agent?: Agent.ID | undefined
+  readonly model?: Model.Ref | undefined
+}
+export type SessionPreflightOutput = SessionCache.PreflightReport
+export type SessionPreflightOperation<E = never> = (
+  input: SessionPreflightInput,
+) => Effect.Effect<SessionPreflightOutput, E>
+
+export type SessionThinkingInput = { readonly sessionID: Session.ID }
+export type SessionThinkingOutput = { readonly dropped: ReadonlyArray<SessionCache.DroppedThinking> }
+export type SessionThinkingOperation<E = never> = (
+  input: SessionThinkingInput,
+) => Effect.Effect<SessionThinkingOutput, E>
 
 export type SessionSkillInput = {
   readonly sessionID: Session.ID
@@ -1327,6 +1348,8 @@ export interface SessionApi<E = never> {
   readonly move: SessionMoveOperation<E>
   readonly prompt: SessionPromptOperation<E>
   readonly command: SessionCommandOperation<E>
+  readonly preflight: SessionPreflightOperation<E>
+  readonly thinking: SessionThinkingOperation<E>
   readonly skill: SessionSkillOperation<E>
   readonly synthetic: SessionSyntheticOperation<E>
   readonly shell: SessionShellOperation<E>

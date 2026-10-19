@@ -51,6 +51,10 @@ import type {
   SessionPromptOutput,
   SessionCommandInput,
   SessionCommandOutput,
+  SessionPreflightInput,
+  SessionPreflightOutput,
+  SessionThinkingInput,
+  SessionThinkingOutput,
   SessionSkillInput,
   SessionSkillOutput,
   SessionSyntheticInput,
@@ -531,9 +535,35 @@ const EndpointSessionCommand = (raw: RawClient["server.session"]) => (input: Ses
         files: input["files"],
         agents: input["agents"],
         skills: input["skills"],
+        metadata: input["metadata"],
         delivery: input["delivery"],
       },
     }).pipe(Effect.mapError(mapClientError)),
+  )
+
+const EndpointSessionPreflight = (raw: RawClient["server.session"]) => (input: SessionPreflightInput) =>
+  preserveEffect<SessionPreflightOutput>()(
+    raw["session.preflight"]({
+      params: { sessionID: input["sessionID"] },
+      payload: {
+        text: input["text"],
+        files: input["files"],
+        command: input["command"],
+        agent: input["agent"],
+        model: input["model"],
+      },
+    }).pipe(
+      Effect.mapError(mapClientError),
+      Effect.map((value) => value.data),
+    ),
+  )
+
+const EndpointSessionThinking = (raw: RawClient["server.session"]) => (input: SessionThinkingInput) =>
+  preserveEffect<SessionThinkingOutput>()(
+    raw["session.thinking"]({ params: { sessionID: input["sessionID"] } }).pipe(
+      Effect.mapError(mapClientError),
+      Effect.map((value) => value.data),
+    ),
   )
 
 const EndpointSessionSkill = (raw: RawClient["server.session"]) => (input: SessionSkillInput) =>
@@ -790,6 +820,8 @@ const adaptGroupSession = (raw: RawClient["server.session"]) => ({
   move: EndpointSessionMove(raw),
   prompt: EndpointSessionPrompt(raw),
   command: EndpointSessionCommand(raw),
+  preflight: EndpointSessionPreflight(raw),
+  thinking: EndpointSessionThinking(raw),
   skill: EndpointSessionSkill(raw),
   synthetic: EndpointSessionSynthetic(raw),
   shell: EndpointSessionShell(raw),

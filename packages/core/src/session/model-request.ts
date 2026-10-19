@@ -31,7 +31,7 @@ import type {
 import type { Agent } from "@opencode/schema/agent"
 import type { Model } from "@opencode/schema/model"
 import type { Content } from "@opencode/schema/tool"
-import { Cause, Context, Effect, Layer, Result, Stream } from "effect"
+import { Cause, Context, Effect, Layer, Option, Result, Stream } from "effect"
 import { HttpClientRequest, HttpClientResponse } from "effect/http"
 import { makeLocationNode } from "@opencode/util/effect/app-node"
 import { App } from "../app.js"
@@ -40,12 +40,16 @@ import { PluginHooks } from "../plugin/hooks.js"
 import { QuestionTool } from "../tool/plugin/question.js"
 import { Tool } from "../tool.js"
 import { SessionAffinity } from "./affinity.js"
+import type { CacheLedger } from "./cache/ledger.js"
+import { CacheModel } from "./cache/model.js"
+import { SessionCache } from "./cache/service.js"
+import { CacheWire } from "./cache/wire.js"
 import { SessionModelTransport } from "./model-transport.js"
 import { SessionProviderContext } from "./provider-context.js"
 import { SessionRunnerModel } from "./runner/model.js"
 import { SessionSchema } from "./schema.js"
 import { SessionSystemPrompt } from "./system-prompt.js"
-import { toLLMMessages } from "./runner/to-llm-message.js"
+import { toLLMMessages, type DroppedReasoning } from "./runner/to-llm-message.js"
 import type { SessionMessage } from "./message.js"
 
 const IMAGE_BYTES_TRIGGER = 25 * 1024 * 1024 // 25 MiB
@@ -76,6 +80,8 @@ export interface Prepared<Event = SessionRequest> {
   readonly executeTool: (
     input: Parameters<Tool.Snapshot["execute"]>[0],
   ) => Effect.Effect<Tool.NormalizedResult, ExecuteError>
+  /** A dry run's request as it reached the wire, once its stream has run. */
+  readonly captured?: () => CacheWire.Captured | undefined
 }
 
 export interface Input {
@@ -90,6 +96,14 @@ export interface Input {
   readonly webSocket?: "session"
   /** Prompt size, measured by the provider or estimated. The default output limit leaves room for it. */
   readonly inputTokens?: { readonly measured: number; readonly estimated: number }
+  /** Build the request without sending it: hooks are told, and the wire captures it instead of any network I/O. */
+  readonly dryRun?: boolean
+  /** What a provider that binds thinking to the prompt does with replayed thinking whose prompt changed. */
+  readonly thinkingBinding?: "error" | "drop_block"
+  /** Why it does so (who was asked), for the prompt-cache ledger's dropped-thinking markers. */
+  readonly thinkingMode?: CacheLedger.Mode
+  /** Correlates the request with the usage that confirms it in the prompt-cache ledger (the Step's assistant message). */
+  readonly cacheKey?: string
 }
 
 /** The default output limit: the catalog limit, fitted to the room the prompt leaves in the context window. */
@@ -111,6 +125,8 @@ export const baseTranscript = (input: {
   readonly tools: Tool.Snapshot
   readonly initial: string
   readonly messages: ReadonlyArray<SessionMessage.Info>
+  /** Reasoning that later requests leave out or replay as text (the Session's dropped-thinking markers). */
+  readonly dropped?: ReadonlyArray<DroppedReasoning>
 }) => {
   const providerMetadataKey = input.model.model.route.providerMetadataKey ?? input.model.model.provider
   return {
@@ -123,7 +139,7 @@ export const baseTranscript = (input: {
     ]
       .filter((part) => part.length > 0)
       .map(SystemPart.make),
-    messages: toLLMMessages(input.messages, input.model.ref, providerMetadataKey),
+    messages: toLLMMessages(input.messages, input.model.ref, providerMetadataKey, { dropped: input.dropped }),
   }
 }
 
@@ -328,6 +344,7 @@ export const layer = Layer.effect(
     const hooks = yield* PluginHooks.Service
     const transport = yield* SessionModelTransport.Service
     const app = yield* App.Metadata
+    const cache = Option.getOrUndefined(yield* Effect.serviceOption(SessionCache.Service))
     const prepare = Effect.fn("SessionModelRequest.prepare")(function* <
       S extends SessionRequest & { tools?: Definitions },
     >(kind: SessionRequestKind, input: Input, shape: (draft: SessionRequest, tools: Definitions) => Effect.Effect<S>) {
@@ -395,11 +412,18 @@ export const layer = Layer.effect(
         toolChoice: input.toolChoice,
         generation: Object.keys(generation).length === 0 ? undefined : generation,
         providerOptions: Object.keys(providerOptions).length === 0 ? undefined : providerOptions,
+        // Only where opencode can check the binding itself; elsewhere the protocol default stays.
+        ...(input.thinkingBinding !== undefined && CacheModel.checksThinking(model.model)
+          ? { thinkingPrefixMismatch: input.thinkingBinding }
+          : {}),
       })
 
       const baseURL = base.model.route.endpoint.baseURL
+      // Hooks see a dry run, so they can skip work only a sent request needs (minting a token, metering).
+      const dryRun = input.dryRun ? { dryRun: true } : {}
       const modelHook = yield* hooks.trigger("session", "model.request", {
         ...scope,
+        ...dryRun,
         baseURL: typeof baseURL === "string" ? baseURL : undefined,
         headers: { ...base.http?.headers },
       })
@@ -440,6 +464,7 @@ export const layer = Layer.effect(
             Effect.gen(function* () {
               const before = yield* hooks.trigger("session", "http.request", {
                 ...scope,
+                ...dryRun,
                 request: yield* HttpClientRequest.toWeb(req),
               })
               let sent = HttpClientRequest.fromWeb(before.request)
@@ -489,10 +514,35 @@ export const layer = Layer.effect(
             )
           : undefined
 
+      // Installed whether or not plugins hook HTTP, and after their hooks: the prompt-cache ledger accounts for what
+      // reaches the wire, and a dry run is captured there instead of sent.
+      const wire = CacheWire.make({
+        request,
+        credential: model.credential,
+        mode: input.dryRun
+          ? { type: "dryrun" }
+          : {
+              type: "send",
+              sent:
+                cache && input.cacheKey !== undefined && (kind === "primary" || kind === "generate")
+                  ? cache.sent({
+                      sessionID: session.id,
+                      ref: model.ref,
+                      key: input.cacheKey,
+                      snapshot: kind === "primary",
+                      ...(input.thinkingMode !== undefined && CacheModel.checksThinking(model.model)
+                        ? { mode: input.thinkingMode }
+                        : {}),
+                    })
+                  : undefined,
+            },
+      })
+
       return {
         event: shaped,
         request,
-        options: { ...(http ? { http } : {}), ...(webSocket ? { webSocket } : {}) },
+        options: wire.options({ http, webSocket }),
+        ...(input.dryRun ? { captured: wire.captured } : {}),
         retry: (event: Parameters<Prepared["retry"]>[0]) =>
           hooks.trigger("session", "retry", event).pipe(Effect.asVoid),
         // Permission.assert and the question tool throw declines as defects so tools cannot
@@ -518,13 +568,18 @@ export const layer = Layer.effect(
     })
 
     const agentHook =
-      (name: "context" | "compaction" | "generate", agent: Agent.ID) => (draft: SessionRequest, tools: Definitions) =>
-        hooks.trigger("session", name, { ...draft, agent, tools })
+      (name: "context" | "compaction" | "generate", input: Input) => (draft: SessionRequest, tools: Definitions) =>
+        hooks.trigger("session", name, {
+          ...draft,
+          agent: input.agent,
+          tools,
+          ...(input.dryRun ? { dryRun: true } : {}),
+        })
 
     return Service.of({
-      primary: (input) => prepare("primary", input, agentHook("context", input.agent)),
-      compaction: (input) => prepare("compaction", input, agentHook("compaction", input.agent)),
-      generate: (input) => prepare("generate", input, agentHook("generate", input.agent)),
+      primary: (input) => prepare("primary", input, agentHook("context", input)),
+      compaction: (input) => prepare("compaction", input, agentHook("compaction", input)),
+      generate: (input) => prepare("generate", input, agentHook("generate", input)),
       title: (input) => prepare("title", input, (draft) => hooks.trigger("session", "title", draft)),
     })
   }),
@@ -533,5 +588,5 @@ export const layer = Layer.effect(
 export const node = makeLocationNode({
   service: Service,
   layer,
-  deps: [PluginHooks.node, SessionModelTransport.node, App.node],
+  deps: [PluginHooks.node, SessionModelTransport.node, App.node, SessionCache.node],
 })

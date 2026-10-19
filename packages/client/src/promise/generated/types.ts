@@ -114,6 +114,18 @@ export type SessionActive = { type: "running" }
 
 export type SessionInboxDelivery = "steer" | "queue"
 
+export type SessionCachePreflightStatus = "hit" | "partial" | "miss" | "unknown"
+
+export type SessionCacheDivergence = {
+  unit: string
+  index: number
+  previousUnit?: string
+  excerpt?: string
+  previousExcerpt?: string
+}
+
+export type SessionCacheConsentOutcome = { reusableTokens: number; lostTokens: number }
+
 export type SessionInboxSyntheticPayload = { text: string; description?: string; metadata?: { [x: string]: JsonValue } }
 
 export type SessionInboxCompactionPayload = {}
@@ -334,6 +346,8 @@ export type SessionProviderContextProvenance = {
   endpoint: string
 }
 
+export type SessionCacheModelRef = { id: string; providerID: ProviderID }
+
 export type ProviderSettings = {
   timeout?: number | false
   headerTimeout?: number | false
@@ -404,6 +418,21 @@ export type SessionMessageCompactionRunning = {
   reason: "auto" | "manual"
   summary: string
   recent: string
+}
+
+export type SessionCacheDroppedThinking = {
+  messageID: SessionMessageID
+  ordinal: number
+  reason: string
+  asText: boolean
+  time: number
+}
+
+export type SessionCacheDroppedThinkingBlock = {
+  messageID: SessionMessageID
+  ordinal: number
+  reason: string
+  asText: boolean
 }
 
 export type FileSystemEntry = { path: RelativePath; type: "file" | "directory" }
@@ -524,6 +553,13 @@ export type SessionMessageIdle = {
   type: "idle"
   outcome: "succeeded" | "failed" | "interrupted"
   error?: SessionStructuredError
+}
+
+export type SessionCacheStaleThinking = {
+  count: number
+  reason: string
+  unit?: string
+  consent?: SessionCacheConsentOutcome
 }
 
 export type SessionInboxSynthetic = {
@@ -926,6 +962,8 @@ export type ModelVariant = {
 
 export type PermissionRuleset = Array<PermissionRule>
 
+export type SessionThinkingResponse = { data: { dropped: Array<SessionCacheDroppedThinking> } }
+
 export type SessionMessageUser = {
   id: SessionMessageID
   metadata?: { [x: string]: JsonValue }
@@ -966,6 +1004,20 @@ export type SessionMessageToolStateError = {
   error: SessionStructuredError
   content?: [ToolContent, ...Array<ToolContent>]
   metadata?: { [x: string]: JsonValue }
+}
+
+export type SessionCachePreflightReport = {
+  status: SessionCachePreflightStatus
+  format?: string
+  model?: SessionCacheModelRef
+  previous?: { time: number; promptTokens: number; model: SessionCacheModelRef; ageMs: number }
+  reusableTokens: number
+  reusableExact: boolean
+  lostTokens: number
+  reasons: Array<string>
+  divergence?: SessionCacheDivergence
+  staleThinking?: SessionCacheStaleThinking
+  running?: boolean
 }
 
 export type SessionAgentSelected = {
@@ -1532,6 +1584,15 @@ export type SessionReasoningDelta = {
   type: "session.reasoning.delta"
   location?: LocationRef
   data: { sessionID: SessionID; assistantMessageID: SessionMessageID; ordinal: number; delta: string }
+}
+
+export type SessionThinkingDropped = {
+  id: EventID
+  created: number
+  metadata?: { [x: string]: any }
+  type: "session.thinking.dropped"
+  location?: LocationRef
+  data: { sessionID: SessionID; blocks: Array<SessionCacheDroppedThinkingBlock> }
 }
 
 export type SessionToolInputDelta = {
@@ -2375,6 +2436,8 @@ export type SessionMessageAssistantTool = {
   time: { created: number; ran?: number; completed?: number }
 }
 
+export type SessionPreflightResponse = { data: SessionCachePreflightReport }
+
 export type SessionInboxItem =
   | { type: "user"; payload: SessionInboxUserPayload1; delivery: SessionInboxDelivery }
   | { type: "synthetic"; payload: SessionInboxSyntheticPayload1; delivery: SessionInboxDelivery }
@@ -2620,6 +2683,7 @@ export type V2Event =
   | SessionReasoningStarted
   | SessionReasoningDelta
   | SessionReasoningEnded
+  | SessionThinkingDropped
   | SessionToolInputStarted
   | SessionToolInputDelta
   | SessionToolInputEnded
@@ -4343,7 +4407,7 @@ export type SessionPromptInput = {
       readonly id: string
       readonly mention?: { readonly start: number; readonly end: number; readonly text: string }
     }>
-    readonly metadata?: { readonly [x: string]: JsonValue }
+    readonly metadata?: { readonly thinkingLoss?: "ask" | "accept" } & { readonly [x: string]: JsonValue }
     readonly delivery?: ("steer" | "queue") | null
     readonly resume?: boolean | null
   }["id"]
@@ -4364,7 +4428,7 @@ export type SessionPromptInput = {
       readonly id: string
       readonly mention?: { readonly start: number; readonly end: number; readonly text: string }
     }>
-    readonly metadata?: { readonly [x: string]: JsonValue }
+    readonly metadata?: { readonly thinkingLoss?: "ask" | "accept" } & { readonly [x: string]: JsonValue }
     readonly delivery?: ("steer" | "queue") | null
     readonly resume?: boolean | null
   }["text"]
@@ -4385,7 +4449,7 @@ export type SessionPromptInput = {
       readonly id: string
       readonly mention?: { readonly start: number; readonly end: number; readonly text: string }
     }>
-    readonly metadata?: { readonly [x: string]: JsonValue }
+    readonly metadata?: { readonly thinkingLoss?: "ask" | "accept" } & { readonly [x: string]: JsonValue }
     readonly delivery?: ("steer" | "queue") | null
     readonly resume?: boolean | null
   }["files"]
@@ -4406,7 +4470,7 @@ export type SessionPromptInput = {
       readonly id: string
       readonly mention?: { readonly start: number; readonly end: number; readonly text: string }
     }>
-    readonly metadata?: { readonly [x: string]: JsonValue }
+    readonly metadata?: { readonly thinkingLoss?: "ask" | "accept" } & { readonly [x: string]: JsonValue }
     readonly delivery?: ("steer" | "queue") | null
     readonly resume?: boolean | null
   }["agents"]
@@ -4427,7 +4491,7 @@ export type SessionPromptInput = {
       readonly id: string
       readonly mention?: { readonly start: number; readonly end: number; readonly text: string }
     }>
-    readonly metadata?: { readonly [x: string]: JsonValue }
+    readonly metadata?: { readonly thinkingLoss?: "ask" | "accept" } & { readonly [x: string]: JsonValue }
     readonly delivery?: ("steer" | "queue") | null
     readonly resume?: boolean | null
   }["skills"]
@@ -4448,7 +4512,7 @@ export type SessionPromptInput = {
       readonly id: string
       readonly mention?: { readonly start: number; readonly end: number; readonly text: string }
     }>
-    readonly metadata?: { readonly [x: string]: JsonValue }
+    readonly metadata?: { readonly thinkingLoss?: "ask" | "accept" } & { readonly [x: string]: JsonValue }
     readonly delivery?: ("steer" | "queue") | null
     readonly resume?: boolean | null
   }["metadata"]
@@ -4469,7 +4533,7 @@ export type SessionPromptInput = {
       readonly id: string
       readonly mention?: { readonly start: number; readonly end: number; readonly text: string }
     }>
-    readonly metadata?: { readonly [x: string]: JsonValue }
+    readonly metadata?: { readonly thinkingLoss?: "ask" | "accept" } & { readonly [x: string]: JsonValue }
     readonly delivery?: ("steer" | "queue") | null
     readonly resume?: boolean | null
   }["delivery"]
@@ -4490,7 +4554,7 @@ export type SessionPromptInput = {
       readonly id: string
       readonly mention?: { readonly start: number; readonly end: number; readonly text: string }
     }>
-    readonly metadata?: { readonly [x: string]: JsonValue }
+    readonly metadata?: { readonly thinkingLoss?: "ask" | "accept" } & { readonly [x: string]: JsonValue }
     readonly delivery?: ("steer" | "queue") | null
     readonly resume?: boolean | null
   }["resume"]
@@ -4517,6 +4581,7 @@ export type SessionCommandInput = {
       readonly id: string
       readonly mention?: { readonly start: number; readonly end: number; readonly text: string }
     }>
+    readonly metadata?: { readonly thinkingLoss?: "ask" | "accept" } & { readonly [x: string]: JsonValue }
     readonly delivery?: ("steer" | "queue") | null
   }["name"]
   readonly text: {
@@ -4536,6 +4601,7 @@ export type SessionCommandInput = {
       readonly id: string
       readonly mention?: { readonly start: number; readonly end: number; readonly text: string }
     }>
+    readonly metadata?: { readonly thinkingLoss?: "ask" | "accept" } & { readonly [x: string]: JsonValue }
     readonly delivery?: ("steer" | "queue") | null
   }["text"]
   readonly files?: {
@@ -4555,6 +4621,7 @@ export type SessionCommandInput = {
       readonly id: string
       readonly mention?: { readonly start: number; readonly end: number; readonly text: string }
     }>
+    readonly metadata?: { readonly thinkingLoss?: "ask" | "accept" } & { readonly [x: string]: JsonValue }
     readonly delivery?: ("steer" | "queue") | null
   }["files"]
   readonly agents?: {
@@ -4574,6 +4641,7 @@ export type SessionCommandInput = {
       readonly id: string
       readonly mention?: { readonly start: number; readonly end: number; readonly text: string }
     }>
+    readonly metadata?: { readonly thinkingLoss?: "ask" | "accept" } & { readonly [x: string]: JsonValue }
     readonly delivery?: ("steer" | "queue") | null
   }["agents"]
   readonly skills?: {
@@ -4593,8 +4661,29 @@ export type SessionCommandInput = {
       readonly id: string
       readonly mention?: { readonly start: number; readonly end: number; readonly text: string }
     }>
+    readonly metadata?: { readonly thinkingLoss?: "ask" | "accept" } & { readonly [x: string]: JsonValue }
     readonly delivery?: ("steer" | "queue") | null
   }["skills"]
+  readonly metadata?: {
+    readonly name: string
+    readonly text: string
+    readonly files?: ReadonlyArray<{
+      readonly uri: string
+      readonly name?: string
+      readonly description?: string
+      readonly mention?: { readonly start: number; readonly end: number; readonly text: string }
+    }>
+    readonly agents?: ReadonlyArray<{
+      readonly name: string
+      readonly mention?: { readonly start: number; readonly end: number; readonly text: string }
+    }>
+    readonly skills?: ReadonlyArray<{
+      readonly id: string
+      readonly mention?: { readonly start: number; readonly end: number; readonly text: string }
+    }>
+    readonly metadata?: { readonly thinkingLoss?: "ask" | "accept" } & { readonly [x: string]: JsonValue }
+    readonly delivery?: ("steer" | "queue") | null
+  }["metadata"]
   readonly delivery?: {
     readonly name: string
     readonly text: string
@@ -4612,11 +4701,82 @@ export type SessionCommandInput = {
       readonly id: string
       readonly mention?: { readonly start: number; readonly end: number; readonly text: string }
     }>
+    readonly metadata?: { readonly thinkingLoss?: "ask" | "accept" } & { readonly [x: string]: JsonValue }
     readonly delivery?: ("steer" | "queue") | null
   }["delivery"]
 }
 
 export type SessionCommandOutput = void
+
+export type SessionPreflightInput = {
+  readonly sessionID: { readonly sessionID: string }["sessionID"]
+  readonly text?: {
+    readonly text?: string
+    readonly files?: ReadonlyArray<{
+      readonly uri: string
+      readonly name?: string
+      readonly description?: string
+      readonly mention?: { readonly start: number; readonly end: number; readonly text: string }
+    }>
+    readonly command?: { readonly name: string; readonly arguments?: string }
+    readonly agent?: string
+    readonly model?: { readonly id: string; readonly providerID: string; readonly variant?: string }
+  }["text"]
+  readonly files?: {
+    readonly text?: string
+    readonly files?: ReadonlyArray<{
+      readonly uri: string
+      readonly name?: string
+      readonly description?: string
+      readonly mention?: { readonly start: number; readonly end: number; readonly text: string }
+    }>
+    readonly command?: { readonly name: string; readonly arguments?: string }
+    readonly agent?: string
+    readonly model?: { readonly id: string; readonly providerID: string; readonly variant?: string }
+  }["files"]
+  readonly command?: {
+    readonly text?: string
+    readonly files?: ReadonlyArray<{
+      readonly uri: string
+      readonly name?: string
+      readonly description?: string
+      readonly mention?: { readonly start: number; readonly end: number; readonly text: string }
+    }>
+    readonly command?: { readonly name: string; readonly arguments?: string }
+    readonly agent?: string
+    readonly model?: { readonly id: string; readonly providerID: string; readonly variant?: string }
+  }["command"]
+  readonly agent?: {
+    readonly text?: string
+    readonly files?: ReadonlyArray<{
+      readonly uri: string
+      readonly name?: string
+      readonly description?: string
+      readonly mention?: { readonly start: number; readonly end: number; readonly text: string }
+    }>
+    readonly command?: { readonly name: string; readonly arguments?: string }
+    readonly agent?: string
+    readonly model?: { readonly id: string; readonly providerID: string; readonly variant?: string }
+  }["agent"]
+  readonly model?: {
+    readonly text?: string
+    readonly files?: ReadonlyArray<{
+      readonly uri: string
+      readonly name?: string
+      readonly description?: string
+      readonly mention?: { readonly start: number; readonly end: number; readonly text: string }
+    }>
+    readonly command?: { readonly name: string; readonly arguments?: string }
+    readonly agent?: string
+    readonly model?: { readonly id: string; readonly providerID: string; readonly variant?: string }
+  }["model"]
+}
+
+export type SessionPreflightOutput = SessionPreflightResponse["data"]
+
+export type SessionThinkingInput = { readonly sessionID: { readonly sessionID: string }["sessionID"] }
+
+export type SessionThinkingOutput = SessionThinkingResponse["data"]
 
 export type SessionSkillInput = {
   readonly sessionID: { readonly sessionID: string }["sessionID"]

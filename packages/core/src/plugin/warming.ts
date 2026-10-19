@@ -57,6 +57,8 @@ export const Plugin = define({
 
     const hook = (event: SessionHooks["context"]) =>
       Effect.gen(function* () {
+        // A dry run sends nothing, so there is no cache to keep warm.
+        if (event.dryRun) return
         const session = yield* ctx.session.get({ sessionID: event.sessionID }).pipe(Effect.orDie)
         if (session.parentID) return
 

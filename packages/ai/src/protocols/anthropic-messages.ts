@@ -504,6 +504,8 @@ interface ParserState {
     readonly reason: FinishReasonDetails
     readonly providerMetadata?: ProviderMetadata
   }
+  /** What the provider changed in the request before the model saw it, from `message_start`. */
+  readonly inputTransformations?: ReadonlyArray<Readonly<Record<string, unknown>>>
   readonly lifecycle: Lifecycle.State
 }
 
@@ -1015,13 +1017,21 @@ const supportsEffortUpdates = (request: LLMRequest) => {
   return version.major > 5 || (version.major === 5 && version.minor >= 1)
 }
 
-const applyThinkingBindingDefault = (model: LLMRequest["model"], thinking: AnthropicThinking | undefined) => {
+/**
+ * Whether MODEL binds replayed thinking to the prompt before it, so its requests carry a `block_binding` and
+ * `thinkingPrefixMismatch` decides what the provider does with a stale block.
+ */
+export const bindsThinking = (model: LLMRequest["model"]) => supportsThinkingBlockBinding(model)
+
+// The request picks the mismatch behavior (`thinkingPrefixMismatch`, "drop_block" when unset); a binding spelled out
+// in provider options wins over both.
+const applyThinkingBindingDefault = (request: LLMRequest, thinking: AnthropicThinking | undefined) => {
   if (isThinkingOff(thinking)) return thinking
-  if (!supportsThinkingBlockBinding(model)) return thinking
+  if (!supportsThinkingBlockBinding(request.model)) return thinking
   return {
     ...(thinking ?? { type: "adaptive" as const }),
     block_binding: {
-      prefix_mismatch_behavior: "drop_block",
+      prefix_mismatch_behavior: request.thinkingPrefixMismatch ?? "drop_block",
       ...thinking?.block_binding,
     },
   }
@@ -1081,7 +1091,7 @@ const fromRequest = Effect.fn("AnthropicMessages.fromRequest")(function* (reques
     top_p: generation?.topP,
     top_k: generation?.topK,
     stop_sequences: generation?.stop,
-    thinking: applyThinkingBindingDefault(request.model, fitThinking(options.thinking, maxTokens)),
+    thinking: applyThinkingBindingDefault(request, fitThinking(options.thinking, maxTokens)),
     output_config,
     // top-level passthrough per SDK MessageCreateParamsBase:4638,4643,4649,4654,4670
     cache_control: options.cache_control ?? options.cacheControl,
@@ -1218,9 +1228,40 @@ type StepResult = readonly [ParserState, ReadonlyArray<LLMEvent>]
 
 const NO_EVENTS: StepResult["1"] = []
 
+// The provider reports blocks it removed before the model saw the prompt, such as thinking dropped under
+// `prefix_mismatch_behavior: "drop_block"` (`{ type: "thinking_dropped", path: "messages.3.content.0" }`). With the
+// thinking-binding beta every response carries the list, empty when nothing changed; it is kept empty, so callers can
+// tell a report of no drops from a provider that reports nothing.
+const inputTransformations = (event: AnthropicEvent) => {
+  const value = event.message?.input_transformations
+  if (!Array.isArray(value)) return undefined
+  return value.filter(ProviderShared.isRecord)
+}
+
 const onMessageStart = (state: ParserState, event: AnthropicEvent): StepResult => {
   const usage = mapUsage(event.message?.usage, state.providerMetadataKey)
-  return [usage ? { ...state, usage: mergeUsage(state.usage, usage, state.providerMetadataKey) } : state, NO_EVENTS]
+  const transformations = inputTransformations(event)
+  return [
+    {
+      ...state,
+      ...(usage ? { usage: mergeUsage(state.usage, usage, state.providerMetadataKey) } : {}),
+      ...(transformations ? { inputTransformations: transformations } : {}),
+    },
+    NO_EVENTS,
+  ]
+}
+
+// Request transformations surface on the finish, beside the stop sequence, as `inputTransformations`.
+const finishMetadata = (state: ParserState): ProviderMetadata | undefined => {
+  const metadata = state.pendingFinish?.providerMetadata
+  if (state.inputTransformations === undefined) return metadata
+  return {
+    ...metadata,
+    [state.providerMetadataKey]: {
+      ...metadata?.[state.providerMetadataKey],
+      inputTransformations: state.inputTransformations,
+    },
+  }
 }
 
 const onContentBlockStart = (
@@ -1478,7 +1519,7 @@ const onMessageStop = Effect.fnUntraced(function* (state: ParserState) {
       raw: undefined,
     },
     usage: state.usage,
-    providerMetadata: state.pendingFinish?.providerMetadata,
+    providerMetadata: finishMetadata(state),
   })
   return [{ ...state, lifecycle: finished, tools: result.tools }, events] satisfies StepResult
 })

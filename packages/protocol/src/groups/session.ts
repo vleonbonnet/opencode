@@ -5,7 +5,7 @@ import { Session } from "@opencode/schema/session"
 import { SessionStats } from "@opencode/schema/session-stats"
 import { InstructionEntry } from "@opencode/schema/instruction-entry"
 import { Project } from "@opencode/schema/project"
-import { DateTimeUtcFromMillis, NonNegativeInt, PositiveInt } from "@opencode/schema/schema"
+import { DateTimeUtcFromMillis, NonNegativeInt, optional, PositiveInt } from "@opencode/schema/schema"
 import { Event } from "@opencode/schema/event"
 import { Context, Schema, SchemaGetter, Struct } from "effect"
 import { HttpApiEndpoint, HttpApiGroup, HttpApiMiddleware, HttpApiSchema, OpenApi } from "effect/http-api"
@@ -35,6 +35,7 @@ import { SessionEvent } from "@opencode/schema/session-event"
 import { EventLog } from "@opencode/schema/event-log"
 import { FileDiff } from "@opencode/schema/file-diff"
 import { Form } from "@opencode/schema/form"
+import { SessionCache } from "@opencode/schema/session-cache"
 import { PublicSessionMessage } from "./message.js"
 
 const SessionActive = Schema.Struct({
@@ -319,7 +320,8 @@ export const makeSessionGroup = <I extends HttpApiMiddleware.AnyId, S, FormI ext
         payload: Schema.Struct({
           id: SessionMessage.ID.pipe(Schema.optional),
           ...PromptInput.Prompt.fields,
-          metadata: SessionInbox.UserPayload.fields.metadata,
+          /** Client metadata kept on the message; `thinkingLoss` decides what the turn does with stale thinking. */
+          metadata: SessionCache.PromptMetadata.pipe(optional),
           delivery: SessionInbox.Delivery.pipe(Schema.optional),
           resume: Schema.Boolean.pipe(Schema.optional),
         }),
@@ -341,6 +343,8 @@ export const makeSessionGroup = <I extends HttpApiMiddleware.AnyId, S, FormI ext
         payload: Schema.Struct({
           name: Schema.String,
           ...PromptInput.Prompt.fields,
+          /** Forwarded to the prompt the command sends, like the prompt route's `metadata`. */
+          metadata: SessionCache.PromptMetadata.pipe(optional),
           delivery: SessionInbox.Delivery.pipe(Schema.optional),
         }),
         success: HttpApiSchema.NoContent,
@@ -354,6 +358,41 @@ export const makeSessionGroup = <I extends HttpApiMiddleware.AnyId, S, FormI ext
             description: "Execute a slash command callback immediately.",
           }),
         ),
+    )
+    .add(
+      HttpApiEndpoint.post("session.preflight", "/api/experimental/session/:sessionID/preflight", {
+        params: { sessionID: Session.ID },
+        payload: SessionCache.PreflightInput,
+        success: Schema.Struct({ data: SessionCache.PreflightReport }).annotate({
+          identifier: "SessionPreflightResponse",
+        }),
+        error: [SessionNotFoundError, InvalidRequestError],
+      })
+        .middleware(sessionLocationMiddleware)
+        .annotateMerge(
+          OpenApi.annotations({
+            identifier: "experimental.session.preflight",
+            summary: "Preflight the next turn",
+            description:
+              "Predict how much of the provider's prompt cache the next turn reuses, and whether earlier signed thinking no longer matches the conversation, by dry-running the exact request it would send: the selected or given agent and model, the history, any pending instruction update, and a message built from text, files or a command. Nothing is enqueued, persisted or sent. While a turn runs the report is unknown. When staleThinking is present, a turn sent with metadata.thinkingLoss 'ask' fails with a thinking.stale error (unless its reason is 'unknown binding': those blocks are sent, and only a provider refusal fails the turn); with 'accept' it replays them as text, as staleThinking.consent predicts; without thinkingLoss the provider drops them. An unknown command or agent, or an unavailable model, is a 400.",
+          }),
+        ),
+    )
+    .add(
+      HttpApiEndpoint.get("session.thinking", "/api/experimental/session/:sessionID/thinking", {
+        params: { sessionID: Session.ID },
+        success: Schema.Struct({
+          data: Schema.Struct({ dropped: Schema.Array(SessionCache.DroppedThinking) }),
+        }).annotate({ identifier: "SessionThinkingResponse" }),
+        error: SessionNotFoundError,
+      }).annotateMerge(
+        OpenApi.annotations({
+          identifier: "experimental.session.thinking",
+          summary: "List dropped thinking",
+          description:
+            "Reasoning blocks that later requests leave out, oldest first. messageID and ordinal name a block as the session.reasoning events do: the ordinal-th reasoning item, from 0, of that assistant message's content. asText blocks were dropped with the user's consent and replay as <earlier-reasoning> text; the others were dropped by the provider and are omitted. reason says which, and whether anyone was asked: it starts with 'dropped with consent', 'dropped by the provider without asking' (the turn set no thinkingLoss) or 'dropped by the provider'.",
+        }),
+      ),
     )
     .add(
       HttpApiEndpoint.post("session.skill", "/api/experimental/session/:sessionID/skill", {

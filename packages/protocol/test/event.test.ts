@@ -26,6 +26,7 @@ test("classifies public events by type", () => {
   expect(isOpenCodeEvent({ type: "mcp.status.changed" })).toBe(true)
   expect(isOpenCodeEvent({ type: "mcp.resources.changed" })).toBe(true)
   expect(isOpenCodeEvent({ type: "mcp.tools.changed" })).toBe(false)
+  expect(isOpenCodeEvent({ type: "session.thinking.dropped" })).toBe(true)
   expect(isOpenCodeEvent({ type: "acme.updated" })).toBe(false)
 })
 

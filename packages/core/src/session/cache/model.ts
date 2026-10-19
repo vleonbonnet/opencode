@@ -1,0 +1,645 @@
+export * as CacheModel from "./model.js"
+
+// Prompt-cache model: turns a captured wire request into the sequence of prefix hashes a provider's prompt cache
+// keys on.
+//
+// Providers cache on the rendered prompt prefix. We cannot see the rendering, but it is a deterministic function of
+// the request, so two requests can only share a cached prefix up to the first block where their normalized request
+// content differs. Fields are split into:
+//
+// - namespace: where the cache lives (endpoint, credential, routing affinity). Caches are not shared across
+//   namespaces (verified: anthropic direct, grove and copilot keep separate caches for byte-identical requests). The
+//   credential is the stored identity the request authenticates with (`Captured.credential`), never the wire header:
+//   OAuth refreshes, Entra tokens and request signing change the header, not the account the provider caches under.
+// - keyed fields: anything that may change rendering. Unknown fields are keyed so the model can only err towards
+//   predicting a miss.
+// - non-keyed fields: verified not to affect the cache (max_tokens, effort, thinking.display on Anthropic; max_tokens,
+//   temperature on Fireworks), plus sampling/transport fields that act after the prompt is processed.
+//
+// Formats with explicit breakpoints (Anthropic Messages) only create cache entries at `cache_control` blocks and only
+// find an earlier entry within a 20-block lookback of a breakpoint (verified: 20 blocks hit, 22 miss). Automatic-prefix
+// formats (OpenAI-compatible chat, Responses) cache every prefix of a processed request.
+
+import type { LanguageModel } from "@opencode/ai"
+import { AnthropicMessages } from "@opencode/ai/protocols"
+import { Hash } from "@opencode/util/hash"
+import type { Captured } from "./wire.js"
+
+export type Format = "anthropic" | "openai-chat" | "openai-responses" | "unknown"
+export type Region = "tools" | "system" | "messages"
+
+export const ANTHROPIC_LOOKBACK = 20
+export const ANTHROPIC_DEFAULT_TTL = 5 * 60_000
+// A conservative prediction window for hosts whose retention is undocumented. Crossing a window is not evidence that
+// the provider evicted the prefix.
+export const AUTOMATIC_DEFAULT_TTL = 5 * 60_000
+
+export type Retention = {
+  readonly ttl: number
+  readonly source: string
+}
+
+export type Block = {
+  /** Chained hash of the normalized request prefix ending with this block. */
+  readonly prefix: string
+  /** Hash of this block alone, for diffing against a previous request. */
+  readonly own: string
+  readonly bytes: number
+  readonly region: Region
+  readonly path: string
+  readonly label: string
+  readonly excerpt: string
+  /** Set when the request asks the provider to create a cache entry here. */
+  readonly breakpoint?: { readonly ttl: number }
+}
+
+export type Normalized = {
+  readonly format: Format
+  readonly namespace: string
+  readonly namespaceParts: Readonly<Record<string, string>>
+  readonly model: string | undefined
+  /** Hashes of keyed top-level fields, for explaining a divergence. */
+  readonly keyed: Readonly<Record<string, string>>
+  readonly blocks: readonly Block[]
+  /** Automatic formats cache every prefix; explicit formats only breakpoints. */
+  readonly automatic: boolean
+  /** Prediction window for automatic entries, not a provider eviction time. */
+  readonly automaticRetention?: Retention
+  readonly totalBytes: number
+}
+
+const hash = (value: string) => Hash.sha256(value).slice(0, 32)
+
+const stable = (value: unknown) => JSON.stringify(value ?? null)
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+}
+
+/** Remove cache markers: they place breakpoints but are not prompt content. */
+function stripMarkers(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(stripMarkers)
+  if (!isRecord(value)) return value
+  const out: Record<string, unknown> = {}
+  for (const [key, item] of Object.entries(value)) {
+    if (key === "cache_control" || key === "cacheControl") continue
+    out[key] = stripMarkers(item)
+  }
+  return out
+}
+
+function ttlOf(marker: unknown) {
+  if (!isRecord(marker)) return
+  return marker.ttl === "1h" ? 60 * 60_000 : ANTHROPIC_DEFAULT_TTL
+}
+
+function excerptOf(value: unknown) {
+  const text = (() => {
+    if (typeof value === "string") return value
+    if (!isRecord(value)) return stable(value)
+    for (const key of ["text", "thinking", "content", "output", "name", "arguments"]) {
+      const item = value[key]
+      if (typeof item === "string" && item) return item
+    }
+    return stable(value)
+  })()
+  const flat = text.replace(/\s+/g, " ").trim()
+  return flat.length > 120 ? flat.slice(0, 117) + "..." : flat
+}
+
+function labelOf(value: unknown, fallback: string) {
+  if (!isRecord(value)) return fallback
+  const type = typeof value.type === "string" ? value.type : undefined
+  const role = typeof value.role === "string" ? value.role : undefined
+  return [role, type].filter(Boolean).join(" ") || fallback
+}
+
+function endpoint(raw: string) {
+  try {
+    const parsed = new URL(raw)
+    return `${parsed.protocol}//${parsed.host}${parsed.pathname}`
+  } catch {
+    return raw
+  }
+}
+
+type Draft = { value: unknown; region: Region; path: string; marker?: unknown; seed: string }
+
+function chain(drafts: Draft[]) {
+  const blocks: Block[] = []
+  let previous = ""
+  let total = 0
+  for (const draft of drafts) {
+    const text = stable(stripMarkers(draft.value))
+    const own = hash(draft.region + "\u0000" + text)
+    previous = hash(previous + "\u0000" + draft.seed + "\u0000" + own)
+    total += text.length
+    const ttl = ttlOf(draft.marker)
+    blocks.push({
+      prefix: previous,
+      own,
+      bytes: text.length,
+      region: draft.region,
+      path: draft.path,
+      label: labelOf(draft.value, draft.region),
+      excerpt: excerptOf(draft.value),
+      ...(ttl !== undefined ? { breakpoint: { ttl } } : {}),
+    })
+  }
+  return { blocks, total }
+}
+
+function keyedFields(body: Record<string, unknown>, skip: ReadonlySet<string>) {
+  const keyed: Record<string, string> = {}
+  for (const [key, value] of Object.entries(body)) {
+    if (skip.has(key)) continue
+    keyed[key] = hash(stable(value))
+  }
+  return keyed
+}
+
+// Anthropic Messages -------------------------------------------------------
+
+const ANTHROPIC_CONTENT = new Set(["system", "messages", "tools"])
+// Verified on anthropic, grove and copilot: changing these keeps the cache. Vertex names the API version in the body.
+const ANTHROPIC_NON_KEYED = new Set([
+  "max_tokens",
+  "stream",
+  "metadata",
+  "temperature",
+  "top_p",
+  "top_k",
+  "stop_sequences",
+])
+// Documented to invalidate only the messages region (system/tools stay cached).
+const ANTHROPIC_MESSAGES_KEYED = new Set(["thinking", "tool_choice"])
+// Keyed request headers: they select features that change rendering.
+const ANTHROPIC_KEYED_HEADERS = ["anthropic-beta", "anthropic-version"]
+
+function anthropicSeeds(body: Record<string, unknown>, headers: Readonly<Record<string, string>>) {
+  const global: Record<string, unknown> = {}
+  const messages: Record<string, unknown> = {}
+  for (const [key, value] of Object.entries(body)) {
+    if (ANTHROPIC_CONTENT.has(key) || ANTHROPIC_NON_KEYED.has(key)) continue
+    if (key === "output_config" && isRecord(value)) {
+      const { effort: _effort, ...rest } = value
+      if (Object.keys(rest).length) global[key] = rest
+      continue
+    }
+    if (ANTHROPIC_MESSAGES_KEYED.has(key)) {
+      if (key === "thinking" && isRecord(value)) {
+        // block_binding only decides what happens to a replayed block whose prefix changed; a request that drops
+        // nothing renders the same prompt, and the behavior flips per turn with the user's consent.
+        const { display: _display, block_binding: _binding, ...rest } = value
+        messages[key] = rest
+        continue
+      }
+      messages[key] = value
+      continue
+    }
+    global[key] = value
+  }
+  for (const name of ANTHROPIC_KEYED_HEADERS) {
+    const value = headers[name]
+    if (value !== undefined)
+      global["header:" + name] = value
+        .split(",")
+        .map((item) => item.trim())
+        .sort()
+  }
+  return { global: hash(stable(global)), messages: hash(stable(messages)), fields: { ...global, ...messages } }
+}
+
+function vertexModel(url: string) {
+  const pathname = URL.parse(url)?.pathname ?? url
+  return /\/models\/([^/:]+):(?:stream)?[rR]awPredict$/.exec(pathname)?.[1]
+}
+
+function anthropic(body: Record<string, unknown>, request: Captured): Omit<Normalized, "namespace" | "namespaceParts"> {
+  const seeds = anthropicSeeds(body, request.headers)
+  const drafts: Draft[] = []
+  const tools = Array.isArray(body.tools) ? body.tools : []
+  tools.forEach((tool, index) =>
+    drafts.push({
+      value: tool,
+      region: "tools",
+      path: `tools[${index}]${isRecord(tool) && typeof tool.name === "string" ? ` (${tool.name})` : ""}`,
+      marker: isRecord(tool) ? tool.cache_control : undefined,
+      seed: seeds.global,
+    }),
+  )
+  const system =
+    typeof body.system === "string"
+      ? [{ type: "text", text: body.system }]
+      : Array.isArray(body.system)
+        ? body.system
+        : []
+  system.forEach((block, index) =>
+    drafts.push({
+      value: block,
+      region: "system",
+      path: `system[${index}]`,
+      marker: isRecord(block) ? block.cache_control : undefined,
+      seed: seeds.global,
+    }),
+  )
+  const messages = Array.isArray(body.messages) ? body.messages : []
+  messages.forEach((message, index) => {
+    if (!isRecord(message)) return
+    const role = typeof message.role === "string" ? message.role : "message"
+    const content =
+      typeof message.content === "string"
+        ? [{ type: "text", text: message.content }]
+        : Array.isArray(message.content)
+          ? message.content
+          : []
+    content.forEach((block, part) =>
+      drafts.push({
+        value: { role, ...(isRecord(block) ? block : { value: block }) },
+        region: "messages",
+        path: `messages[${index}].content[${part}] (${role}${isRecord(block) && typeof block.type === "string" ? " " + block.type : ""})`,
+        marker: isRecord(block) ? block.cache_control : undefined,
+        seed: seeds.global + seeds.messages,
+      }),
+    )
+  })
+  const { blocks, total } = chain(drafts)
+  return {
+    format: "anthropic",
+    model: typeof body.model === "string" ? body.model : vertexModel(request.url),
+    keyed: Object.fromEntries(Object.entries(seeds.fields).map(([key, value]) => [key, hash(stable(value))])),
+    blocks,
+    automatic: false,
+    totalBytes: total,
+  }
+}
+
+// https://developers.openai.com/api/docs/guides/prompt-caching#cache-lifetime
+// OpenAI's GPT-5.6+ minimum is 30m. Earlier models' 24h mode typically lasts 30m, not a guaranteed 24h; in-memory mode
+// typically lasts 5-10m. Its default depends on the organisation's retention policy, which the wire cannot reveal.
+// Codex uses a separate backend: model-family defaults there remain estimates.
+//
+// GitHub Copilot serves GPT models from OpenAI and its own Azure OpenAI deployments
+// (docs.github.com/en/copilot/reference/ai-models/model-hosting) and documents no window of its own beyond a
+// tutorial's "24 hours", which measurements contradict. Both backends guarantee GPT-5.6+ prefixes for 30m and default
+// GPT-5.5 to extended retention; Copilot runs under a zero data retention agreement, so earlier models default to
+// in-memory. Measured on api.githubcopilot.com (gpt-6-astra, gpt-6-sol): full prefix reads after up to 25m idle,
+// misses from about 27-30m on.
+const COPILOT_HOST =
+  /^(?:api(?:\.(?:individual|business|enterprise))?\.githubcopilot\.com|copilot-api\.[a-z0-9-]+(?:\.[a-z0-9-]+)+)$/
+
+function automaticRetention(body: Record<string, unknown>, request: Captured): Retention {
+  const fallback = { ttl: AUTOMATIC_DEFAULT_TTL, source: "undocumented provider fallback" }
+  const url = URL.parse(request.url)
+  const provider =
+    url?.origin === "https://api.openai.com" && /^\/v1\/(responses|chat\/completions)$/.test(url.pathname)
+      ? "OpenAI"
+      : url?.origin === "https://chatgpt.com" && url.pathname === "/backend-api/codex/responses"
+        ? "Codex"
+        : url?.protocol === "https:" &&
+            !url.port &&
+            !url.username &&
+            !url.password &&
+            COPILOT_HOST.test(url.hostname) &&
+            /^\/(responses|chat\/completions)$/.test(url.pathname)
+          ? "Copilot"
+          : undefined
+  if (!provider) return fallback
+  const version = typeof body.model === "string" ? /^gpt-(\d+)(?:\.(\d+))?(?:-|$)/.exec(body.model) : null
+  if (provider === "Copilot") {
+    // Copilot also proxies non-OpenAI models over these endpoints.
+    if (!version) return fallback
+    const major = Number(version[1])
+    const minor = Number(version[2] ?? 0)
+    if (major > 5 || (major === 5 && minor >= 6))
+      return { ttl: 30 * 60_000, source: "Copilot GPT-5.6+, OpenAI/Azure 30m minimum" }
+    if (major === 5 && minor === 5) return { ttl: 30 * 60_000, source: "Copilot GPT-5.5 extended retention estimate" }
+    return { ttl: AUTOMATIC_DEFAULT_TTL, source: "Copilot in-memory estimate" }
+  }
+  const major = Number(version?.[1])
+  const minor = Number(version?.[2] ?? 0)
+  if (major > 5 || (major === 5 && minor >= 6))
+    return {
+      ttl: 30 * 60_000,
+      source: provider === "Codex" ? "Codex model-family estimate" : "OpenAI GPT-5.6+ minimum",
+    }
+  if (provider === "OpenAI" && isRecord(body.prompt_cache_options) && body.prompt_cache_options.ttl === "30m")
+    return { ttl: 30 * 60_000, source: "requested OpenAI 30m minimum" }
+  if ((major === 5 && minor === 5) || (provider === "OpenAI" && body.prompt_cache_retention === "24h"))
+    return {
+      ttl: 30 * 60_000,
+      source: provider === "Codex" ? "Codex model-family estimate" : "OpenAI extended retention estimate",
+    }
+  return {
+    ttl: AUTOMATIC_DEFAULT_TTL,
+    source: provider === "Codex" ? "undocumented Codex retention fallback" : "OpenAI in-memory estimate",
+  }
+}
+
+// OpenAI-compatible chat ---------------------------------------------------
+
+// Verified on Fireworks: max_tokens and temperature keep the cache; the rest only drive decoding or transport.
+// reasoning_effort is rendered by chat templates and did break the cache, so it stays keyed.
+const CHAT_NON_KEYED = new Set([
+  "max_tokens",
+  "max_completion_tokens",
+  "stream",
+  "stream_options",
+  "temperature",
+  "top_p",
+  "top_k",
+  "min_p",
+  "seed",
+  "n",
+  "stop",
+  "frequency_penalty",
+  "presence_penalty",
+  "repetition_penalty",
+  "logprobs",
+  "top_logprobs",
+  "metadata",
+])
+
+function openaiChat(
+  body: Record<string, unknown>,
+  request: Captured,
+): Omit<Normalized, "namespace" | "namespaceParts"> {
+  const skip = new Set([...CHAT_NON_KEYED, "messages", "tools"])
+  const keyed = keyedFields(body, skip)
+  const seed = hash(stable(keyed))
+  const drafts: Draft[] = []
+  const tools = Array.isArray(body.tools) ? body.tools : []
+  tools.forEach((tool, index) =>
+    drafts.push({
+      value: tool,
+      region: "tools",
+      path: `tools[${index}]${isRecord(tool) && isRecord(tool.function) && typeof tool.function.name === "string" ? ` (${tool.function.name})` : ""}`,
+      seed,
+    }),
+  )
+  const messages = Array.isArray(body.messages) ? body.messages : []
+  messages.forEach((message, index) => {
+    const role = isRecord(message) && typeof message.role === "string" ? message.role : "message"
+    drafts.push({
+      value: message,
+      region: role === "system" || role === "developer" ? "system" : "messages",
+      path: `messages[${index}] (${role})`,
+      seed,
+    })
+  })
+  const { blocks, total } = chain(drafts)
+  return {
+    format: "openai-chat",
+    model: typeof body.model === "string" ? body.model : undefined,
+    keyed,
+    blocks,
+    automatic: true,
+    automaticRetention: automaticRetention(body, request),
+    totalBytes: total,
+  }
+}
+
+// OpenAI Responses ---------------------------------------------------------
+
+const RESPONSES_NON_KEYED = new Set([
+  "stream",
+  "max_output_tokens",
+  "temperature",
+  "top_p",
+  "top_logprobs",
+  "metadata",
+  "include",
+  "store",
+  "background",
+])
+
+function openaiResponses(
+  body: Record<string, unknown>,
+  request: Captured,
+): Omit<Normalized, "namespace" | "namespaceParts"> {
+  const skip = new Set([...RESPONSES_NON_KEYED, "input", "tools", "instructions"])
+  const keyed = keyedFields(body, skip)
+  const seed = hash(stable(keyed))
+  const drafts: Draft[] = []
+  const tools = Array.isArray(body.tools) ? body.tools : []
+  tools.forEach((tool, index) =>
+    drafts.push({
+      value: tool,
+      region: "tools",
+      path: `tools[${index}]${isRecord(tool) && typeof tool.name === "string" ? ` (${tool.name})` : ""}`,
+      seed,
+    }),
+  )
+  if (typeof body.instructions === "string")
+    drafts.push({ value: body.instructions, region: "system", path: "instructions", seed })
+  const input =
+    typeof body.input === "string"
+      ? [{ role: "user", content: body.input }]
+      : Array.isArray(body.input)
+        ? body.input
+        : []
+  input.forEach((item, index) => {
+    const role =
+      isRecord(item) && typeof item.role === "string"
+        ? item.role
+        : isRecord(item) && typeof item.type === "string"
+          ? item.type
+          : "item"
+    drafts.push({
+      value: item,
+      region: role === "system" || role === "developer" ? "system" : "messages",
+      path: `input[${index}] (${role})`,
+      seed,
+    })
+  })
+  const { blocks, total } = chain(drafts)
+  return {
+    format: "openai-responses",
+    model: typeof body.model === "string" ? body.model : undefined,
+    keyed,
+    blocks,
+    automatic: true,
+    automaticRetention: automaticRetention(body, request),
+    totalBytes: total,
+  }
+}
+
+function detect(request: Captured, body: unknown): Format {
+  if (!isRecord(body)) return "unknown"
+  const pathname = URL.parse(request.url)?.pathname ?? request.url
+  // Vertex serves Anthropic Messages bodies (with `anthropic_version`, model in the URL) through rawPredict.
+  const messagesEndpoint =
+    pathname.endsWith("/messages") || (/:(?:stream)?[rR]awPredict$/.test(pathname) && "anthropic_version" in body)
+  if (messagesEndpoint && Array.isArray(body.messages) && "max_tokens" in body) return "anthropic"
+  if (pathname.endsWith("/chat/completions") && Array.isArray(body.messages)) return "openai-chat"
+  if (pathname.endsWith("/responses") && ("input" in body || "instructions" in body)) return "openai-responses"
+  return "unknown"
+}
+
+function parse(request: Captured): unknown {
+  try {
+    return request.body === undefined ? undefined : JSON.parse(request.body)
+  } catch {
+    return undefined
+  }
+}
+
+export function normalize(request: Captured): Normalized {
+  return normalizeBody(request, parse(request))
+}
+
+function normalizeBody(request: Captured, body: unknown): Normalized {
+  const format = detect(request, body)
+  // A request whose credential nothing stable identifies (an OAuth sign-in without an account, ambient credentials)
+  // leaves it out: the endpoint alone names the cache.
+  const parts: Record<string, string> = {
+    endpoint: endpoint(request.url),
+    ...(request.credential === undefined ? {} : { credential: request.credential }),
+  }
+  // Automatic-prefix hosts route cache hits by affinity (verified on Fireworks: a different or missing
+  // x-session-affinity misses). Explicit-breakpoint caches are organisation-wide.
+  if (format !== "anthropic") {
+    const affinity = request.headers["x-session-affinity"]
+    if (affinity) parts.affinity = affinity
+  }
+  const namespace = hash(stable(parts))
+  if (format === "unknown" || !isRecord(body)) {
+    return {
+      format: "unknown",
+      namespace,
+      namespaceParts: parts,
+      model: isRecord(body) && typeof body.model === "string" ? body.model : undefined,
+      keyed: {},
+      blocks: [],
+      automatic: false,
+      totalBytes: request.body?.length ?? 0,
+    }
+  }
+  const shape =
+    format === "anthropic"
+      ? anthropic(body, request)
+      : format === "openai-chat"
+        ? openaiChat(body, request)
+        : openaiResponses(body, request)
+  return { ...shape, namespace, namespaceParts: parts }
+}
+
+// Thinking-signature binding ------------------------------------------------
+//
+// What an Anthropic thinking signature is bound to, measured on direct Anthropic and Copilot (claude-opus-5-5,
+// thinking-binding-controls): the system prompt, the tool set (order does not matter) and every content block before
+// the thinking block, its own message included. Not bound: cache markers, max_tokens, output_config.effort, the
+// thinking config (even its absence), tool_choice, content after the block, and other thinking blocks (removing an
+// earlier thinking block leaves later ones valid). The Claude API documents one more link the ledger does not model:
+// each block records the thinking block before it, so only a leading run of blocks can be removed (opencode removes
+// blocks only from the first stale one on, which the provider drops anyway).
+
+const THINKING_TYPES = new Set(["thinking", "redacted_thinking"])
+
+export type SignedThinking = {
+  /** Hash of the signature (or redacted data): the block's identity. */
+  readonly id: string
+  /** The signature or redacted data itself, as replayed. */
+  readonly signature: string
+  /** Where the block sits in the request, as the provider names it in errors: `messages.N.content.M`. */
+  readonly path: string
+  /** Hashes of what the block is bound to. */
+  readonly binding: Binding
+}
+
+export type Binding = {
+  readonly system: string
+  readonly tools: string
+  /** Every non-thinking content block before this one, roles included. */
+  readonly prefix: string
+  /** The messages before the one holding the block: its prefix without its own message's earlier content. */
+  readonly start: string
+}
+
+/**
+ * What the thinking a request's reply produces is bound to, as far as the request tells: the reply's own content
+ * before a block is not part of it.
+ */
+export type Produced = Pick<Binding, "system" | "tools" | "start">
+
+/** The signed thinking a request carries, and what the thinking its reply produces is bound to. */
+export type Thinking = {
+  readonly signed: readonly SignedThinking[]
+  /** Undefined for formats whose thinking is not bound to the prompt. */
+  readonly produced: Produced | undefined
+}
+
+function contentBlocks(content: unknown): unknown[] {
+  if (typeof content === "string") return [{ type: "text", text: content }]
+  return Array.isArray(content) ? content : []
+}
+
+/** The identity of a thinking block, from its signature (or redacted data). */
+export function thinkingID(signature: string) {
+  return hash("thinking:" + signature)
+}
+
+function thinkingOf(request: Captured, body: unknown): Thinking {
+  if (!isRecord(body) || detect(request, body) !== "anthropic" || !Array.isArray(body.messages))
+    return { signed: [], produced: undefined }
+  const system = hash("system:" + stable(stripMarkers(contentBlocks(body.system))))
+  const tools = hash(
+    "tools:" + stable((Array.isArray(body.tools) ? body.tools : []).map((tool) => stable(stripMarkers(tool))).sort()),
+  )
+  const signed: SignedThinking[] = []
+  let prefix = hash("messages:")
+  // The reply is a new assistant message after the last one, unless it continues a trailing assistant message (a
+  // prefill, which history does not keep): then it replays where that one starts.
+  let replyStart = prefix
+  body.messages.forEach((message: unknown, index: number) => {
+    if (!isRecord(message)) return
+    const start = prefix
+    prefix = hash(prefix + "\u0000role:" + String(message.role))
+    contentBlocks(message.content).forEach((block, position) => {
+      if (isRecord(block) && THINKING_TYPES.has(String(block.type))) {
+        const signature = block.type === "thinking" ? block.signature : block.data
+        if (typeof signature === "string" && signature)
+          signed.push({
+            id: thinkingID(signature),
+            signature,
+            path: `messages.${index}.content.${position}`,
+            binding: { system, tools, prefix, start },
+          })
+        return
+      }
+      prefix = hash(prefix + "\u0001" + stable(stripMarkers(block)))
+    })
+    replyStart = message.role === "assistant" ? start : prefix
+  })
+  return { signed, produced: { system, tools, start: replyStart } }
+}
+
+/** The signed thinking blocks of an Anthropic REQUEST, with their binding. Empty for other formats. */
+export function signedThinking(request: Captured): SignedThinking[] {
+  return [...thinkingOf(request, parse(request)).signed]
+}
+
+export type Analyzed = { readonly normalized: Normalized; readonly thinking: Thinking }
+
+/** The normalized form and the thinking layout of REQUEST, reading its body once. */
+export function analyze(request: Captured): Analyzed {
+  const body = parse(request)
+  return { normalized: normalizeBody(request, body), thinking: thinkingOf(request, body) }
+}
+
+/**
+ * Whether opencode checks the thinking bindings of MODEL's requests: Anthropic Messages models that bind replayed
+ * thinking to the prompt. Only their requests choose what the provider does with a stale block, so a client can be
+ * asked before it is dropped. Elsewhere (other protocols, AI SDK routes even when they carry Anthropic bodies, models
+ * without the binding) the protocol default stays and nothing is checked.
+ */
+export const checksThinking = (model: LanguageModel) =>
+  model.route.protocol === AnthropicMessages.protocol.id && AnthropicMessages.bindsThinking(model)
+
+/** The block-binding behavior a captured Anthropic request asks for, if any. */
+export function bindingBehavior(request: Captured): string | undefined {
+  const body = parse(request)
+  if (!isRecord(body) || !isRecord(body.thinking) || !isRecord(body.thinking.block_binding)) return undefined
+  const value = body.thinking.block_binding.prefix_mismatch_behavior
+  return typeof value === "string" ? value : undefined
+}

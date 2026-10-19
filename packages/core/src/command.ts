@@ -1,7 +1,9 @@
 export * as Command from "./command.js"
 
 import { Command } from "@opencode/schema/command"
+import type { Model } from "@opencode/schema/model"
 import type { PromptInput } from "@opencode/schema/prompt-input"
+import type { PromptMetadata } from "@opencode/schema/session-cache"
 import type { Session } from "@opencode/schema/session"
 import type { SessionInbox } from "@opencode/schema/session-inbox"
 import { makeLocationNode } from "@opencode/util/effect/app-node"
@@ -17,11 +19,22 @@ export interface Invocation {
   readonly sessionID: Session.ID
   readonly prompt: PromptInput.Prompt
   readonly delivery: SessionInbox.Delivery
+  /** Client metadata for the prompt the command sends, such as `thinkingLoss`. */
+  readonly metadata?: PromptMetadata
+}
+
+/** Where a command sends its prompt, when that is known before it runs. */
+export interface Target {
+  readonly agent?: string
+  readonly model?: Model.Ref
+  /** The command prompts a new subagent session instead of the invoking one. */
+  readonly subagent?: boolean
 }
 
 export interface Definition {
   readonly name: string
   readonly description?: string
+  readonly target?: Target
   readonly execute: (input: Invocation) => Effect.Effect<void, unknown>
 }
 
@@ -41,6 +54,8 @@ export class ExecutionError extends Schema.TaggedError<ExecutionError>()("Comman
 
 export interface Interface extends State.Transformable<Editor> {
   readonly get: (name: string) => Effect.Effect<Info | undefined>
+  /** The command's declared target, so a preflight can predict the turn it starts without running it. */
+  readonly target: (name: string) => Effect.Effect<Target | undefined>
   readonly list: () => Effect.Effect<Info[]>
   readonly execute: (input: {
     readonly name: string
@@ -77,6 +92,7 @@ export const layer = Layer.effect(
           return definition ? info(definition) : undefined
         }),
       ),
+      target: Effect.fn("Command.target")((name) => Effect.sync(() => state.get().get(name)?.target)),
       list: Effect.fn("Command.list")(() => Effect.sync(() => Array.from(state.get().values(), info))),
       execute: Effect.fn("Command.execute")(function* (input) {
         const definition = state.get().get(input.name)

@@ -1,4 +1,4 @@
-export { Route, LLMClient } from "./client.js"
+export { Route, LLMClient, compileRequest, compileHttpRequest } from "./client.js"
 export type {
   Route as RouteShape,
   RouteLanguageModelInput,

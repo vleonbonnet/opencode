@@ -31,6 +31,7 @@ for (const [id, enabled] of [
       expect(compiled.body.thinking).toEqual(
         enabled ? { type: "adaptive", block_binding: { prefix_mismatch_behavior: "drop_block" } } : undefined,
       )
+      expect(AnthropicMessages.bindsThinking(request.model)).toBe(enabled)
       expect(prepared.request.headers["anthropic-beta"]).toBe(
         enabled
           ? "existing-beta,interleaved-thinking-2025-05-14,thinking-binding-controls-2026-08-01"
@@ -61,5 +62,41 @@ it.effect("preserves explicit thinking settings and combines required beta heade
           : "interleaved-thinking-2025-05-14,compact-2026-01-12,thinking-binding-controls-2026-08-01",
       )
     }
+  }),
+)
+
+it.effect("follows the request-level prefix mismatch behavior unless provider options spell one out", () =>
+  Effect.gen(function* () {
+    const compile = (thinkingPrefixMismatch?: "error" | "drop_block", thinking?: unknown) =>
+      compileRequest(
+        LLM.request({
+          model: AnthropicMessages.route.model({ id: "claude-fable-5-1" }),
+          prompt: "Hello",
+          thinkingPrefixMismatch,
+          ...(thinking === undefined ? {} : { providerOptions: { thinking } }),
+        }),
+      ).pipe(Effect.map((compiled) => compiled.body.thinking))
+    expect(yield* compile("error")).toEqual({ type: "adaptive", block_binding: { prefix_mismatch_behavior: "error" } })
+    expect(yield* compile("drop_block")).toEqual({
+      type: "adaptive",
+      block_binding: { prefix_mismatch_behavior: "drop_block" },
+    })
+    expect(yield* compile("error", { type: "adaptive", display: "summarized" })).toEqual({
+      type: "adaptive",
+      display: "summarized",
+      block_binding: { prefix_mismatch_behavior: "error" },
+    })
+    expect(
+      yield* compile("error", { type: "adaptive", block_binding: { prefix_mismatch_behavior: "drop_block" } }),
+    ).toEqual({ type: "adaptive", block_binding: { prefix_mismatch_behavior: "drop_block" } })
+    // Models without thinking binding never carry it.
+    const unbound = yield* compileRequest(
+      LLM.request({
+        model: AnthropicMessages.route.model({ id: "claude-opus-4-8" }),
+        prompt: "Hello",
+        thinkingPrefixMismatch: "error",
+      }),
+    )
+    expect(unbound.body.thinking).toBeUndefined()
   }),
 )

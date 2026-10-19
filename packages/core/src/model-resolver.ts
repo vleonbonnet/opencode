@@ -4,6 +4,7 @@ import { makeLocationNode } from "@opencode/util/effect/app-node"
 import { HttpOptions, LanguageModel, mergeHttpOptions, ProviderConfigurationError } from "@opencode/ai"
 import { Auth } from "@opencode/ai/route"
 import { Context, Effect, Layer, Schema, Struct } from "effect"
+import { Hash } from "@opencode/util/hash"
 import { AISDK } from "./aisdk.js"
 import { Credential } from "./credential.js"
 import { Integration } from "./integration.js"
@@ -124,7 +125,40 @@ export interface Resolved {
   readonly transport?: Provider.Transport
   /** Milliseconds without streamed data before a WebSocket exchange fails; `false` disables the limit. */
   readonly chunkTimeout?: number | false
+  /** What the model's requests authenticate with, as {@link credentialIdentity} names it; undefined when nothing does. */
+  readonly credential?: string
 }
+
+const digest = (value: string) => Hash.sha256(value).slice(0, 16)
+
+/**
+ * A stable, non-secret name for what a model's requests authenticate with, for keying provider-side caches: it changes
+ * with the key or account, never when a token refreshes or a request is signed. A key names itself; an OAuth sign-in
+ * its account when the credential records one; an external source (Entra ID, Google ADC, an AWS profile) its method
+ * and the project, resource or profile it was set up with. Undefined when nothing stable identifies the credential (an
+ * OAuth sign-in without an account, the provider's ambient credentials): caches are then keyed by endpoint alone.
+ */
+export const credentialIdentity = (input: {
+  readonly credential: Credential.Value | undefined
+  readonly settings: Readonly<Record<string, unknown>> | undefined
+}): string | undefined => {
+  const credential = input.credential
+  if (credential?.type === "key") return `key:${digest(credential.key)}`
+  if (credential?.type === "oauth") {
+    const account = ["accountID", "accountId", "account_id"]
+      .map((name) => credential.metadata?.[name])
+      .find((value): value is string => typeof value === "string" && value !== "")
+    return account === undefined ? undefined : `account:${digest(`${credential.methodID}\u0000${account}`)}`
+  }
+  if (credential?.type === "external")
+    return `external:${digest(`${credential.methodID}\u0000${JSON.stringify(credential.metadata ?? {})}`)}`
+  const configured = [input.settings?.apiKey, input.settings?.authToken, input.settings?.accessToken].find(
+    (value): value is string => typeof value === "string" && value !== "",
+  )
+  return configured === undefined ? undefined : `key:${digest(configured)}`
+}
+
+const optionalCredential = (credential: string | undefined) => (credential === undefined ? {} : { credential })
 
 export interface Interface {
   readonly resolve: (requested?: Ref) => Effect.Effect<Resolved | undefined, Error>
@@ -406,6 +440,7 @@ export const layer = Layer.effect(
         compaction: runtimeInfo.settings?.compaction,
         transport: provider?.settings?.transport,
         chunkTimeout: Provider.timeout(provider?.settings?.chunkTimeout),
+        ...optionalCredential(credentialIdentity({ credential, settings: runtimeInfo.settings })),
       }
     })
     return Service.of({
