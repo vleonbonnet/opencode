@@ -162,11 +162,11 @@ const remember = <K, V>(map: Map<K, V>, key: K, value: V, limit: number) => {
 }
 
 /**
- * The thinking blocks the provider reported dropping, from a Step's provider state; undefined when it reported nothing
+ * The thinking blocks the provider reported dropping, from a Step's native data; undefined when it reported nothing
  * (an empty list is a report that nothing was dropped).
  */
-export const droppedPaths = (providerState: Record<string, unknown> | undefined): CacheLedger.Drop[] | undefined => {
-  const transformations = providerState?.inputTransformations
+export const droppedPaths = (native: Record<string, unknown> | undefined): CacheLedger.Drop[] | undefined => {
+  const transformations = native?.inputTransformations
   if (!Array.isArray(transformations)) return undefined
   return transformations.flatMap((item) =>
     isRecord(item) && item.type === "thinking_dropped" && typeof item.path === "string"
@@ -177,7 +177,7 @@ export const droppedPaths = (providerState: Record<string, unknown> | undefined)
 
 /** The signature (or redacted data) identifying a reasoning item's signed block, if it has one. */
 export const reasoningSignature = (item: SessionMessage.AssistantReasoning) => {
-  const signature = item.state?.signature ?? item.state?.redactedData
+  const signature = item.native?.signature ?? item.native?.redactedData
   return typeof signature === "string" && signature.length > 0 ? signature : undefined
 }
 
@@ -415,7 +415,7 @@ const layer = Layer.effect(
           event.data.assistantMessageID,
           sent,
           { input: event.data.tokens.input, read: event.data.tokens.cache.read, write: event.data.tokens.cache.write },
-          droppedPaths(event.data.providerState),
+          droppedPaths(event.data.native),
         )
       })
 

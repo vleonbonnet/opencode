@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { Effect, Schema } from "effect"
+import { Context, Effect, Schema } from "effect"
 import { CodeMode, Extension, Tool } from "../src/index.js"
 
 const held: Array<unknown> = []
@@ -349,6 +349,60 @@ describe("host errors", () => {
     expect(await value(`try { boom() } catch (e) { return e.status }`, target)).toBe(404)
     expect(reason.status).toBe(404)
     expect((await failure(`await get()`, target)).message).toBe('Uncaught: {"status":404,"nested":{"a":1}}')
+  })
+})
+
+describe("a global returning an Effect", () => {
+  class Caller extends Context.Service<Caller, { readonly name: string }>()("test/Caller") {}
+  const events: Array<string> = []
+  let interrupted = false
+  const effects = Extension.make({
+    name: "effects",
+    globals: {
+      who: () =>
+        Effect.gen(function* () {
+          events.push("run")
+          return (yield* Caller).name
+        }),
+      refuse: () => Effect.fail(new TypeError("refused")),
+      hang: () => Effect.never.pipe(Effect.onInterrupt(() => Effect.sync(() => (interrupted = true)))),
+    },
+  })
+  const hooks = {
+    "extension.before": () => Effect.sync(() => void events.push("before")),
+    "extension.after": () => Effect.sync(() => void events.push("after")),
+  } satisfies CodeMode.Hooks
+  const run = (code: string, target = CodeMode.make({ extensions: [effects], hooks })) =>
+    Effect.runPromise(target.execute(code).pipe(Effect.provideService(Caller, { name: "first" })))
+
+  test("runs in the execution's context, inside the extension hooks, and is awaited like a promise", async () => {
+    events.length = 0
+    const result = await run(`const pending = who(); return [pending instanceof Promise, await pending]`)
+    expect(result.ok && result.value).toEqual([true, "first"])
+    expect(events).toEqual(["before", "run", "after"])
+  })
+
+  test("a failure crosses as a rejection the program catches", async () => {
+    const result = await run(`try { await refuse() } catch (e) { return [e instanceof TypeError, e.message] }`)
+    expect(result.ok && result.value).toEqual([true, "refused"])
+  })
+
+  test("a before hook that fails stops it before it runs", async () => {
+    events.length = 0
+    const guarded = CodeMode.make({
+      extensions: [effects],
+      hooks: { "extension.before": (call) => Effect.fail(new Error(`${call.name} is not allowed`)) },
+    })
+    const result = await run(`try { await who() } catch (e) { return e.message }`, guarded)
+    expect(result.ok && result.value).toBe("who is not allowed")
+    expect(events).toEqual([])
+  })
+
+  test("ending the execution interrupts one the program did not await", async () => {
+    interrupted = false
+    const result = await run(`hang(); return 1`)
+    expect(result.ok && result.value).toBe(1)
+    expect(interrupted).toBe(true)
   })
 })
 

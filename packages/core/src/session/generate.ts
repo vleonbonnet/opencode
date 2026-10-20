@@ -11,7 +11,6 @@ import { SessionCache } from "./cache/service.js"
 import { SessionContext } from "./context.js"
 import type { AgentNotFoundError } from "./error.js"
 import { SessionHistory } from "./history.js"
-import { SessionProviderContext } from "./provider-context.js"
 import { SessionModelRequest } from "./model-request.js"
 import { ModelRetry } from "../model-retry.js"
 import type { SessionRunnerModel } from "./runner/model.js"
@@ -41,12 +40,7 @@ export const generate = Effect.fn("SessionGenerate.generate")(function* (input: 
     const cache = Option.getOrUndefined(yield* Effect.serviceOption(SessionCache.Service))
     const selection = yield* context.select(input.session.id)
     const model = yield* context.resolveModel(selection.session)
-    const history = yield* SessionHistory.preview(
-      database.db,
-      selection.session.id,
-      selection.instructions,
-      SessionProviderContext.provenance(model) ?? "local",
-    )
+    const history = yield* SessionHistory.preview(database.db, selection.session.id, selection.instructions, model.ref)
     const transcript = SessionModelRequest.baseTranscript({
       agent: selection.agent.info,
       model,

@@ -17,7 +17,6 @@ import { SessionContext } from "../context.js"
 import { SessionEvent } from "../event.js"
 import { SessionInbox } from "../inbox.js"
 import { SessionHistory } from "../history.js"
-import { SessionProviderContext } from "../provider-context.js"
 import { SessionModelRequest } from "../model-request.js"
 import { SessionModelTransport } from "../model-transport.js"
 import { SessionMessage } from "../message.js"
@@ -110,7 +109,7 @@ const layer = Layer.effect(
                   if (next?.type === "compaction")
                     yield* bus.publishAll([
                       [SessionEvent.InboxDelivered, { sessionID, inboxID: next.id }],
-                      [SessionEvent.Compaction.Started, { sessionID, reason: "manual", recent: "", inputID: next.id }],
+                      [SessionEvent.Compaction.Started, { sessionID, reason: "manual", inputID: next.id }],
                     ])
                   if (next?.type === "move")
                     yield* restore(
@@ -137,12 +136,7 @@ const layer = Layer.effect(
                     const selected = yield* context.select(sessionID)
                     const model = yield* context.resolveModel(selected.session)
                     // Preview updates without admitting them after the already-delivered compaction marker.
-                    const history = yield* SessionHistory.preview(
-                      db,
-                      sessionID,
-                      selected.instructions,
-                      SessionProviderContext.provenance(model) ?? "local",
-                    )
+                    const history = yield* SessionHistory.preview(db, sessionID, selected.instructions, model.ref)
                     return yield* compaction.compact({
                       reason: "manual",
                       inputID: pending.id,

@@ -233,8 +233,7 @@ const resolveCatalogModel = Effect.fn("ModelResolver.resolveCatalogModel")(funct
   dependencies?: Dependencies,
 ) {
   const resolved = prepareRuntimeModel(model)
-  const configuration = credential?.type === "key" ? credential.configuration : undefined
-  const configured = { ...resolved.settings, ...credential?.metadata, ...configuration }
+  const configured = { ...resolved.settings, ...credential?.metadata }
   if (Provider.isAISDK(resolved.package)) {
     const loadAISDK = dependencies?.loadAISDK
     if (!loadAISDK) return yield* unsupported(resolved)
@@ -243,7 +242,6 @@ const resolveCatalogModel = Effect.fn("ModelResolver.resolveCatalogModel")(funct
       Provider.mergeOverlay(resolved.settings, {
         ...nativeCredentialSettings(resolved, resolved.package ?? "", credential),
         ...credential?.metadata,
-        ...configuration,
       }) ?? {},
     )
     return yield* loadAISDK({ ...resolved, settings }).pipe(

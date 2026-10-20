@@ -25,7 +25,6 @@ import { SessionInbox } from "../inbox.js"
 import { SessionMessage } from "../message.js"
 import { SessionModelRequest } from "../model-request.js"
 import { SessionPrompt } from "../prompt.js"
-import { SessionProviderContext } from "../provider-context.js"
 import { MAX_STEPS_PROMPT } from "../runner/max-steps.js"
 import { SessionRunnerModel } from "../runner/model.js"
 import type { SessionSchema } from "../schema.js"
@@ -132,12 +131,9 @@ const predict = Effect.fn("SessionPreflight.predict")(function* (input: {
   const ref = { id: resolvedModel.ref.id, providerID: resolvedModel.ref.providerID }
 
   // History as the runner loads it, plus the instruction update the next Step would admit first.
-  const history = yield* SessionHistory.preview(
-    db,
-    sessionID,
-    selected.instructions,
-    SessionProviderContext.provenance(resolvedModel) ?? "local",
-  ).pipe(Effect.result)
+  const history = yield* SessionHistory.preview(db, sessionID, selected.instructions, resolvedModel.ref).pipe(
+    Effect.result,
+  )
   if (history._tag === "Failure")
     return yield* unknown(
       history.failure instanceof Instructions.InitializationBlocked

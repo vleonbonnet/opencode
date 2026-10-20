@@ -2,6 +2,7 @@ export * as CodeModeWeb from "./web.js"
 
 import { Extension } from "@opencode/codemode"
 import type { Context } from "@opencode/schema/tool"
+import { Effect } from "effect"
 import type { Permission } from "../permission.js"
 import type { WebFetchTool } from "../tool/plugin/webfetch.js"
 
@@ -31,40 +32,46 @@ export const permission = (request: Request, context: Context): Permission.Asser
 })
 
 /**
- * The `fetch` global of one execution. A request is sent only once `authorize` resolves; aborting `signal` when the
- * execution ends stops a request still in flight.
+ * The `fetch` global. A request is sent only once `authorize` succeeds. Both run as an Effect in the calling
+ * execution's context, so ending the execution interrupts them, withdrawing a pending permission request and
+ * aborting a request in flight.
  */
-export const extension = (authorize: (request: Request) => Promise<void>, signal: AbortSignal) => {
-  const fetch = async (input: string | URL, init: Init = {}) => {
-    if (URL.parse(String(input))?.protocol === "file:")
-      throw new Error("fetch cannot be used for filesystem access.")
-    await authorize(display([input, init]))
-    const response = await globalThis.fetch(input, {
-      method: init.method,
-      headers: init.headers,
-      body: init.body,
-      signal: AbortSignal.any([AbortSignal.timeout(TIMEOUT_MS), signal]),
+export const extension = <R>(authorize: (request: Request) => Effect.Effect<void, unknown, R>) => {
+  const fetch = (input: string | URL, init: Init = {}) =>
+    Effect.gen(function* () {
+      if (URL.parse(String(input))?.protocol === "file:")
+        return yield* Effect.fail(new Error("fetch cannot be used for filesystem access."))
+      yield* authorize(display([input, init]))
+      return yield* Effect.tryPromise({ try: (signal) => send(input, init, signal), catch: (reason) => reason })
     })
-    const bytes = await response.bytes()
-    const headers = Object.fromEntries(response.headers)
-    const text = () => new TextDecoder().decode(bytes)
-    return {
-      url: response.url,
-      status: response.status,
-      statusText: response.statusText,
-      ok: response.ok,
-      redirected: response.redirected,
-      headers: {
-        get: (name: string) => headers[name.toLowerCase()] ?? null,
-        has: (name: string) => name.toLowerCase() in headers,
-        entries: () => Object.entries(headers),
-      },
-      text: async () => text(),
-      json: async () => JSON.parse(text()) as unknown,
-      bytes: async () => bytes,
-    }
-  }
   return Extension.make({ name: "web", globals: { fetch } })
+}
+
+const send = async (input: string | URL, init: Init, signal: AbortSignal) => {
+  const response = await globalThis.fetch(input, {
+    method: init.method,
+    headers: init.headers,
+    body: init.body,
+    signal: AbortSignal.any([AbortSignal.timeout(TIMEOUT_MS), signal]),
+  })
+  const bytes = await response.bytes()
+  const headers = Object.fromEntries(response.headers)
+  const text = () => new TextDecoder().decode(bytes)
+  return {
+    url: response.url,
+    status: response.status,
+    statusText: response.statusText,
+    ok: response.ok,
+    redirected: response.redirected,
+    headers: {
+      get: (name: string) => headers[name.toLowerCase()] ?? null,
+      has: (name: string) => name.toLowerCase() in headers,
+      entries: () => Object.entries(headers),
+    },
+    text: async () => text(),
+    json: async () => JSON.parse(text()) as unknown,
+    bytes: async () => bytes,
+  }
 }
 
 /** What to show for a fetch call: its method and URL. */

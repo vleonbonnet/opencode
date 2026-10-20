@@ -135,7 +135,8 @@ export const extensionGlobals = <R>(
 
   // A host function as a program function. Arguments cross in; a global's call runs inside the host's extension
   // hooks, which see the host's own error on failure; then whatever came back, or was thrown, crosses out so the
-  // program catches a copy. Functions inside results are part of a value's API and skip the hooks.
+  // program catches a copy. A returned Effect runs in the execution's context, after the before hook, and the
+  // program awaits it like a promise. Functions inside results are part of a value's API and skip the hooks.
   const wrap = (value: Function, label: string, describe?: (args: ReadonlyArray<unknown>) => ExtensionInvocation) =>
     fn<R>(builtins, value.name, value.length, (_, values) => {
       const args = values.map((item, index) => toHost(item, `Argument ${index + 1} to ${label}`))
@@ -154,6 +155,7 @@ export const extensionGlobals = <R>(
       } catch (reason) {
         return settle(Effect.fail(reason))
       }
+      if (Effect.isEffect(result)) return ctx.pending.create(settle(result as Effect.Effect<unknown, unknown, R>))
       if (!(result instanceof Promise)) return settle(Effect.succeed(result))
       return ctx.pending.create(settle(Effect.tryPromise({ try: () => result, catch: (reason) => reason })))
     })
