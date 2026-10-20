@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { Context, Effect, Schema } from "effect"
+import { Context, Deferred, Effect, Exit, Schema } from "effect"
 import { CodeMode, Extension, Tool } from "../src/index.js"
 
 const held: Array<unknown> = []
@@ -356,6 +356,7 @@ describe("a global returning an Effect", () => {
   class Caller extends Context.Service<Caller, { readonly name: string }>()("test/Caller") {}
   const events: Array<string> = []
   let interrupted = false
+  let gate = Deferred.makeUnsafe<void>()
   const effects = Extension.make({
     name: "effects",
     globals: {
@@ -366,6 +367,15 @@ describe("a global returning an Effect", () => {
         }),
       refuse: () => Effect.fail(new TypeError("refused")),
       hang: () => Effect.never.pipe(Effect.onInterrupt(() => Effect.sync(() => (interrupted = true)))),
+      gated: (tag: string) =>
+        Effect.gen(function* () {
+          events.push(`start ${tag}`)
+          yield* Deferred.await(gate)
+          events.push(`end ${tag}`)
+          return tag
+        }),
+      mark: (tag: string) => void events.push(tag),
+      open: () => void Deferred.doneUnsafe(gate, Exit.void),
     },
   })
   const hooks = {
@@ -403,6 +413,19 @@ describe("a global returning an Effect", () => {
     const result = await run(`hang(); return 1`)
     expect(result.ok && result.value).toBe(1)
     expect(interrupted).toBe(true)
+  })
+
+  // Host work, like a promise a global returns: it must not hold the program's turn while it waits.
+  test("the program goes on while one is pending, and several run at once", async () => {
+    events.length = 0
+    gate = Deferred.makeUnsafe<void>()
+    const result = await run(
+      `const a = gated("a"); const b = gated("b"); mark("program"); open(); return await Promise.all([a, b])`,
+      CodeMode.make({ extensions: [effects], limits: { timeoutMs: 2000 } }),
+    )
+    expect(result.ok && result.value).toEqual(["a", "b"])
+    expect(events.slice(0, 3)).toEqual(["start a", "start b", "program"])
+    expect(events.slice(3).sort()).toEqual(["end a", "end b"])
   })
 })
 

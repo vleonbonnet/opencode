@@ -4,8 +4,8 @@ export * as Extension from "./extension.js"
  * Host functions a program calls directly as globals. Values crossing in either direction are converted, never
  * shared: arguments come in as copies, results go out as copies, and a function inside a result is callable the
  * same way. A global that returns an Effect runs it in the calling execution's context, with the runtime's services
- * and inside its extension hooks, and the program awaits its result; ending the execution interrupts it. Extension
- * calls are not tool calls.
+ * and inside its extension hooks, and the program awaits its result; like a returned promise it runs concurrently
+ * with the program, and ending the execution interrupts it. Extension calls are not tool calls.
  */
 export type Extension = {
   readonly name: string
