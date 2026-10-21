@@ -238,10 +238,12 @@ describe("legacy directory command behavior", () => {
         "/workspace",
       ),
     )
+    // PowerShell commands are also spelled as the cmdlet they run.
+    const spelled = (alternates: string[]) => (shell === "pwsh" ? { alternates } : {})
     expect(result).toEqual({
       commands: [
-        { resource: "sl .", save: "sl *" },
-        { resource: "pop-location", save: "pop-location *" },
+        { resource: "sl .", save: "sl *", ...spelled(["Set-Location ."]) },
+        { resource: "pop-location", save: "pop-location *", ...spelled(["Pop-Location"]) },
       ],
       directories: ["/outside", "/elsewhere", "/stack"],
     })

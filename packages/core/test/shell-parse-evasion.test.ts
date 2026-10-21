@@ -396,3 +396,87 @@ describe("ShellParse rules see the words after a redirect", () => {
     expect(await matched(command, rule)).toBe(true)
   })
 })
+
+// The rules denying a recursive Remove-Item, whatever spelling runs it.
+const REMOVE_RECURSE = ["Remove-Item -Recurse *", "Remove-Item * -Recurse *"]
+
+// Whether a rule of RULES sees COMMAND in both scanners, as `matched` does for one rule.
+async function matchedAny(command: string, rules: readonly string[], shell = "/bin/bash") {
+  const results = await seen(command, shell)
+  expect(results.some(Boolean), `${command}: refused by both scanners`).toBe(true)
+  return results.every((texts) => !texts || texts.some((text) => rules.some((rule) => Wildcard.match(text, rule))))
+}
+
+// -EncodedCommand's argument: Base64 of UTF-16LE text.
+function encoded(script: string) {
+  return Buffer.from(script, "utf16le").toString("base64")
+}
+
+describe("ShellParse rules see the cmdlet a PowerShell command runs, with its parameters' full names", () => {
+  test.each([
+    "Remove-Item -Recurse C:\\x",
+    "Remove-Item C:\\x -Recurse",
+    "remove-item -recurse x",
+    "Remove-Item -Force -Recurse -Path x",
+    "Remove-Item -r x",
+    "Remove-Item x -rec -fo",
+    "Remove-Item x -Recurse:$true",
+    "rm -Recurse x",
+    "ri -r x",
+    "del x -Recurse",
+    "erase -rec x",
+    "rd -r x",
+    "rmdir x -Recurse",
+    "RM -R x",
+    "Microsoft.PowerShell.Management\\Remove-Item -Recurse x",
+    "& Remove-Item -Recurse x",
+    "& 'Remove-Item' -Recurse x",
+    "Get-ChildItem x | Remove-Item -Recurse",
+    "if (Test-Path x) { Remove-Item x -Recurse -Force }",
+    "foreach ($d in $dirs) { rm $d -r }",
+    "$null = Remove-Item -Recurse x",
+    "pwsh -c 'Remove-Item -Recurse x'",
+    `powershell -EncodedCommand ${encoded("Remove-Item -Recurse x")}`,
+  ])("%s", async (command) => {
+    expect(await matchedAny(command, REMOVE_RECURSE, "pwsh")).toBe(true)
+  })
+
+  test.each([
+    "Remove-Item x",
+    "Remove-Item x -Force",
+    "Remove-Item x -Recurse:$false",
+    "Remove-Item '-Recurse' x",
+    "Get-ChildItem -Recurse x",
+    "Write-Output 'Remove-Item -Recurse x'",
+  ])("does not see a recursive Remove-Item in %s", async (command) => {
+    expect(await matchedAny(command, REMOVE_RECURSE, "pwsh")).toBe(false)
+  })
+
+  test.each([
+    `powershell -Command "Remove-Item -Recurse x"`,
+    `pwsh -NoProfile -c 'Get-Date; Remove-Item x -Recurse'`,
+    `powershell.exe -c "rm -r x"`,
+    `pwsh -EncodedCommand ${encoded("Get-Date\nri -rec x")}`,
+    `echo 'Remove-Item -Recurse x' | pwsh -Command -`,
+    `bash -c "pwsh -c 'Remove-Item -Recurse x'"`,
+    `pwsh -c "pwsh -c 'del -r x'"`,
+  ])("reads the scripts bash hands to PowerShell: %s", async (command) => {
+    expect(await matchedAny(command, REMOVE_RECURSE)).toBe(true)
+  })
+
+  test("keeps each PowerShell command as written for the rules", async () => {
+    const [legacy] = await seen("rm -r x; Remove-Item y", "pwsh")
+    expect(legacy).toEqual(["rm -r x", "Remove-Item -Recurse x", "Remove-Item y"])
+  })
+
+  test("refuses PowerShell scripts nested past the depth it follows, in both scanners", async () => {
+    const levels = (count: number) =>
+      Array.from({ length: count }).reduce<string>(
+        (script) => `pwsh -EncodedCommand ${encoded(script)}`,
+        "Get-ChildItem",
+      )
+    for (const result of await scans(levels(5)))
+      expect(result instanceof Error ? result.message : result).toContain("nests")
+    for (const result of await scans(levels(4))) expect(result).not.toBeInstanceOf(Error)
+  })
+})

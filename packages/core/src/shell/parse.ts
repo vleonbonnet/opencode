@@ -6,6 +6,7 @@ import os from "os"
 import path from "path"
 import type { Node } from "web-tree-sitter"
 import { shellParserWasm } from "#shell-parser-wasm"
+import { ShellPowerShell } from "./powershell.js"
 import type { ShellScan } from "./scan.js"
 import { ShellSelect } from "./select.js"
 import { ShellUnwrap } from "./unwrap.js"
@@ -222,12 +223,33 @@ const scanLegacy = Effect.fnUntraced(function* (command: string, shell: string, 
       nested.delete()
     }
   }
+  // The commands of a script handed to PowerShell: what Tree-sitter finds in it, errors and all.
+  const powershellCommands = (text: string) => {
+    const nested = parsers.ps.parse(text)
+    if (!nested) return
+    try {
+      return nested.rootNode
+        .descendantsOfType("command")
+        .filter((node): node is Node => Boolean(node))
+        .map((node) => ({ text: node.text.trim(), words: powershellWords(node, text) }))
+    } finally {
+      nested.delete()
+    }
+  }
   const output = yield* Effect.acquireUseRelease(
     Effect.succeed(tree),
     (tree) =>
       Effect.sync(() => {
         const output = collector()
-        const options: Options = { powershell, posix: posix(shell), cwd, shell, dialect: dialect(shell), commands }
+        const options: Options = {
+          powershell,
+          posix: posix(shell),
+          cwd,
+          shell,
+          dialect: dialect(shell),
+          commands,
+          powershellCommands,
+        }
         const scripts = legacyCommands(output, tree.rootNode, command, options, ShellScan.heredocExtent)
         // A script is read as the command is: what Tree-sitter finds in it, errors and all.
         follow(output, scripts, (script) => {
@@ -265,7 +287,10 @@ type Options = {
   dialect: ShellUnwrap.Dialect
   // The commands of a script, as unwrapped; none when the script cannot be read.
   commands: (script: Script) => ShellUnwrap.Unwrapped[] | undefined
+  // The commands of a script handed to PowerShell, each as written and as its words; none when it cannot be read.
+  powershellCommands: (text: string) => PowerShellCommand[] | undefined
 }
+type PowerShellCommand = { text: string; words: string[] }
 type Script = ShellUnwrap.Script
 type Extent = typeof ShellScan.heredocExtent
 
@@ -310,7 +335,9 @@ function legacyCommands(output: Collector, root: Node, source: string, options: 
     }
     const save = `${prefix(tokens).join(" ")} *`
     if (!options.posix) {
-      output.command(text(node), save)
+      if (options.powershell)
+        powershellCommand(output, { text: text(node), words: powershellWords(node, source) }, save, options)
+      else output.command(text(node), save)
       continue
     }
     const words = legacyWords(node, source, heredocs.ranges)
@@ -324,6 +351,7 @@ function legacyCommands(output: Collector, root: Node, source: string, options: 
     }
     const found = expand(output, text(node), save, words, options.dialect, assignments)
     scripts.push(...found.scripts)
+    powershellScripts(output, found.powershell, options)
     const downstream = legacyDownstream(node)
     if (downstream.length)
       reads.push(...piped(found, () => downstream.map((item) => unwrapNode(item, source, options)), options))
@@ -546,7 +574,23 @@ export const scanPortable = Effect.fnUntraced(function* (command: string, shell:
       .filter((item) => !item.declaration && !item.assignment)
       .map((item) => ShellUnwrap.unwrap(portableWords(item), script.dialect))
   }
-  const options: Options = { powershell, posix: posix(shell), cwd, shell, dialect: dialect(shell), commands }
+  // The commands of a script handed to PowerShell, as those of a PowerShell command are read.
+  const powershellCommands = (text: string) => {
+    const nested = ShellScan.scanPowerShell(text)
+    if (nested.kind === "opaque") return
+    return nested.commands
+      .filter((item) => !item.declaration && !item.assignment && !foreachBlock(item))
+      .map((item) => ({ text: item.resource, words: portableWords(item) }))
+  }
+  const options: Options = {
+    powershell,
+    posix: posix(shell),
+    cwd,
+    shell,
+    dialect: dialect(shell),
+    commands,
+    powershellCommands,
+  }
   const result = powershell
     ? statementsOf(ShellScan.scanPowerShell(command))
     : ShellScan.statements(command, options.dialect)
@@ -575,6 +619,18 @@ function statementsOf(result: ShellScan.Result): ShellScan.Statements {
   return result.kind === "opaque" ? result : { ...result, heredocs: [], places: new Map(), downstream: new Map() }
 }
 
+// Whether a PowerShell ITEM is a bare statement-head foreach block, which the shipped PowerShell grammar treats as
+// control flow rather than a command.
+function foreachBlock(item: Command) {
+  const words = portableWords(item)
+  return (
+    item.statementHead === true &&
+    /^foreach(?:-|$)/i.test(words[0] ?? "") &&
+    words.length > 1 &&
+    words.slice(1).every((word) => word.startsWith("{"))
+  )
+}
+
 // Adds the commands the portable scanner found and returns the script strings they hand to a shell.
 function portableCommands(output: Collector, scanned: Portable, options: Options) {
   const { powershell, cwd, shell } = options
@@ -596,15 +652,7 @@ function portableCommands(output: Collector, scanned: Portable, options: Options
       continue
     }
     const words = portableWords(item)
-    // The shipped PowerShell grammar treats bare statement-head foreach blocks as control flow.
-    if (
-      powershell &&
-      item.statementHead &&
-      /^foreach(?:-|$)/i.test(words[0] ?? "") &&
-      words.length > 1 &&
-      words.slice(1).every((word) => word.startsWith("{"))
-    )
-      continue
+    if (powershell && foreachBlock(item)) continue
     const name = powershell ? words[0]?.toLowerCase() : words[0]
     if (CWD.has(name)) {
       output.result.directories.push(
@@ -652,12 +700,14 @@ function portableCommands(output: Collector, scanned: Portable, options: Options
             return `${item.resource.slice(0, boundary)}${separator ?? " "}*`
           })()
     if (!options.posix) {
-      output.command(resource, save)
+      if (powershell) powershellCommand(output, { text: resource, words }, save, options)
+      else output.command(resource, save)
       continue
     }
     const assignments = place?.assignments.map((item) => without(item.raw, item.start, spans)) ?? []
     const found = expand(output, resource, save, cutWords(words), options.dialect, assignments)
     scripts.push(...found.scripts)
+    powershellScripts(output, found.powershell, options)
     const downstream = scanned.downstream.get(item)
     if (downstream)
       reads.push(
@@ -718,8 +768,9 @@ type Input = {
 }
 
 // What the commands reading an input do with it: the scripts to check that run it, its text to check whole when an
-// interpreter runs it, the commands composed from it, and whether it is only data.
-type Read = { data: boolean; scripts: Script[]; texts: string[]; views: ShellUnwrap.View[] }
+// interpreter runs it and, when that is PowerShell, command by command as well, the commands composed from it, and
+// whether it is only data.
+type Read = { data: boolean; scripts: Script[]; texts: string[]; powershell: string[]; views: ShellUnwrap.View[] }
 
 // What the commands reading INPUT do with it (see ShellUnwrap.reading). The commands of a -c script reading it read
 // it in turn, and a file it is written to that a later command runs is run as a script, as a program, or as its
@@ -730,6 +781,7 @@ function read(input: Input, options: Options, depth = 1): Read {
     data: !reading.code,
     scripts: [...reading.scripts],
     texts: reading.text ? [input.text] : [],
+    powershell: reading.powershell ? [input.text] : [],
     views: [...reading.views],
   }
   for (const script of reading.nested) {
@@ -742,6 +794,7 @@ function read(input: Input, options: Options, depth = 1): Read {
     result.data &&= inner.data
     result.scripts.push(...inner.scripts)
     result.texts.push(...inner.texts)
+    result.powershell.push(...inner.powershell)
     result.views.push(...inner.views)
   }
   const tees = input.readers.flatMap((item) =>
@@ -786,11 +839,20 @@ function emit(output: Collector, reads: readonly Read[], options: Options) {
   const scripts: Script[] = []
   for (const item of reads) {
     for (const text of item.texts) output.extra(text, exact(text))
-    for (const view of item.views)
-      scripts.push(
-        ...expand(output, ShellUnwrap.text(view), undefined, [view.program, ...view.args], options.dialect, [], true)
-          .scripts,
+    powershellScripts(output, item.powershell, options)
+    for (const view of item.views) {
+      const found = expand(
+        output,
+        ShellUnwrap.text(view),
+        undefined,
+        [view.program, ...view.args],
+        options.dialect,
+        [],
+        true,
       )
+      scripts.push(...found.scripts)
+      powershellScripts(output, found.powershell, options)
+    }
     scripts.push(...item.scripts)
   }
   return scripts
@@ -838,6 +900,16 @@ function collector() {
       seen.add(resource)
       push(resource, save, alternates)
     },
+    // Lists RESOURCE as `extra` does, or adds ALTERNATES to it when it is listed already.
+    respelled(resource: string, save: string | undefined, alternates: readonly string[]) {
+      const listed = result.commands.find((item) => item.resource === resource)
+      if (!listed) {
+        seen.add(resource)
+        return push(resource, save, alternates)
+      }
+      const others = [...new Set([...(listed.alternates ?? []), ...alternates])].filter((item) => item !== resource)
+      if (others.length) listed.alternates = others
+    },
     fail(reason: string) {
       failures.push(reason)
     },
@@ -883,6 +955,32 @@ function expand(
   }
   for (const text of found.texts) output.extra(text, exact(text))
   return found
+}
+
+// Emits COMMAND of a PowerShell script DEPTH scripts deep, with the spelling of the cmdlet it runs, saved as SAVE,
+// then reads the scripts it hands to PowerShell in turn.
+function powershellCommand(
+  output: Collector,
+  command: PowerShellCommand,
+  save: string | undefined,
+  options: Options,
+  depth = 0,
+) {
+  const spellings = ShellPowerShell.spellings(command.words)
+  if (depth === 0) output.command(command.text, save, spellings)
+  else output.respelled(command.text, save, spellings)
+  powershellScripts(output, ShellUnwrap.powershellScripts(command.words), options, depth + 1)
+}
+
+// Reads each script of TEXTS handed to PowerShell DEPTH scripts deep command by command, as a POSIX script is read,
+// while the script stays checked whole as written as well. One that cannot be read is checked whole only.
+function powershellScripts(output: Collector, texts: readonly string[], options: Options, depth = 1) {
+  if (!texts.length) return
+  if (depth > ShellUnwrap.MAX_SCRIPT_DEPTH)
+    return output.fail(`Shell command nests scripts more than ${ShellUnwrap.MAX_SCRIPT_DEPTH} levels deep`)
+  for (const text of texts)
+    for (const command of options.powershellCommands(text) ?? [])
+      if (command.words.length) powershellCommand(output, command, exact(command.text), options, depth)
 }
 
 // The command as its bare program name runs it, when that differs from the program as written.
@@ -966,6 +1064,33 @@ function parts(node: Node) {
       return []
     return [{ type: child.type, text: child.text }]
   })
+}
+
+// The words of a PowerShell command NODE parsed from SOURCE, as the portable scanner reads them: quotes kept, and a
+// parameter given its value after a colon (`-Recurse:$false`) as one word, which the grammar parses apart.
+function powershellWords(node: Node, source: string) {
+  const items = Array.from({ length: node.childCount }).flatMap((_, index): Node[] => {
+    const child = node.child(index)
+    if (!child) return []
+    if (child.type === "command_elements")
+      return Array.from({ length: child.childCount }).flatMap((_, itemIndex): Node[] => {
+        const item = child.child(itemIndex)
+        return item && item.type !== "command_argument_sep" && item.type !== "redirection" ? [item] : []
+      })
+    return child.type === "command_name" || child.type === "command_name_expr" ? [child] : []
+  })
+  const words: string[] = []
+  for (let index = 0; index < items.length; index++) {
+    const item = items[index]
+    const next = items[index + 1]
+    if (item.type === "command_parameter" && next && source.slice(item.endIndex, next.startIndex) === ":") {
+      words.push(source.slice(item.startIndex, next.endIndex))
+      index++
+      continue
+    }
+    words.push(item.text)
+  }
+  return words
 }
 
 function directoryArgs(command: Part[], powershell: boolean, cwd: string, shell: string) {

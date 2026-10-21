@@ -19,6 +19,8 @@ export type Unwrapped = {
   assignments: string[]
   // Script text handed to a shell whose language is not POSIX shell (pwsh, cmd, fish, csh), checked as written.
   texts: string[]
+  // Those of the texts handed to PowerShell, which are also checked command by command.
+  powershell: string[]
   // More commands than MAX_VIEWS, so not all of them were found.
   truncated?: true
 }
@@ -378,7 +380,7 @@ const FIND_EXECS = new Set(["-exec", "-execdir", "-ok", "-okdir"])
 // pass. DIALECT is the shell reading the words, which `eval` runs its script in. Each inner command has fewer words
 // than the one running it, so the walk ends.
 export function unwrap(words: readonly string[], dialect: Dialect = "posix"): Unwrapped {
-  const result: Unwrapped = { views: [], scripts: [], assignments: [], texts: [] }
+  const result: Unwrapped = { views: [], scripts: [], assignments: [], texts: [], powershell: [] }
   if (!words.length) return result
   result.views.push(view(words, 0, dialect))
   for (let i = 0; i < result.views.length; i++) {
@@ -395,6 +397,7 @@ export function unwrap(words: readonly string[], dialect: Dialect = "posix"): Un
         result.scripts.push(script)
     for (const word of step.assignments) if (!result.assignments.includes(word)) result.assignments.push(word)
     for (const text of step.texts) if (!result.texts.includes(text)) result.texts.push(text)
+    for (const text of step.powershell) if (!result.powershell.includes(text)) result.powershell.push(text)
   }
   return result
 }
@@ -412,7 +415,7 @@ function implied(): View {
 }
 
 function empty(): Step {
-  return { views: [], scripts: [], assignments: [], texts: [] }
+  return { views: [], scripts: [], assignments: [], texts: [], powershell: [] }
 }
 
 // The commands and script strings one command runs on behalf of its words.
@@ -425,7 +428,10 @@ function inner(item: View, dialect: Dialect): Step {
     }
   if (name === "find") return { ...empty(), views: execs(item.args, dialect) }
   if (SHELLS[name]) return shell(item, SHELLS[name]).step
-  if (POWERSHELLS.has(name)) return { ...empty(), texts: powershell(item.args) }
+  if (POWERSHELLS.has(name)) {
+    const texts = powershell(item.args)
+    return { ...empty(), texts, powershell: texts }
+  }
   if (name === "cmd") return { ...empty(), texts: cmd(item.args) }
   if (name === "fish") return { ...empty(), texts: fish(item.args) }
   if (name === "csh" || name === "tcsh") return { ...empty(), texts: csh(item.args) }
@@ -651,6 +657,11 @@ function positional(text: string, params: readonly string[]) {
 // VALUE as one shell word.
 export function quote(value: string) {
   return /^[A-Za-z0-9_@%+=:,./-]+$/.test(value) ? value : `'${value.replaceAll("'", `'\\''`)}'`
+}
+
+// The command text the PowerShell command written as WORDS hands to PowerShell, when it runs PowerShell itself.
+export function powershellScripts(words: readonly string[]) {
+  return words.length && POWERSHELLS.has(program(words[0]).toLowerCase()) ? powershell(words.slice(1)) : []
 }
 
 // PowerShell's command text: what -Command, -CommandWithArgs or -EncodedCommand give, or the words it runs as a
@@ -1271,13 +1282,21 @@ function fileOperand(raw: string) {
 
 // What the commands reading an input do with it, from those commands as unwrapped and the input's TEXT: the shells
 // that run it as a script, each in its dialect; whether an interpreter runs it as a program in another language,
-// which is checked as text; the commands xargs composes from it; the -c scripts whose commands read it, for the
-// caller to read in turn; and whether anything else turns it into code or arguments. An input nothing does is data.
-// DIALECT is the shell running the readers, which `source /dev/stdin` reads it in.
-export type Reading = { scripts: Script[]; text: boolean; views: View[]; nested: Script[]; code: boolean }
+// which is checked as text, and whether that language is PowerShell; the commands xargs composes from it; the -c
+// scripts whose commands read it, for the caller to read in turn; and whether anything else turns it into code or
+// arguments. An input nothing does is data. DIALECT is the shell running the readers, which `source /dev/stdin` reads
+// it in.
+export type Reading = {
+  scripts: Script[]
+  text: boolean
+  powershell: boolean
+  views: View[]
+  nested: Script[]
+  code: boolean
+}
 
 export function reading(found: readonly Unwrapped[], input: string, dialect: Dialect): Reading {
-  const result: Reading = { scripts: [], text: false, views: [], nested: [], code: false }
+  const result: Reading = { scripts: [], text: false, powershell: false, views: [], nested: [], code: false }
   const run = (target: Dialect) => {
     if (!result.scripts.some((item) => item.dialect === target)) result.scripts.push({ text: input, dialect: target })
   }
@@ -1298,7 +1317,10 @@ export function reading(found: readonly Unwrapped[], input: string, dialect: Dia
         if (STDIN.has(words[0] ?? "")) run(dialect)
         else result.code = true
       } else if (NON_POSIX_SHELLS.has(name)) {
-        if (nonPosixReads(name, words)) result.text = true
+        if (nonPosixReads(name, words)) {
+          result.text = true
+          if (POWERSHELLS.has(name)) result.powershell = true
+        }
       } else if (name === "at" || name === "batch") {
         if (!words.some((word) => /^-[A-Za-z]*[fldrc]/.test(word))) run("posix")
       } else if (name === "crontab") {
