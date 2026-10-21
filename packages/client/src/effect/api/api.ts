@@ -1453,6 +1453,17 @@ export interface GenerateApi<E = never> {
   readonly text: GenerateTextOperation<E>
 }
 
+export type VoiceModelsOutput = {
+  readonly models: ReadonlyArray<{
+    readonly model: string
+    readonly provider: string
+    readonly transports: ReadonlyArray<"webrtc" | "websocket">
+    readonly available: boolean
+  }>
+  readonly default?: string | undefined
+}
+export type VoiceModelsOperation<E = never> = () => Effect.Effect<VoiceModelsOutput, E>
+
 export type VoiceSessionInput = {
   readonly model: string
   readonly session?: { readonly [x: string]: unknown } | undefined
@@ -1468,6 +1479,7 @@ export type VoiceSessionOutput = {
 export type VoiceSessionOperation<E = never> = (input: VoiceSessionInput) => Effect.Effect<VoiceSessionOutput, E>
 
 export interface VoiceApi<E = never> {
+  readonly models: VoiceModelsOperation<E>
   readonly session: VoiceSessionOperation<E>
 }
 
