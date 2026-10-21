@@ -219,6 +219,8 @@ const makeRunnerState = (compaction?: SessionRunnerModel.Resolved["compaction"])
     authorizations: new Array<Tool.Context>(),
     executions: new Array<string>(),
     closedTransports: new Array<Session.ID>(),
+    // Sessions whose drain named a declined tool call as its stop, in call order.
+    declineReports: new Array<Session.ID>(),
     blockTools: (count = 1) =>
       Effect.acquireRelease(
         Effect.all({ started: Deferred.make<void>(), release: Deferred.make<void>() }).pipe(
@@ -446,7 +448,12 @@ const layer = Layer.unwrap(
           continuation?: SessionRunner.Continuation,
         ): Effect.Effect<void, SessionRunner.RunError> {
           return sessionRunner
-            .drain({ sessionID, force, continuation })
+            .drain({
+              sessionID,
+              force,
+              continuation,
+              reportDeclined: () => Effect.sync(() => void state.declineReports.push(sessionID)),
+            })
             .pipe(
               Effect.flatMap((result) =>
                 result._tag === "Complete" ? Effect.void : drain(sessionID, false, result.continuation),
@@ -5110,6 +5117,9 @@ describe("SessionRunnerLLM", () => {
 
     expect(exit._tag).toBe("Failure")
     if (exit._tag === "Failure") expect(Cause.hasInterruptsOnly(exit.cause)).toBe(true)
+    // The step names the stop before interrupting, so settlement can release the declined turn
+    // instead of reading the interrupt as an unowned teardown and resuming it after a restart.
+    expect(s.declineReports).toEqual([sessionID])
     expect(s.requests).toHaveLength(1)
     expect(yield* s.context).toMatchObject([
       Expected.user("Call declined"),
@@ -5151,6 +5161,8 @@ describe("SessionRunnerLLM", () => {
 
     yield* s.resume
 
+    // Feedback keeps the turn going, so it is no stop at all.
+    expect(s.declineReports).toEqual([])
     expect(s.requests).toHaveLength(2)
     expect(yield* s.context).toMatchObject([
       Expected.user("Call corrected"),
@@ -5215,6 +5227,8 @@ describe("SessionRunnerLLM", () => {
 
     expect(exit._tag).toBe("Failure")
     if (exit._tag === "Failure") expect(Cause.hasInterruptsOnly(exit.cause)).toBe(true)
+    // Dismissing a question is the user's stop too.
+    expect(s.declineReports).toEqual([sessionID])
     expect(s.requests).toHaveLength(1)
     expect(yield* s.context).toMatchObject([
       Expected.user("Ask then stop"),
