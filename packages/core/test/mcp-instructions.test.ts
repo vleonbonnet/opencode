@@ -171,7 +171,7 @@ describe("McpInstructions", () => {
     ),
   )
 
-  it.effect("restates guidance when Code Mode is disabled for a server", () => {
+  it.effect("replaces a server entry when Code Mode is disabled for it", () => {
     let tools: Mcp.Tool[] = [tool("alpha")]
     return Effect.gen(function* () {
       const service = yield* McpInstructions.Service
@@ -181,12 +181,10 @@ describe("McpInstructions", () => {
       const changed = yield* readUpdate(yield* service.load([[]]), initialized)
       expect(changed.text).toBe(
         [
-          "The available MCP server instructions have changed. This list supersedes the previous one.",
-          "<mcp_instructions>",
+          "The following MCP server instructions have changed. Each entry replaces the previously listed server with the same name:",
           '  <server name="alpha">',
           "    Alpha instructions",
           "  </server>",
-          "</mcp_instructions>",
         ].join("\n"),
       )
     }).pipe(
@@ -222,17 +220,11 @@ describe("McpInstructions", () => {
       const changed = yield* readUpdate(yield* service.load([[]]), added)
       expect(changed.text).toBe(
         [
-          "The available MCP server instructions have changed. This list supersedes the previous one.",
-          "<mcp_instructions>",
+          "The following MCP server instructions have changed. Each entry replaces the previously listed server with the same name:",
           '  <server name="alpha">',
           '    Use tools from this server through `execute` under `tools["alpha"]`.',
           "    Updated alpha",
           "  </server>",
-          '  <server name="beta">',
-          '    Use tools from this server through `execute` under `tools["beta"]`.',
-          "    Beta instructions",
-          "  </server>",
-          "</mcp_instructions>",
         ].join("\n"),
       )
 

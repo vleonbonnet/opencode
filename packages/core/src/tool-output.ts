@@ -33,6 +33,8 @@ export interface Interface extends State.Transformable<Editor> {
   readonly truncate: (result: Result) => Effect.Effect<Result>
   /** Bounds a failed call's model-visible error text with the same limits, saving any text it cuts. */
   readonly truncateError: (error: SessionError.Error) => Effect.Effect<SessionError.Error>
+  /** Writes bytes the model cannot receive inline to a retained file and returns its path. */
+  readonly save: (bytes: Uint8Array, extension: string) => Effect.Effect<string>
   readonly cleanup: () => Effect.Effect<void>
 }
 
@@ -103,7 +105,7 @@ const layer = Layer.effect(
       }
     }
 
-    const save = Effect.fnUntraced(function* (text: string) {
+    const saveText = Effect.fnUntraced(function* (text: string) {
       const file = path.join(directory, fileName())
       yield* fs.ensureDir(directory)
       yield* fs.writeFileString(file, text)
@@ -114,7 +116,7 @@ const layer = Layer.effect(
     const cut = Effect.fnUntraced(function* (text: string, label: string) {
       const bounded = bound(text, false)
       if (bounded === undefined) return undefined
-      const file = yield* save(text).pipe(Effect.orDie)
+      const file = yield* saveText(text).pipe(Effect.orDie)
       return { kept: bounded.kept, file, marker: `[showing ${bounded.shown}; full ${label} saved to ${file}]` }
     })
 
@@ -122,7 +124,7 @@ const layer = Layer.effect(
     const cutError = Effect.fnUntraced(function* (text: string, label: string) {
       const bounded = bound(text, true)
       if (bounded === undefined) return undefined
-      const saved = yield* save(text).pipe(
+      const saved = yield* saveText(text).pipe(
         Effect.map((file) => `full ${label} saved to ${file}`),
         Effect.catch((error) =>
           Effect.logWarning("failed to save truncated tool error", { error }).pipe(
@@ -181,11 +183,18 @@ const layer = Layer.effect(
       }
     })
 
+    const save = Effect.fnUntraced(function* (bytes: Uint8Array, extension: string) {
+      const file = path.join(directory, fileName() + extension)
+      yield* fs.writeWithDirs(file, bytes).pipe(Effect.orDie)
+      return file
+    })
+
     return Service.of({
       transform: state.transform,
       reload: state.reload,
       truncate,
       truncateError,
+      save,
       cleanup: () => cleanup(fs, directory),
     })
   }),

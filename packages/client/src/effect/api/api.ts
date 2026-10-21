@@ -718,6 +718,7 @@ export type SessionLogOutput =
               readonly message: string
               readonly status?: number | undefined
               readonly response?: { readonly body: string } | undefined
+              readonly retryAfterMs?: number | undefined
             }
           }
         }
@@ -885,6 +886,7 @@ export type SessionLogOutput =
               readonly message: string
               readonly status?: number | undefined
               readonly response?: { readonly body: string } | undefined
+              readonly retryAfterMs?: number | undefined
             }
             readonly finish?: "content-filter" | undefined
             readonly rawFinish?: string | undefined
@@ -1073,6 +1075,7 @@ export type SessionLogOutput =
               readonly message: string
               readonly status?: number | undefined
               readonly response?: { readonly body: string } | undefined
+              readonly retryAfterMs?: number | undefined
             }
             readonly content?:
               | readonly [
@@ -1120,6 +1123,7 @@ export type SessionLogOutput =
               readonly message: string
               readonly status?: number | undefined
               readonly response?: { readonly body: string } | undefined
+              readonly retryAfterMs?: number | undefined
             }
           }
         }
@@ -1181,6 +1185,7 @@ export type SessionLogOutput =
               readonly message: string
               readonly status?: number | undefined
               readonly response?: { readonly body: string } | undefined
+              readonly retryAfterMs?: number | undefined
             }
             readonly inputID?: SessionMessage.ID | undefined
             readonly cost?: Money.USD | undefined

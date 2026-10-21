@@ -424,7 +424,7 @@ export const layer = Layer.effect(
       const modelHook = yield* hooks.trigger("session", "model.request", {
         ...scope,
         ...dryRun,
-        baseURL: typeof baseURL === "string" ? baseURL : undefined,
+        baseURL,
         headers: { ...base.http?.headers },
       })
       const route =
