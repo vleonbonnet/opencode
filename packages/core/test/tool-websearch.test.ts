@@ -1,5 +1,6 @@
 import { describe, expect } from "bun:test"
-import { Context, Effect, Layer } from "effect"
+import { Context, Deferred, Effect, Fiber, Layer } from "effect"
+import { TestClock } from "effect/testing"
 import type { HttpClientError } from "effect/http"
 import { AppNodeBuilder } from "@opencode/core/effect/app-node-builder"
 import { LayerNode } from "@opencode/util/effect/layer-node"
@@ -223,7 +224,7 @@ describe("WebSearchTool registration", () => {
         {
           sessionID,
           title: "Web Search",
-          metadata: { kind: "websearch.provider" },
+          metadata: { kind: "websearch.provider", tool: { messageID: toolIdentity.messageID, id: "call-enable" } },
           fields: [
             {
               key: "choice",
@@ -298,10 +299,14 @@ describe("WebSearchTool registration", () => {
       expect(yield* fixture.kv.get(WebSearch.ProviderKey)).toBe(WebSearch.ID.make("parallel"))
       expect(fixture.websearch.queries).toHaveLength(2)
       expect(fixture.websearch.queries[1]?.providerID).toBe(WebSearch.ID.make("parallel"))
+      expect(fixture.formRequests[0]?.metadata).toEqual({
+        kind: "websearch.provider",
+        tool: { messageID: toolIdentity.messageID, id: "call-choose" },
+      })
       expect(fixture.formRequests[1]).toEqual({
         sessionID,
         title: "Choose a web search provider",
-        metadata: { kind: "websearch.provider" },
+        metadata: { kind: "websearch.provider", tool: { messageID: toolIdentity.messageID, id: "call-choose" } },
         fields: [
           {
             key: "provider",
@@ -316,6 +321,25 @@ describe("WebSearchTool registration", () => {
           },
         ],
       })
+    }),
+  )
+
+  it.effect("waits for the consent answer however long it takes", () =>
+    Effect.gen(function* () {
+      const fixture = yield* setup
+      const answered = yield* Deferred.make<void>()
+      fixture.formWait = Deferred.await(answered)
+      fixture.formResponse = { status: "answered", answer: { choice: "allow" } }
+      const search = yield* executeTool(fixture.registry, {
+        sessionID,
+        ...toolIdentity,
+        call: { type: "tool-call", id: "call-late", name: "websearch", input: { query: "effect" } },
+      }).pipe(Effect.forkChild({ startImmediately: true }))
+      while (fixture.formRequests.length === 0) yield* Effect.yieldNow
+      yield* TestClock.adjust("10 minutes")
+      yield* Deferred.succeed(answered, undefined)
+      expect(yield* Fiber.join(search)).toMatchObject({ status: "completed" })
+      expect(fixture.formRequests).toHaveLength(1)
     }),
   )
 

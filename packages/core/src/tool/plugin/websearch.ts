@@ -65,6 +65,11 @@ export const Plugin = {
                 )
               const result = yield* search().pipe(
                 Effect.catchTag("WebSearch.ProviderRequired", () => {
+                  // The forms name this call, as the question tool's do, so clients show them on its block.
+                  const metadata = {
+                    kind: "websearch.provider",
+                    tool: { messageID: context.messageID, id: context.id },
+                  }
                   return providerSelectionLock
                     .withPermit(
                       Effect.gen(function* () {
@@ -75,7 +80,7 @@ export const Plugin = {
                         const response = yield* forms.ask({
                           sessionID: context.sessionID,
                           title: "Web Search",
-                          metadata: { kind: "websearch.provider" },
+                          metadata,
                           fields: [
                             {
                               key: "choice",
@@ -108,7 +113,7 @@ export const Plugin = {
                             ? yield* forms.ask({
                                 sessionID: context.sessionID,
                                 title: "Choose a web search provider",
-                                metadata: { kind: "websearch.provider" },
+                                metadata,
                                 fields: [
                                   {
                                     key: "provider",
@@ -137,13 +142,8 @@ export const Plugin = {
                         return provider.id
                       }),
                     )
-                    .pipe(
-                      Effect.timeoutOrElse({
-                        duration: "1 minute",
-                        orElse: () => Effect.fail(new Error("Web search cancelled")),
-                      }),
-                      Effect.flatMap(search),
-                    )
+                    // No time limit: consent waits for its answer as a question does.
+                    .pipe(Effect.flatMap(search))
                 }),
               )
               const output = {
