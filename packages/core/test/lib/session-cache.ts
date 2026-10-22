@@ -353,7 +353,7 @@ export const createSession = Effect.fn("test.createSession")(function* (sessionI
       directory: "/project",
       title: "cache",
       version: "test",
-      agent: "build",
+      agent: Agent.ID.make("build"),
       model: { id: MODEL_ID, providerID: String(models.primary.ref.providerID) },
     })
     .onConflictDoNothing()

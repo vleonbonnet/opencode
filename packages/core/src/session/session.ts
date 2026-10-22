@@ -316,7 +316,7 @@ export const make = Effect.fn("Session.make")(function* () {
               description: input.description,
               metadata: input.metadata,
             }),
-            delivery: SessionInbox.Delivery.make(input.delivery ?? "steer"),
+            delivery: input.delivery ?? "steer",
           } satisfies SessionInbox.Item
           const admitted = yield* admission
             .admit({

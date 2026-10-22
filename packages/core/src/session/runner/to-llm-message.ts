@@ -103,6 +103,7 @@ const userAttachmentContent = (files: readonly FileAttachment[]) => {
 }
 
 const decodeToolInput = Schema.decodeUnknownOption(Schema.fromJsonString(Schema.Unknown))
+const decodeNativeWindow = Schema.decodeUnknownSync(SessionHistory.NativeWindow)
 
 const providerMetadata = (
   provider: string,
@@ -177,8 +178,8 @@ const assistant = (
   providerMetadataKey: string,
   dropped: ReadonlyMap<string, DroppedReasoning>,
 ) => {
-  const sameProvider = String(message.model.providerID) === String(model.providerID)
-  const sameModel = sameProvider && String(message.model.id) === String(model.id)
+  const sameProvider = message.model.providerID === model.providerID
+  const sameModel = sameProvider && message.model.id === model.id
   const reuseProviderMetadata = sameModel && message.error === undefined
   const reasoningInterrupted = message.content.some(
     (item) => item.type === "reasoning" && item.time !== undefined && item.time.completed === undefined,
@@ -331,8 +332,7 @@ function toLLMMessage(
     case "compaction": {
       if (message.status !== "completed") return []
       // History selection only keeps native windows the target model can replay.
-      if (message.native?.messages !== undefined)
-        return [...Schema.decodeUnknownSync(SessionHistory.NativeWindow)(message.native.messages)]
+      if (message.native?.messages !== undefined) return [...decodeNativeWindow(message.native.messages)]
       const kept = SessionRecentText.kept(message)
       return [
         Message.make({
