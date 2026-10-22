@@ -25,12 +25,17 @@ export const DEFAULT_TIMEOUT_MS = 2 * 60 * 1_000
 
 const BACKGROUND_INSTRUCTION =
   "You will be notified automatically when the command finishes. The notification will include the command's output. Unless the user explicitly asks otherwise, DO NOT poll for completion, even if you need the final result to continue. Repeatedly sleeping and reading or searching the output file is polling, not useful work. You may read the current output if it lets you do useful work now, but do not repeatedly check it while waiting for the command to finish. Keep working on anything that does not depend on the result. If you have nothing else to do, end your response; you will be resumed automatically when the command finishes."
-// Retrying long work with a larger timeout, or with a longer sleep before checking on it, only blocks longer; in the
-// background it runs to completion and its notification brings the result.
+// Retrying long work with a larger timeout only blocks longer; in the background it runs to completion and its
+// notification brings the result.
 const timeoutInstruction = (timeout: number, background: boolean) =>
-  background
-    ? `Command exceeded timeout of ${timeout} ms. If it needs more time, run it again in the background without a timeout and wait for the notification that it finished.`
-    : `Command exceeded timeout of ${timeout} ms. If it needs more time, such as a build, deploy, job or test run, run it again with background: true and wait for the notification that it finished. Do not retry with a larger timeout or a longer sleep, and do not poll for completion. If it was waiting for interactive input, run it so that it does not prompt.`
+  [
+    `Command exceeded timeout of ${timeout} ms.`,
+    background
+      ? "If it needs more time, run it again with `background: true` and no timeout."
+      : "If it needs more time, run it again with `background: true`.",
+    "If it was waiting for interactive input, run it so that it does not prompt.",
+    "Do not retry with a larger timeout, and do not poll for completion.",
+  ].join(" ")
 const OS =
   process.platform === "darwin"
     ? "macOS"

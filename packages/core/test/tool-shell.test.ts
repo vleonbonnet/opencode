@@ -1641,12 +1641,9 @@ describe("ShellTool", () => {
             expect(settled.status).toBe("completed")
             expect(settled.metadata).toMatchObject({ timeout: true })
             const text = settled.content?.map((item) => (item.type === "text" ? item.text : "")).join("\n") ?? ""
-            expect(text).toContain("Command exceeded timeout of 100 ms.")
-            expect(text).toContain("run it again with background: true and wait for the notification that it finished")
             expect(text).toContain(
-              "Do not retry with a larger timeout or a longer sleep, and do not poll for completion",
+              "Command exceeded timeout of 100 ms. If it needs more time, run it again with `background: true`. If it was waiting for interactive input, run it so that it does not prompt. Do not retry with a larger timeout, and do not poll for completion.\nTimed out before completion",
             )
-            expect(text).toContain("Timed out before completion")
           }),
         )
       },
@@ -1690,7 +1687,7 @@ describe("ShellTool", () => {
             expect((yield* shell.wait(id)).status).toBe("timeout")
             expect((yield* Fiber.join(admitted)).valueOrUndefined?.data.item.payload).toMatchObject({
               text: expect.stringMatching(
-                /Command exceeded timeout of 50 ms\. If it needs more time, run it again in the background without a timeout and wait for the notification that it finished\.\n\nTimed out before completion/,
+                /Command exceeded timeout of 50 ms\. If it needs more time, run it again with `background: true` and no timeout\. If it was waiting for interactive input, run it so that it does not prompt\. Do not retry with a larger timeout, and do not poll for completion\.\n\nTimed out before completion/,
               ),
               description: idleCommand,
               metadata: {
