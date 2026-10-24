@@ -9,7 +9,6 @@ import { Project } from "./project.js"
 import { Prompt } from "./prompt.js"
 import { DateTimeUtcFromMillis, PositiveInt, RelativePath, statics } from "./schema.js"
 import { ascending } from "./identifier.js"
-import { Event } from "./event.js"
 import { Shell as ShellSchema } from "./shell.js"
 import { FinishReason } from "./llm.js"
 import { SessionError } from "./session-error.js"
@@ -24,7 +23,7 @@ export const ID = Schema.String.check(Schema.isStartingWith("msg_")).pipe(
   Schema.annotate({ identifier: "Session.Message.ID" }),
   statics((schema) => ({
     create: () => schema.make("msg_" + ascending()),
-    fromEvent: (eventID: Event.ID) => schema.make(eventID.replace(/^evt_/, "msg_")),
+    fromEvent: (eventID: string) => schema.make(eventID.replace(/^evt_/, "msg_")),
   })),
 )
 export type ID = typeof ID.Type
@@ -228,6 +227,8 @@ export const Assistant = Schema.Struct({
   /** Step-level native data, such as a provider's reason for blocking a response. */
   native: Native.pipe(optional),
   cost: Money.USD.pipe(optional),
+  /** Subscription allowance the step used instead of money, such as OpenCode Go's. */
+  allowance: Money.USD.pipe(optional),
   tokens: TokenUsage.Info.pipe(optional),
   error: SessionError.Error.pipe(optional),
   retry: AssistantRetry.pipe(optional),

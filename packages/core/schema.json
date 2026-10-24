@@ -1,7 +1,7 @@
 {
   "version": "7",
   "dialect": "sqlite",
-  "id": "83bec608-1133-4b64-ac57-4b6684c91fff",
+  "id": "ff2efc22-36c2-4af5-8f24-2288090b0ba6",
   "prevIds": ["5067fae0-90ff-4601-82d7-dd050ea9dc8f"],
   "ddl": [
     {
@@ -1257,6 +1257,16 @@
       "default": "0",
       "generated": null,
       "name": "cost",
+      "entityType": "columns",
+      "table": "session_v2"
+    },
+    {
+      "type": "real",
+      "notNull": true,
+      "autoincrement": false,
+      "default": "0",
+      "generated": null,
+      "name": "allowance",
       "entityType": "columns",
       "table": "session_v2"
     },

@@ -80,7 +80,6 @@ export type CreateDataInput = {
   readonly onError?: (error: unknown) => void
 }
 
-const messageIDFromEvent = (eventID: string) => eventID.replace(/^evt_/, "msg_")
 const messagePageLimit = 20
 // Trailing window for event bursts that each ask for the same refetch.
 export const settleMs = 150
@@ -467,6 +466,7 @@ export function createData(config: CreateDataInput) {
     // Streaming events target one assistant message and, within it, the latest part of a kind.
     // A missing target means the row was never loaded or was evicted; the event is dropped.
     editAssistant(sessionID: string, messageID: string, fn: (assistant: SessionMessageAssistant) => void) {
+      if (!messageIndex.get(sessionID)?.has(messageID)) return
       message.update(sessionID, (draft, index) => {
         const position = index.get(messageID)
         const item = position === undefined ? undefined : draft[position]
@@ -686,6 +686,7 @@ export function createData(config: CreateDataInput) {
         if (store.session.info[event.data.sessionID])
           setStore("session", "info", event.data.sessionID, {
             cost: event.data.cost,
+            allowance: event.data.allowance,
             tokens: event.data.tokens,
           })
         return
@@ -694,7 +695,7 @@ export function createData(config: CreateDataInput) {
         if (store.session.info[event.data.sessionID])
           setStore("session", "info", event.data.sessionID, "agent", event.data.agent)
         message.insert(event.data.sessionID, {
-          id: messageIDFromEvent(event.id),
+          id: SessionMessage.ID.fromEvent(event.id),
           type: "agent-switched",
           agent: event.data.agent,
           previous,
@@ -708,7 +709,7 @@ export function createData(config: CreateDataInput) {
           setStore("session", "info", event.data.sessionID, "model", event.data.model)
         if (!store.session.message[event.data.sessionID]) return
         message.insert(event.data.sessionID, {
-          id: messageIDFromEvent(event.id),
+          id: SessionMessage.ID.fromEvent(event.id),
           type: "model-switched",
           model: event.data.model,
           previous,
@@ -716,7 +717,7 @@ export function createData(config: CreateDataInput) {
         })
         refresh(() =>
           api()
-            .session.message.get({ sessionID: event.data.sessionID, messageID: messageIDFromEvent(event.id) })
+            .session.message.get({ sessionID: event.data.sessionID, messageID: SessionMessage.ID.fromEvent(event.id) })
             .then((item) => {
               message.update(event.data.sessionID, (draft, index) => {
                 const position = index.get(item.id)
@@ -771,10 +772,10 @@ export function createData(config: CreateDataInput) {
             subpath: current.subpath,
           }
           setStore("session", "info", event.data.sessionID, "location", event.data.location)
-          if (event.data.projectID) setStore("session", "info", event.data.sessionID, "projectID", event.data.projectID)
+          setStore("session", "info", event.data.sessionID, "projectID", event.data.projectID)
           setStore("session", "info", event.data.sessionID, "subpath", event.data.subpath)
           message.insert(event.data.sessionID, {
-            id: messageIDFromEvent(event.id),
+            id: SessionMessage.ID.fromEvent(event.id),
             type: "location-switched",
             location: event.data.location,
             projectID: event.data.projectID,
@@ -855,7 +856,7 @@ export function createData(config: CreateDataInput) {
         const updateText = event.data.text
         if (updateText === undefined) return
         message.insert(event.data.sessionID, {
-          id: messageIDFromEvent(event.id),
+          id: SessionMessage.ID.fromEvent(event.id),
           type: "system",
           text: updateText,
           description: `Instructions updated: ${Object.keys(event.data.delta).join(", ")}`,
@@ -865,7 +866,7 @@ export function createData(config: CreateDataInput) {
         return
       case "session.synthetic":
         message.insert(event.data.sessionID, {
-          id: messageIDFromEvent(event.id),
+          id: SessionMessage.ID.fromEvent(event.id),
           type: "synthetic",
           text: event.data.text,
           description: event.data.description,
@@ -875,7 +876,7 @@ export function createData(config: CreateDataInput) {
         return
       case "session.shell.started":
         message.insert(event.data.sessionID, {
-          id: messageIDFromEvent(event.id),
+          id: SessionMessage.ID.fromEvent(event.id),
           type: "shell",
           shellID: event.data.shell.id,
           command: event.data.shell.command,
@@ -887,6 +888,7 @@ export function createData(config: CreateDataInput) {
         })
         return
       case "session.shell.ended":
+        if (!store.session.message[event.data.sessionID]) return
         message.update(event.data.sessionID, (draft) => {
           const match = message.shell(draft, event.data.shell.id)
           if (!match) return
@@ -943,6 +945,7 @@ export function createData(config: CreateDataInput) {
           assistant.rawFinish = event.data.rawFinish
           assistant.native = event.data.native
           assistant.cost = event.data.cost
+          assistant.allowance = event.data.allowance
           assistant.tokens = event.data.tokens
           if (event.data.snapshot) assistant.snapshot = { ...assistant.snapshot, end: event.data.snapshot }
         })
@@ -958,6 +961,7 @@ export function createData(config: CreateDataInput) {
           assistant.retry = undefined
           if (event.data.cost !== undefined && event.data.tokens !== undefined) {
             assistant.cost = event.data.cost
+            assistant.allowance = event.data.allowance
             assistant.tokens = event.data.tokens
           }
         })
@@ -1073,7 +1077,7 @@ export function createData(config: CreateDataInput) {
       case "session.compaction.started":
         if (event.data.inputID) removePending(event.data.sessionID, event.data.inputID)
         message.insert(event.data.sessionID, {
-          id: event.data.inputID ?? messageIDFromEvent(event.id),
+          id: event.data.inputID ?? SessionMessage.ID.fromEvent(event.id),
           type: "compaction",
           status: "running",
           reason: event.data.reason,
@@ -1093,7 +1097,7 @@ export function createData(config: CreateDataInput) {
         if (event.type === "session.execution.interrupted" && event.data.reason === "shutdown") return
         // Mirror the projected idle marker so turn boundaries match before the next message read.
         message.insert(event.data.sessionID, {
-          id: messageIDFromEvent(event.id),
+          id: SessionMessage.ID.fromEvent(event.id),
           type: "idle",
           outcome:
             event.type === "session.execution.succeeded"
@@ -1153,6 +1157,7 @@ export function createData(config: CreateDataInput) {
         })
         return
       case "session.compaction.delta":
+        if (!store.session.message[event.data.sessionID]) return
         message.update(event.data.sessionID, (draft) => {
           const current = message.compaction(draft)
           if (current?.status === "running") current.summary += event.data.text
@@ -1175,7 +1180,7 @@ export function createData(config: CreateDataInput) {
             return
           }
           message.append(draft, index, {
-            id: messageIDFromEvent(event.id),
+            id: SessionMessage.ID.fromEvent(event.id),
             type: "compaction",
             status: "completed",
             reason: event.data.reason,
@@ -1194,14 +1199,11 @@ export function createData(config: CreateDataInput) {
           const position = draft.findLastIndex((item) => item.type === "compaction" && item.status === "running")
           const current = draft[position]
           const failed: Extract<SessionMessageInfo, { type: "compaction"; status: "failed" }> = {
-            id: current?.id ?? event.data.inputID ?? messageIDFromEvent(event.id),
+            id: current?.id ?? event.data.inputID ?? SessionMessage.ID.fromEvent(event.id),
             type: "compaction",
             status: "failed",
-            reason: event.data.reason ?? "manual",
-            error: event.data.error ?? {
-              type: "compaction.failed",
-              message: "Compaction failed before recording an error",
-            },
+            reason: event.data.reason,
+            error: event.data.error,
             metadata: current?.type === "compaction" ? current.metadata : event.metadata,
             cost: event.data.cost,
             tokens: event.data.tokens,
@@ -1430,6 +1432,16 @@ export function createData(config: CreateDataInput) {
         if (session.parentID) return session.cost
         return (store.session.family[sessionID] ?? [sessionID]).reduce(
           (total, id) => total + (store.session.info[id]?.cost ?? 0),
+          0,
+        )
+      },
+      /** Subscription allowance used instead of money, such as OpenCode Go's; a root session's includes its family. */
+      allowance(sessionID: string) {
+        const session = store.session.info[sessionID]
+        if (!session) return 0
+        if (session.parentID) return session.allowance ?? 0
+        return (store.session.family[sessionID] ?? [sessionID]).reduce(
+          (total, id) => total + (store.session.info[id]?.allowance ?? 0),
           0,
         )
       },
