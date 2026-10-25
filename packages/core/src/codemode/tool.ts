@@ -12,6 +12,7 @@ import type {
 } from "@opencode/schema/tool"
 import { Context, Effect, Ref, Schema, Semaphore } from "effect"
 import { definition, normalizedName } from "../tool/runtime.js"
+import { ToolUserStop } from "../tool/user-stop.js"
 import { CodeModeCatalog } from "./catalog.js"
 import { CodeModeWeb } from "./web.js"
 
@@ -91,6 +92,7 @@ export const create = (
         const callIndex = yield* Ref.make(0)
         const files = yield* Ref.make<Array<CollectedFiles>>([])
         const calls = yield* Ref.make<Array<ExecuteCall>>([])
+        const stopped = yield* Ref.make<ToolUserStop.Error | undefined>(undefined)
         const lock = Semaphore.makeUnsafe(1)
         const record = (update: (items: Array<ExecuteCall>) => Array<ExecuteCall>) =>
           lock.withPermit(
@@ -103,7 +105,11 @@ export const create = (
               executeTool: (name, tool, input) =>
                 Effect.gen(function* () {
                   const index = yield* Ref.getAndUpdate(callIndex, (index) => index + 1)
-                  const executed = yield* executeTool(name, tool, input, context)
+                  const executed = yield* executeTool(name, tool, input, context).pipe(
+                    Effect.catchCauseFilter(ToolUserStop.fromCause, (stop) =>
+                      Ref.update(stopped, (current) => current ?? stop).pipe(Effect.andThen(Effect.interrupt)),
+                    ),
+                  )
                   const content =
                     typeof executed.content === "string"
                       ? [{ type: "text" as const, text: executed.content }]
@@ -117,7 +123,13 @@ export const create = (
                 }),
               hooks: progressHooks(record),
             }),
+            // Interrupt the interpreter so JS cannot catch a user stop, then restore its identity for session settlement.
+            Effect.catchCause((cause) =>
+              Ref.get(stopped).pipe(Effect.flatMap((stop) => (stop ? Effect.die(stop) : Effect.failCause(cause)))),
+            ),
           )
+        const stop = yield* Ref.get(stopped)
+        if (stop) return yield* Effect.die(stop)
         const toolCalls = yield* Ref.get(calls)
         const collected = (yield* Ref.get(files))
           .toSorted((left, right) => left.index - right.index)

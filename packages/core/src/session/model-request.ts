@@ -31,13 +31,14 @@ import type {
 import type { Agent } from "@opencode/schema/agent"
 import type { Model } from "@opencode/schema/model"
 import type { Content } from "@opencode/schema/tool"
-import { Cause, Context, Effect, Layer, Option, Result, Stream } from "effect"
+import { Context, Effect, Layer, Option, Stream } from "effect"
 import { HttpClientRequest, HttpClientResponse } from "effect/http"
 import { makeLocationNode } from "@opencode/util/effect/app-node"
 import { App } from "../app.js"
 import { Permission } from "../permission.js"
 import { PluginHooks } from "../plugin/hooks.js"
 import { QuestionTool } from "../tool/plugin/question.js"
+import { ToolUserStop } from "../tool/user-stop.js"
 import { Tool } from "../tool.js"
 import { SessionAffinity } from "./affinity.js"
 import type { CacheLedger } from "./cache/ledger.js"
@@ -531,20 +532,9 @@ export const layer = Layer.effect(
         // including declines a tool rethrew and its wrapper attached to a Tool.Error, as Promise
         // plugin tools do.
         executeTool: (call: Parameters<Prepared["executeTool"]>[0]) =>
-          tools.execute({ ...call, definitions: hooked }).pipe(
-            Effect.catchCauseFilter(
-              (cause) => {
-                const decline = cause.reasons
-                  .map((r) => (Cause.isDieReason(r) ? r.defect : Cause.isFailReason(r) ? r.error.error : undefined))
-                  .find(
-                    (value): value is Permission.DeclinedError | QuestionTool.CancelledError =>
-                      value instanceof Permission.DeclinedError || value instanceof QuestionTool.CancelledError,
-                  )
-                return decline ? Result.succeed(decline) : Result.fail(cause)
-              },
-              (decline) => Effect.fail(decline),
-            ),
-          ),
+          tools
+            .execute({ ...call, definitions: hooked })
+            .pipe(Effect.catchCauseFilter(ToolUserStop.fromCause, (decline) => Effect.fail(decline))),
       }
     })
 

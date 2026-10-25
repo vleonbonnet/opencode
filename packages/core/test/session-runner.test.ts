@@ -5058,6 +5058,134 @@ describe("SessionRunnerLLM", () => {
     ])
   })
 
+  for (const codemode of [false, true]) {
+    for (const origin of ["tool", "effect-hook", "promise-hook"] as const) {
+      for (const outcome of ["deny", "decline", "feedback"] as const) {
+        scenario(`permission outcomes: ${origin} ${outcome} via ${codemode ? "Code Mode" : "direct"}`, function* (s) {
+          const registry = yield* Tool.Service
+          const hooks = yield* PluginHooks.Service
+          const reason = outcome === "feedback" ? "Use staging instead" : "Policy forbids production"
+          const check =
+            outcome === "decline"
+              ? Effect.die(new Permission.DeclinedError())
+              : Effect.fail(
+                  new Tool.Error({
+                    message: reason,
+                    error:
+                      outcome === "feedback"
+                        ? new Permission.CorrectedError({ feedback: reason })
+                        : new Permission.BlockedError({
+                            permission: "deploy",
+                            resources: ["production"],
+                            rules: [],
+                            reason,
+                          }),
+                  }),
+                )
+          let executed = false
+          yield* transformTools(
+            registry,
+            {
+              guarded: {
+                name: "guarded",
+                description: "Exercise a permission outcome",
+                input: Schema.Struct({}),
+                output: Schema.String,
+                execute: () =>
+                  (origin === "tool" ? check : Effect.void).pipe(
+                    Effect.andThen(
+                      Effect.sync(() => {
+                        executed = true
+                        return { output: "unexpected execution" }
+                      }),
+                    ),
+                  ),
+              },
+            },
+            { codemode },
+          )
+          if (origin === "effect-hook")
+            yield* hooks.register("tool", "execute.before", (event) => (event.tool === "guarded" ? check : Effect.void))
+          if (origin === "promise-hook") {
+            yield* PluginPromise.fromPromise({
+              id: "permission-outcome",
+              async setup(context) {
+                await context.tool.hook("execute.before", async (event) => {
+                  if (event.tool === "guarded")
+                    await context.permission.assert({
+                      sessionID: event.sessionID,
+                      action: "deploy",
+                      resources: ["production"],
+                    })
+                })
+              },
+            }).effect(
+              host({
+                tool: { ...host().tool, hook: (name, callback) => hooks.register("tool", name, callback) },
+                permission: { ...host().permission, assert: () => check },
+              }),
+            )
+          }
+          yield* s.admit("Exercise permission outcome")
+          yield* s.llm.push(
+            codemode
+              ? TestLLM.tool("call-guarded", "execute", { code: "return await tools.guarded({})" })
+              : TestLLM.tool("call-guarded", "guarded", {}),
+            TestLLM.stop(),
+          )
+          const exit = yield* s.resume.pipe(Effect.exit)
+          expect(executed).toBe(false)
+          expect(s.requests).toHaveLength(outcome === "decline" ? 1 : 2)
+          expect(s.declineReports).toEqual(outcome === "decline" ? [sessionID] : [])
+          if (outcome === "decline") {
+            expect(Exit.isFailure(exit) && Cause.hasInterruptsOnly(exit.cause)).toBe(true)
+            expect(yield* s.context).toMatchObject([
+              Expected.user("Exercise permission outcome"),
+              Expected.assistant({}, [
+                Expected.failedTool(
+                  { id: "call-guarded" },
+                  { error: { type: "aborted", message: "The user declined this tool call" } },
+                ),
+              ]),
+            ])
+          } else {
+            expect(Exit.isSuccess(exit)).toBe(true)
+            expect(JSON.stringify(yield* s.context)).toContain(reason)
+          }
+        })
+      }
+    }
+  }
+
+  for (const code of [
+    'try { await tools.declined({}) } catch (error) { return "caught" }',
+    "return await Promise.allSettled([tools.declined({})])",
+    'tools.declined({}); return "not awaited"',
+  ]) {
+    scenario(`Code Mode cannot swallow a user decline: ${code}`, function* (s) {
+      const registry = yield* Tool.Service
+      yield* transformTools(
+        registry,
+        {
+          declined: {
+            name: "declined",
+            description: "User declines approval",
+            input: Schema.Struct({}),
+            output: Schema.String,
+            execute: () => Effect.die(new Permission.DeclinedError()),
+          },
+        },
+        { codemode: true },
+      )
+      yield* s.admit("Decline inside Code Mode")
+      yield* s.llm.push(TestLLM.tool("call-declined", "execute", { code }), TestLLM.stop())
+      const exit = yield* s.resume.pipe(Effect.exit)
+      expect(Exit.isFailure(exit) && Cause.hasInterruptsOnly(exit.cause)).toBe(true)
+      expect(s.requests).toHaveLength(1)
+      expect(s.declineReports).toEqual([sessionID])
+    })
+  }
+
   scenario("returns tool-wrapped policy blocks to the model and continues", function* (s) {
     const registry = yield* Tool.Service
     yield* transformTools(
