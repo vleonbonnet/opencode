@@ -1418,6 +1418,6 @@ function resolvePath(cwd: string, value: string) {
   const trimmed = value.replace(/[\r\n]+$/, "")
   if (!trimmed) return cwd
   const normalized = FSUtil.windowsPath(trimmed)
-  if (path.isAbsolute(normalized)) return path.normalize(normalized)
+  if (path.isAbsolute(normalized)) return FSUtil.throughDrive(path.normalize(normalized), cwd)
   return path.resolve(cwd, normalized)
 }

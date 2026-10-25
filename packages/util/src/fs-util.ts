@@ -278,6 +278,32 @@ export namespace FSUtil {
       .replace(/^\/mnt\/([a-zA-Z])(?:\/|$)/, (_, drive) => `${drive.toUpperCase()}:/`)
   }
 
+  // Git for Windows and the native realpath name a path on a mapped network or subst drive by the
+  // drive's target. Naming it through the drive `reference` is on keeps the spelling its caller used.
+  export function throughDrive(
+    value: string,
+    reference: string,
+    options?: { platform?: NodeJS.Platform; target?: (drive: string) => string | undefined },
+  ): string {
+    if ((options?.platform ?? process.platform) !== "win32") return value
+    const drive = path.win32.parse(reference).root
+    if (!/^[a-zA-Z]:\\$/.test(drive)) return value
+    if (path.win32.parse(value).root.toLowerCase() === drive.toLowerCase()) return value
+    const target = (options?.target ?? driveTarget)(drive)
+    if (!target) return value
+    const rest = path.win32.relative(target, value)
+    if (path.win32.isAbsolute(rest) || rest === ".." || rest.startsWith(`..${path.win32.sep}`)) return value
+    return path.win32.join(drive, rest)
+  }
+
+  function driveTarget(drive: string) {
+    try {
+      return realpathSync.native(drive)
+    } catch {
+      return undefined
+    }
+  }
+
   export const ignoredDirectories = ["node_modules", ".git", ".venv", "venv", "__pycache__"]
 
   export const ignoreGlobs = [...ignoredDirectories, `**/{${ignoredDirectories.join(",")}}/**`]
