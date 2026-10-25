@@ -11,7 +11,6 @@ import type {
   Result,
 } from "@opencode/schema/tool"
 import { Context, Effect, Ref, Schema, Semaphore } from "effect"
-import type { Permission } from "../permission.js"
 import { definition, normalizedName } from "../tool/runtime.js"
 import { CodeModeCatalog } from "./catalog.js"
 import { CodeModeWeb } from "./web.js"
@@ -60,8 +59,6 @@ class Run extends Context.Service<
   {
     readonly executeTool: (name: string, tool: Info, input: unknown) => Effect.Effect<unknown, unknown>
     readonly hooks: CodeMode.Hooks
-    /** Asks for the permission a request from `fetch` needs, as the execute call that makes it. */
-    readonly authorize: (request: CodeModeWeb.Request) => Effect.Effect<void, unknown>
   }
 >()("@opencode/CodeModeTool/Run") {}
 
@@ -80,14 +77,9 @@ const description = [
   "Await every call whose completion matters; pending calls are interrupted when execution ends. Run independent calls concurrently with `Promise.allSettled`.",
 ].join("\n")
 
-/**
- * The execute tool over `inventory`. `executeTool` runs the program's tool calls; `assert` asks for the permissions the
- * runtime's own globals need, such as webfetch for `fetch`, for the acting agent and Session of the execute call.
- */
 export const create = (
   inventory: Inventory,
   executeTool: (name: string, tool: Info, input: unknown, context: ToolContext) => Effect.Effect<Result, Error>,
-  assert: (input: Permission.AssertInput) => Effect.Effect<void, unknown>,
 ) => {
   return {
     name: "execute",
@@ -124,7 +116,6 @@ export const create = (
                   return text === "" ? null : text
                 }),
               hooks: progressHooks(record),
-              authorize: (request) => assert(CodeModeWeb.permission(request, context)),
             }),
           )
         const toolCalls = yield* Ref.get(calls)
@@ -259,13 +250,10 @@ function runtime(inventory: Inventory) {
     })
   }
   const tools = renderTools(root)
-  const created = CodeMode.make<typeof tools>({ tools, extensions: [web], hooks: runHooks })
+  const created = CodeMode.make<typeof tools>({ tools, extensions: [CodeModeWeb.extension], hooks: runHooks })
   runtimes.set(inventory, created)
   return created
 }
-
-// The runtime is shared, so `fetch` reaches the calling execution's permission check through its Run service.
-const web = CodeModeWeb.extension((request) => Run.use((run) => run.authorize(request)))
 
 const runHooks = {
   "tool.before": (call) => Run.use((run) => run.hooks["tool.before"]?.(call) ?? Effect.void),

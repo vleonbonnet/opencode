@@ -269,14 +269,7 @@ const permissionFail = {
       }),
     }),
 }
-// Code Mode's fetch asks through the Session's permission service; scenarios read what it asked.
-const asserted: Permission.AssertInput[] = []
-const permission = permissionLayer({
-  assert: (input) =>
-    Effect.sync(() => {
-      asserted.push(input)
-    }),
-})
+const permission = permissionLayer()
 const transformTools = (registry: Tool.Interface, tools: Readonly<Record<string, ToolInfo>>, options?: Tool.Options) =>
   registry.transform((editor) =>
     Object.entries(tools).forEach(([name, tool]) => editor.add({ ...tool, name, options: options ?? tool.options })),
@@ -1917,42 +1910,6 @@ describe("SessionRunnerLLM", () => {
       [defaultSystem, fakeIdentity, "Build skills\n\nInitial context"],
     ])
     expect(systemTexts(s.requests[1])).toContainEqual(expect.stringContaining("Reviewer skills"))
-  })
-
-  scenario("asks the Session's permission service before Code Mode fetches", function* (s) {
-    asserted.length = 0
-    const received: string[] = []
-    const server = yield* Effect.acquireRelease(
-      Effect.sync(() =>
-        Bun.serve({
-          port: 0,
-          fetch: (request) => {
-            received.push(new URL(request.url).pathname)
-            return new Response("fetched")
-          },
-        }),
-      ),
-      (server) => Effect.promise(() => server.stop(true)),
-    )
-    const url = new URL("/data", server.url).href
-    yield* s.llm.push(
-      TestLLM.tool("call-fetch", "execute", { code: `return await (await fetch(${JSON.stringify(url)})).text()` }),
-      TestLLM.stop(),
-    )
-    yield* s.runPrompt("Fetch the data")
-
-    expect(asserted).toEqual([
-      {
-        action: "webfetch",
-        resources: [url],
-        save: ["*"],
-        metadata: { method: "GET", url },
-        sessionID,
-        agent: Agent.ID.make("build"),
-        source: { type: "tool", messageID: expect.any(String), id: "call-fetch" },
-      },
-    ])
-    expect(received).toEqual(["/data"])
   })
 
   scenario("sends plan and build the same tools while each agent's rules decide its calls", function* (s) {

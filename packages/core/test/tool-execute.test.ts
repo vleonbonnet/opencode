@@ -1,6 +1,5 @@
 import { expect, test } from "bun:test"
 import { CodeModeTool } from "@opencode/core/codemode/tool"
-import { Permission } from "@opencode/core/permission"
 import { Tool } from "@opencode/core/tool"
 import { execute } from "@opencode/core/tool/runtime"
 import { Agent } from "@opencode/schema/agent"
@@ -17,23 +16,8 @@ const context = {
   progress: () => Effect.void,
 }
 
-const createCodeMode = (
-  tools: ReadonlyMap<string, Info>,
-  assert: (input: Permission.AssertInput) => Effect.Effect<void, unknown> = () => Effect.void,
-) => CodeModeTool.create({ tools }, (_, tool, input, context) => execute(tool, input, context), assert)
-
-/** A local server counting the requests it answers. */
-const serve = () => {
-  const received: string[] = []
-  const server = Bun.serve({
-    port: 0,
-    fetch: (request) => {
-      received.push(`${request.method} ${new URL(request.url).pathname}`)
-      return new Response("fetched")
-    },
-  })
-  return { url: new URL("/data", server.url).href, received, [Symbol.dispose]: () => server.stop(true) }
-}
+const createCodeMode = (tools: ReadonlyMap<string, Info>) =>
+  CodeModeTool.create({ tools }, (_, tool, input, context) => execute(tool, input, context))
 
 test("execute describes invariant Code Mode behavior", () => {
   expect(createCodeMode(new Map()).description).toBe(
@@ -55,89 +39,6 @@ test("execute rejects filesystem fetches", async () => {
 
   expect(result.output.error).toBe(true)
   expect(result.output.output).toContain("fetch cannot be used for filesystem access.")
-})
-
-test("execute asks for webfetch permission as the execute call before fetching", async () => {
-  using server = serve()
-  const asserted: Permission.AssertInput[] = []
-  const result = await Effect.runPromise(
-    createCodeMode(new Map(), (input) => Effect.sync(() => asserted.push(input))).execute(
-      { code: `return await (await fetch(${JSON.stringify(server.url)}, { method: "post", body: "x" })).text()` },
-      context,
-    ),
-  )
-
-  expect(result.output.output).toBe("fetched")
-  expect(asserted).toEqual([
-    {
-      action: "webfetch",
-      resources: [server.url],
-      save: ["*"],
-      metadata: { method: "POST", url: server.url },
-      sessionID: context.sessionID,
-      agent: context.agent,
-      source: { type: "tool", messageID: context.messageID, id: context.id },
-    },
-  ])
-  expect(server.received).toEqual(["POST /data"])
-})
-
-test("execute sends no request that webfetch permission denies", async () => {
-  using server = serve()
-  const result = await Effect.runPromise(
-    createCodeMode(new Map(), (input) =>
-      Effect.fail(new Permission.BlockedError({ rules: [], permission: input.action, resources: input.resources })),
-    ).execute({ code: `return await fetch(${JSON.stringify(server.url)})` }, context),
-  )
-
-  expect(result.output.error).toBe(true)
-  expect(result.output.output).toContain("Permission denied: webfetch")
-  expect(result.metadata).toEqual({ toolCalls: [{ tool: "fetch", status: "error", input: { method: "GET", url: server.url } }], error: true })
-  expect(server.received).toEqual([])
-})
-
-test("execute withdraws a fetch's pending permission request when the program ends", async () => {
-  using server = serve()
-  let withdrawn = false
-  const result = await Effect.runPromise(
-    createCodeMode(new Map(), () =>
-      Effect.never.pipe(
-        Effect.onInterrupt(() =>
-          Effect.sync(() => {
-            withdrawn = true
-          }),
-        ),
-      ),
-    ).execute({ code: `fetch(${JSON.stringify(server.url)}); return "done"` }, context),
-  )
-
-  expect(result.output.output).toContain("done")
-  await Bun.sleep(10)
-  expect(withdrawn).toBe(true)
-  expect(server.received).toEqual([])
-})
-
-test("executions sharing an inventory's runtime ask for fetch permission as their own call", async () => {
-  using server = serve()
-  const inventory = { tools: new Map<string, Info>() }
-  const asserted: Array<[string, string]> = []
-  const run = (id: string) =>
-    CodeModeTool.create(
-      inventory,
-      (_, tool, input, context) => execute(tool, input, context),
-      (input) => Effect.sync(() => asserted.push([id, input.source?.type === "tool" ? input.source.id : ""])),
-    ).execute(
-      { code: `return await (await fetch(${JSON.stringify(server.url)})).text()` },
-      { ...context, id: Tool.CallID.make(id) },
-    )
-
-  const results = await Effect.runPromise(Effect.all([run("first"), run("second")], { concurrency: "unbounded" }))
-  expect(results.map((result) => result.output.output)).toEqual(["fetched", "fetched"])
-  expect(asserted.toSorted()).toEqual([
-    ["first", "first"],
-    ["second", "second"],
-  ])
-  expect(server.received).toEqual(["GET /data", "GET /data"])
 })
 
 test("canonical execution distinguishes declared, model-only, and raw schema outputs", async () => {
@@ -276,10 +177,10 @@ test("executions share the prepared runtime of an inventory while keeping per-ca
     execute: (input, context) => Effect.succeed({ content: `${context.id}:${(input as { value: string }).value}` }),
   }
   const inventory = { tools: new Map([["echo", echo]]) }
-  const codeMode = CodeModeTool.create(inventory, (_, tool, input, context) => execute(tool, input, context), () => Effect.void)
+  const codeMode = CodeModeTool.create(inventory, (_, tool, input, context) => execute(tool, input, context))
   const run = (id: string) => {
     const progress: Array<Tool.Metadata> = []
-    return CodeModeTool.create(inventory, (_, tool, input, context) => execute(tool, input, context), () => Effect.void)
+    return CodeModeTool.create(inventory, (_, tool, input, context) => execute(tool, input, context))
       .execute(
         { code: `return await tools.echo({ value: "${id}" })` },
         { ...context, id: Tool.CallID.make(id), progress: (update) => Effect.sync(() => progress.push(update)) },

@@ -45,14 +45,12 @@ export interface Interface extends State.Transformable<Editor> {
   /**
    * Tools for a request under the acting agent's `permissions`. `exposure` (default: those permissions) decides what
    * is listed: a tool is left out when every ruleset wholly disables it, or when any delegation ceiling of the Session
-   * does. A listed tool the acting rules wholly disable is refused when called. `assert` asks for the permissions Code
-   * Mode's own globals need, such as webfetch for `fetch`; without it those globals are refused.
+   * does. A listed tool the acting rules wholly disable is refused when called.
    */
   readonly snapshot: (
     permissions?: Permission.Ruleset,
     exposure?: ReadonlyArray<Permission.Ruleset>,
     ceilings?: ReadonlyArray<Permission.Ceiling>,
-    assert?: (input: Permission.AssertInput) => Effect.Effect<void, unknown>,
   ) => Effect.Effect<Snapshot>
 }
 
@@ -257,7 +255,7 @@ const layer = Layer.effect(
       transform: state.transform,
       reload: state.reload,
       list: () => Effect.sync(() => Array.from(state.get().tools.values())),
-      snapshot: Effect.fn("Tool.snapshot")((permissions, exposure, ceilings = [], assert = unasserted) =>
+      snapshot: Effect.fn("Tool.snapshot")((permissions, exposure, ceilings = []) =>
         Effect.sync(() => {
           const data = state.get()
           const active = new Map<string, Tool.Info>()
@@ -284,17 +282,14 @@ const layer = Layer.effect(
           const cached = catalog?.data === data && catalog.names === names ? catalog : undefined
           const codeModeInventory = cached?.inventory ?? { tools: codeModeTools, namespaces: data.namespaces }
           const codeModeTool = codeModeEnabled
-            ? CodeModeTool.create(
-                codeModeInventory,
-                (name, tool, input, context) =>
-                  Effect.suspend(() => {
-                    const error = refused(name, tool.options?.permission ?? name, context.agent)
-                    if (error) return Effect.fail(error)
-                    return beforeExecute(name, input, context).pipe(
-                      Effect.flatMap((event) => executeTool(tool, name, event.input, context)),
-                    )
-                  }),
-                assert,
+            ? CodeModeTool.create(codeModeInventory, (name, tool, input, context) =>
+                Effect.suspend(() => {
+                  const error = refused(name, tool.options?.permission ?? name, context.agent)
+                  if (error) return Effect.fail(error)
+                  return beforeExecute(name, input, context).pipe(
+                    Effect.flatMap((event) => executeTool(tool, name, event.input, context)),
+                  )
+                }),
               )
             : undefined
           const codeModeCatalog = !codeModeEnabled
@@ -358,17 +353,6 @@ const layer = Layer.effect(
     })
   }),
 )
-
-// A snapshot nobody can ask permissions for refuses what would need them.
-const unasserted = (input: Permission.AssertInput) =>
-  Effect.fail(
-    new Permission.BlockedError({
-      rules: [],
-      permission: input.action,
-      resources: input.resources,
-      reason: `Permission denied: ${input.action}. This request cannot ask for permissions.`,
-    }),
-  )
 
 const whollyDisabled = (action: string, rules: Permission.Ruleset) => {
   const rule = rules.findLast((rule) => Wildcard.match(action, rule.action))
