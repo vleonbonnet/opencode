@@ -1,6 +1,6 @@
 export * as SessionRunnerLLM from "./llm.js"
 
-import { AIError, Message } from "@opencode/ai"
+import { AIError, Message } from "@opencode/ai/effect"
 import { STALE_THINKING_ERROR } from "@opencode/schema/session-cache"
 import { and, desc, eq, inArray, sql } from "drizzle-orm"
 import { Cause, Effect, Exit, FiberMap, Layer } from "effect"

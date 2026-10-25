@@ -7,7 +7,7 @@ export * as CacheGate from "./gate.js"
 // not foresee ("error"). "accept": mark the stale blocks dropped and rebuild the request so they replay as text; the
 // provider drops what the check could not foresee. Only models whose requests bind thinking are checked.
 
-import { LLMClient, type LLMClientShape } from "@opencode/ai"
+import { LLMClient, type LLMClientShape } from "@opencode/ai/effect"
 import { Effect, Exit, Option, Stream } from "effect"
 import { StepFailedError } from "../error.js"
 import type { SessionMessage } from "../message.js"

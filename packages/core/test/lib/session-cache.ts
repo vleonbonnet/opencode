@@ -1,7 +1,7 @@
 // A Session stack whose model is a scripted Anthropic Messages (or OpenAI Chat) provider behind a fake HTTP client:
 // every request is recorded, nothing leaves the process, and replies (streams or errors) are queued by the test.
 
-import { LanguageModel } from "@opencode/ai"
+import { LanguageModel } from "@opencode/ai/effect"
 import { AnthropicMessages, OpenAIChat } from "@opencode/ai/protocols"
 import { Auth, LLMClient, RequestExecutor } from "@opencode/ai/route"
 import { Agent } from "@opencode/core/agent"

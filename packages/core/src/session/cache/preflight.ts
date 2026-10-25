@@ -8,7 +8,7 @@ export * as SessionPreflight from "./preflight.js"
 // enqueued, persisted or scheduled (hooks see `dryRun`). When earlier thinking is stale, the turn sent with consent is
 // built and predicted too, since it replays those blocks as text.
 
-import { LLMClient, Message } from "@opencode/ai"
+import { LLMClient, Message } from "@opencode/ai/effect"
 import type { ModelRef, PreflightInput } from "@opencode/schema/session-cache"
 import { Cause, Clock, DateTime, Effect, Schema } from "effect"
 import { Agent } from "../../agent.js"

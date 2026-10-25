@@ -1,5 +1,5 @@
 import { describe, expect } from "bun:test"
-import { LanguageModel, Message, mergeHttpOptions, mergeJsonRecords, SystemPart } from "@opencode/ai"
+import { LanguageModel, Message, mergeHttpOptions, mergeJsonRecords, SystemPart } from "@opencode/ai/effect"
 import { AnthropicMessages, OpenAIChat } from "@opencode/ai/protocols"
 import { AmazonBedrock, AmazonBedrockMantle, GoogleVertexMessages, MiniMax } from "@opencode/ai/providers"
 import { compileRequest } from "@opencode/ai/route/client"

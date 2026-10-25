@@ -1,5 +1,5 @@
 import { describe, expect } from "bun:test"
-import { LanguageModel, LLMRequest, Message, SystemPart } from "@opencode/ai"
+import { LanguageModel, LLMRequest, Message, SystemPart } from "@opencode/ai/effect"
 import { AnthropicMessages, OpenAIChat } from "@opencode/ai/protocols"
 import {
   AmazonBedrock,

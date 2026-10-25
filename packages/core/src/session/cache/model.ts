@@ -20,7 +20,7 @@ export * as CacheModel from "./model.js"
 // find an earlier entry within a 20-block lookback of a breakpoint (verified: 20 blocks hit, 22 miss). Automatic-prefix
 // formats (OpenAI-compatible chat, Responses) cache every prefix of a processed request.
 
-import type { LanguageModel } from "@opencode/ai"
+import type { LanguageModel } from "@opencode/ai/effect"
 import { AnthropicMessages } from "@opencode/ai/protocols"
 import { Hash } from "@opencode/util/hash"
 import type { Captured } from "./wire.js"

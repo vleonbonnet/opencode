@@ -9,7 +9,7 @@ export * as CacheWire from "./wire.js"
 // credential by its stored identity, and rendering must not load or refresh one. In dry-run mode the request is
 // captured and the exchange fails before any network I/O: the HTTP handler and the WebSocket executor are never called.
 
-import { AIError, TransportError, type LLMRequest } from "@opencode/ai"
+import { AIError, TransportError, type LLMRequest } from "@opencode/ai/effect"
 import {
   compileHttpRequest,
   type HttpHandler,

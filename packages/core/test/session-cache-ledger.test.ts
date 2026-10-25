@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { LLM } from "@opencode/ai"
+import { LLM } from "@opencode/ai/effect"
 import { AnthropicMessages, OpenAIResponses } from "@opencode/ai/protocols"
 import { Auth } from "@opencode/ai/route"
 import { CacheLedger } from "@opencode/core/session/cache/ledger"

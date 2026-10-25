@@ -278,6 +278,8 @@ import type {
   WebsearchProvidersOutput,
   WebsearchQueryInput,
   WebsearchQueryOutput,
+  UsageLimitsInput,
+  UsageLimitsOutput,
   ConfigGetInput,
   ConfigGetOutput,
   ConfigShellsOutput,
@@ -1688,6 +1690,13 @@ const adaptGroupWebsearch = (raw: RawClient["server.websearch"]) => ({
   query: EndpointWebsearchQuery(raw),
 })
 
+const EndpointUsageLimits = (raw: RawClient["server.usage"]) => (input?: UsageLimitsInput) =>
+  preserveEffect<UsageLimitsOutput>()(
+    raw["usage.limits"]({ query: { location: input?.["location"] } }).pipe(Effect.mapError(mapClientError)),
+  )
+
+const adaptGroupUsage = (raw: RawClient["server.usage"]) => ({ limits: EndpointUsageLimits(raw) })
+
 const EndpointConfigGet = (raw: RawClient["server.config"]) => (input?: ConfigGetInput) =>
   preserveEffect<ConfigGetOutput>()(
     raw["config.get"]({ query: { location: input?.["location"] } }).pipe(Effect.mapError(mapClientError)),
@@ -1738,6 +1747,7 @@ const adaptClient = (raw: RawClient) => ({
   debug: adaptGroupDebug(raw["server.debug"]),
   migration: adaptGroupMigration(raw["server.migration"]),
   websearch: adaptGroupWebsearch(raw["server.websearch"]),
+  usage: adaptGroupUsage(raw["server.usage"]),
   config: adaptGroupConfig(raw["server.config"]),
 })
 
