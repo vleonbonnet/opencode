@@ -151,11 +151,13 @@ describe("ShellParse", () => {
   })
 
   test("splits PowerShell commands case-insensitively", async () => {
+    // A Windows path names the shell only on Windows, so elsewhere the shell is given as a POSIX path.
+    const windows = process.platform === "win32"
     const result = await Effect.runPromise(
       ShellParse.scan(
         "Get-ChildItem; Write-Output 'done'",
-        "C:\\Program Files\\PowerShell\\7\\pwsh.exe",
-        "C:\\workspace",
+        windows ? "C:\\Program Files\\PowerShell\\7\\pwsh.exe" : "/usr/local/bin/pwsh",
+        windows ? "C:\\workspace" : "/workspace",
       ),
     )
     expect(result.commands).toEqual([

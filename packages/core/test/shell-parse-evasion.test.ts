@@ -162,12 +162,16 @@ describe("ShellParse runners and shells that run another command", () => {
   test.each([
     "bash.exe -c 'kubectl delete pod x'",
     "kubectl.exe delete pod x",
-    "KUBECTL.EXE delete pod x",
     `"C:\\Program Files\\Git\\bin\\bash.exe" -c 'kubectl delete pod x'`,
     `'C:\\tools\\kubectl.exe' delete pod x`,
     "/usr/local/bin/kubectl delete pod x",
   ])("names the program without its directory and Windows suffix: %s", async (command) => {
     expect(await matched(command, "kubectl delete *")).toBe(true)
+  })
+
+  // Program names are case-insensitive only on Windows.
+  test.skipIf(process.platform !== "win32")("names the program in any case: KUBECTL.EXE delete pod x", async () => {
+    expect(await matched("KUBECTL.EXE delete pod x", "kubectl delete *")).toBe(true)
   })
 })
 
