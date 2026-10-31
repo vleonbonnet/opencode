@@ -4,7 +4,8 @@ export * as SessionCache from "./service.js"
 //
 // Every Session model request passes through a wire tap (model-request.ts) that sees its final bytes. Primary
 // requests are kept as pending sends, keyed by their Step's assistant message, and confirmed when the Step ends with
-// the provider's cache read/write counts. Preflights dry-run the next turn and compare it with what was confirmed.
+// the provider's cache read/write counts; each confirmation publishes the Session's cache expiry
+// (`session.cache.updated`). Preflights dry-run the next turn and compare it with what was confirmed.
 //
 // Claude 5.1+ binds each thinking signature to the prompt before it. A prompt chooses what happens to thinking that no
 // longer matches (`metadata.thinkingLoss`). "ask": requests ask the provider to fail on a mismatch, and before a Step
@@ -17,7 +18,7 @@ export * as SessionCache from "./service.js"
 // written through. Another process sharing the database does not see this process's copies.
 
 import { STALE_THINKING_ERROR, THINKING_LOSS } from "@opencode/schema/session-cache"
-import type { DroppedThinking, PreflightReport, StaleThinking } from "@opencode/schema/session-cache"
+import type { DroppedThinking, Expiry, PreflightReport, StaleThinking } from "@opencode/schema/session-cache"
 import { makeGlobalNode } from "@opencode/util/effect/app-node"
 import { and, eq, inArray } from "drizzle-orm"
 import { Cause, Clock, Context, Duration, Effect, Layer, Option, Schedule, Schema, Stream } from "effect"
@@ -129,6 +130,11 @@ export interface Interface {
   }) => Effect.Effect<readonly Dropped[] | undefined>
   /** The reasoning blocks later requests leave out, oldest first. */
   readonly dropped: (sessionID: SessionSchema.ID) => Effect.Effect<readonly Dropped[]>
+  /**
+   * The cache entry each Session's next turn reuses if it extends the Session's last confirmed request
+   * (`CacheLedger.expiry`), for every Session that has a live one.
+   */
+  readonly expiries: Effect.Effect<ReadonlyMap<SessionSchema.ID, Expiry>>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/SessionCache") {}
@@ -315,6 +321,18 @@ const layer = Layer.effect(
             })),
           })
 
+    /** The entries of the namespace RECORD's last request went to. */
+    const lastEntries = (record: CacheLedger.SessionRecord | undefined) =>
+      record?.last ? readEntries(record.last.namespace) : Effect.succeed(undefined)
+
+    // Other Sessions sharing the prefix (a fork replaying its parent's history) may refresh this Session's entry
+    // too; their confirmations publish only for themselves.
+    const publishExpiry = Effect.fnUntraced(function* (sessionID: SessionSchema.ID) {
+      const record = yield* readRecord(sessionID)
+      const expiry = CacheLedger.expiry(record, yield* lastEntries(record), yield* Clock.currentTimeMillis)
+      yield* bus.publish(SessionEvent.Cache.Updated, { sessionID, ...(expiry ? { expiry } : {}) })
+    })
+
     const historyOf = Effect.fnUntraced(function* (sessionID: SessionSchema.ID) {
       const rows = yield* db
         .select()
@@ -371,10 +389,12 @@ const layer = Layer.effect(
     ) {
       // Keep-alive generations share the prefix but are not the Session's turn: they refresh the cache entries and
       // never change what the Session knows about its thinking.
-      if (!sent.snapshot)
-        return yield* updateEntries(sent.normalized.namespace, (entries) =>
+      if (!sent.snapshot) {
+        yield* updateEntries(sent.normalized.namespace, (entries) =>
           CacheLedger.confirmEntries({ sent, entries, usage }),
         )
+        return yield* publishExpiry(sessionID)
+      }
       const produced = sent.produced && messageID ? yield* producedBy(sessionID, messageID) : []
       const lost: CacheLedger.LostThinking[] = []
       yield* updateRecord(sessionID, (record) =>
@@ -382,6 +402,7 @@ const layer = Layer.effect(
           lost.push(...CacheLedger.observe({ sent, record, entries, usage, dropped, produced }))
         }),
       )
+      yield* publishExpiry(sessionID)
       if (lost.length === 0) return
       // Blocks the provider removed stay out of later requests: the thinking that request produced is bound to a
       // prompt without them.
@@ -616,6 +637,7 @@ const layer = Layer.effect(
         const report = CacheLedger.predict({
           record,
           entries,
+          previousEntries: yield* lastEntries(record),
           request: input.request,
           ref: input.ref,
           now,
@@ -628,8 +650,10 @@ const layer = Layer.effect(
     const unknown: Interface["unknown"] = (input) =>
       Effect.gen(function* () {
         const now = yield* Clock.currentTimeMillis
+        const record = yield* readRecord(input.sessionID)
         return CacheLedger.unknown({
-          record: yield* readRecord(input.sessionID),
+          record,
+          entries: yield* lastEntries(record),
           reason: input.reason,
           now,
           ref: input.ref,
@@ -722,7 +746,27 @@ const layer = Layer.effect(
     const dropped: Interface["dropped"] = (sessionID) =>
       readRecord(sessionID).pipe(Effect.map((record) => [...(record?.dropped ?? [])]))
 
-    return Service.of({ sent, confirm, discard, predict, unknown, step, consent, consented, dropped })
+    // Records this process holds decoded are used as they are; the others are decoded without being kept, so listing
+    // every Session does not evict the copies of the Sessions in use.
+    const expiries: Interface["expiries"] = Effect.gen(function* () {
+      const now = yield* Clock.currentTimeMillis
+      const result = new Map<SessionSchema.ID, Expiry>()
+      let after: string | undefined
+      do {
+        const page = yield* kv.scan({ prefix: SESSION_PREFIX, after, limit: 200 })
+        for (const entry of page.entries) {
+          const sessionID = entry.key.slice(SESSION_PREFIX.length) as SessionSchema.ID
+          const copy = records.get(sessionID)
+          const record = copy === undefined ? decodeRecord(entry.value) : (copy ?? undefined)
+          const expiry = CacheLedger.expiry(record, yield* lastEntries(record), now)
+          if (expiry) result.set(sessionID, expiry)
+        }
+        after = page.next
+      } while (after !== undefined)
+      return result
+    })
+
+    return Service.of({ sent, confirm, discard, predict, unknown, step, consent, consented, dropped, expiries })
   }),
 )
 

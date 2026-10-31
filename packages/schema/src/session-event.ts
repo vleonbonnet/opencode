@@ -500,6 +500,22 @@ export namespace Thinking {
   export type Dropped = typeof Dropped.Type
 }
 
+export namespace Cache {
+  /**
+   * The Session's prompt-cache {@link SessionCache.Expiry} after the ledger confirmed one of its requests with the
+   * provider's usage: a Step, or a keep-alive generation. `expiry` is absent when no entry of the request is live.
+   * Expiring in time publishes nothing.
+   */
+  export const Updated = Event.ephemeral({
+    type: "session.cache.updated",
+    schema: {
+      ...Base,
+      expiry: SessionCache.Expiry.pipe(optional),
+    },
+  })
+  export type Updated = typeof Updated.Type
+}
+
 export namespace Tool {
   const ToolBase = {
     ...Base,
@@ -720,6 +736,7 @@ export const Definitions = Event.inventory(
   Reasoning.Delta,
   Reasoning.Ended,
   Thinking.Dropped,
+  Cache.Updated,
   Tool.Input.Started,
   Tool.Input.Delta,
   Tool.Input.Ended,

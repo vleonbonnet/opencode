@@ -75,6 +75,23 @@ export const StaleThinking = Schema.Struct({
  */
 export const UNKNOWN_BINDING = "unknown binding"
 
+/**
+ * The provider prompt-cache entry a Session's next turn reuses if it extends the Session's last confirmed request: the
+ * longest prefix of that request whose entry is still within its retention window, as the cache ledger knows it. The
+ * window is the ledger's: the TTL the request asked for (Anthropic `cache_control`: 5 minutes, or 1 hour when
+ * requested) or, for formats that cache automatically, the provider's documented or estimated retention. Each request
+ * that reads or writes the entry restarts it; the provider may still evict an entry earlier.
+ */
+export interface Expiry extends Schema.Schema.Type<typeof Expiry> {}
+export const Expiry = Schema.Struct({
+  /** When the entry leaves its retention window, in epoch milliseconds. */
+  expires: NonNegativeInt,
+  /** The retention window in milliseconds: the entry was last read or written at `expires - ttl`. */
+  ttl: NonNegativeInt,
+  /** The prompt tokens the entry covers. */
+  tokens: NonNegativeInt,
+}).annotate({ identifier: "SessionCache.Expiry" })
+
 export interface PreflightReport extends Schema.Schema.Type<typeof PreflightReport> {}
 export const PreflightReport = Schema.Struct({
   status: PreflightStatus,
@@ -86,6 +103,13 @@ export const PreflightReport = Schema.Struct({
     promptTokens: NonNegativeInt,
     model: ModelRef,
     ageMs: NonNegativeInt,
+    /**
+     * When the Session's cache {@link Expiry} leaves its retention window, in epoch milliseconds; absent when no entry
+     * of the previous request is live.
+     */
+    expires: NonNegativeInt.pipe(optional),
+    /** That entry's retention window, in milliseconds. */
+    ttl: NonNegativeInt.pipe(optional),
   }).pipe(optional),
   reusableTokens: NonNegativeInt,
   reusableExact: Schema.Boolean,

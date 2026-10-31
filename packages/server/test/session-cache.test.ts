@@ -9,6 +9,7 @@ import { ServerFetch } from "../src/fetch"
 const SessionResponse = Schema.Struct({ data: Schema.toEncoded(Session.Info) })
 const PreflightResponse = Schema.Struct({ data: SessionCache.PreflightReport })
 const ThinkingResponse = Schema.Struct({ data: Schema.Struct({ dropped: Schema.Array(SessionCache.DroppedThinking) }) })
+const CacheResponse = Schema.Struct({ data: Schema.Record(Session.ID, SessionCache.Expiry) })
 
 const serve = Effect.gen(function* () {
   const handler = yield* ServerFetch.make({
@@ -30,7 +31,7 @@ const serve = Effect.gen(function* () {
     })
 })
 
-it.live("serves the preflight and dropped-thinking routes", () =>
+it.live("serves the preflight, dropped-thinking and cache expiry routes", () =>
   Effect.gen(function* () {
     const request = yield* serve
     // A directory without project configuration, so the location loads nothing from this repository.
@@ -50,6 +51,11 @@ it.live("serves the preflight and dropped-thinking routes", () =>
     expect(report).toMatchObject({ status: "unknown", reusableTokens: 0, lostTokens: 0 })
     expect(report.reasons).toHaveLength(1)
     expect(report.reasons[0]).not.toContain("\n")
+
+    // No session has a live cache entry yet.
+    const cache = yield* request("/api/experimental/session/cache", "GET")
+    expect(cache.status).toBe(200)
+    expect(Schema.decodeUnknownSync(CacheResponse)(cache.body)).toEqual({ data: {} })
   }).pipe(Effect.scoped),
   // Each test boots a whole server.
   30_000,

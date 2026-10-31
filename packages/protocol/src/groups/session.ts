@@ -221,6 +221,20 @@ export const makeSessionGroup = <I extends HttpApiMiddleware.AnyId, S, FormI ext
       ),
     )
     .add(
+      HttpApiEndpoint.get("session.cache", "/api/experimental/session/cache", {
+        success: Schema.Struct({ data: Schema.Record(Session.ID, SessionCache.Expiry) }).annotate({
+          identifier: "SessionCacheResponse",
+        }),
+      }).annotateMerge(
+        OpenApi.annotations({
+          identifier: "experimental.session.cache",
+          summary: "List prompt-cache expiries",
+          description:
+            "The provider prompt-cache entry each session's next turn would reuse if it extends the session's last request: the longest prefix of that request still within its retention window, as the cache ledger knows it. expires is when the entry leaves the window and ttl the window's length (both in milliseconds; expires is epoch time), tokens the prompt tokens it covers. Sessions absent from the result have no live entry. session.cache.updated carries a session's new value each time a provider response of it is confirmed; nothing is published when an entry expires in time, and a shorter-lived entry may hide a longer-lived shorter prefix (a 1h system prompt under a 5m conversation), so list again once an expiry passes. A preflight reports what the next turn actually reuses.",
+        }),
+      ),
+    )
+    .add(
       HttpApiEndpoint.get("session.get", "/api/session/:sessionID", {
         params: { sessionID: Session.ID },
         success: Schema.Struct({ data: PublicSessionInfo }),

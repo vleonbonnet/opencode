@@ -12,10 +12,10 @@ import type { Model } from "@opencode/schema/model"
 import type { DateTime } from "effect"
 import type { Permission } from "@opencode/schema/permission"
 import type { SessionMessage } from "@opencode/schema/session-message"
+import type { SessionCache } from "@opencode/schema/session-cache"
 import type { SessionInbox } from "@opencode/schema/session-inbox"
 import type { PromptInput } from "@opencode/schema/prompt-input"
 import type { AgentAttachment } from "@opencode/schema/prompt"
-import type { SessionCache } from "@opencode/schema/session-cache"
 import type { Skill } from "@opencode/schema/skill"
 import type { FileDiff } from "@opencode/schema/file-diff"
 import type { InstructionEntry } from "@opencode/schema/instruction-entry"
@@ -230,6 +230,9 @@ export type SessionExportOperation<E = never> = (input: SessionExportInput) => E
 
 export type SessionActiveOutput = { readonly [x: Session.ID]: { readonly type: "running" } }
 export type SessionActiveOperation<E = never> = () => Effect.Effect<SessionActiveOutput, E>
+
+export type SessionCacheOutput = { readonly [x: Session.ID]: SessionCache.Expiry }
+export type SessionCacheOperation<E = never> = () => Effect.Effect<SessionCacheOutput, E>
 
 export type SessionGetInput = { readonly sessionID: Session.ID }
 export type SessionGetOutput = Session.Info
@@ -1353,6 +1356,7 @@ export interface SessionApi<E = never> {
   readonly import: SessionImportOperation<E>
   readonly export: SessionExportOperation<E>
   readonly active: SessionActiveOperation<E>
+  readonly cache: SessionCacheOperation<E>
   readonly get: SessionGetOperation<E>
   readonly remove: SessionRemoveOperation<E>
   readonly fork: SessionForkOperation<E>

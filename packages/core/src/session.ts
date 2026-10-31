@@ -221,6 +221,8 @@ export interface Interface {
   >
   /** The reasoning blocks later requests leave out (dropped thinking), oldest first. */
   readonly thinking: (sessionID: SessionSchema.ID) => Effect.Effect<ReadonlyArray<SessionCache.Dropped>, NotFoundError>
+  /** The prompt-cache entry each Session's next turn would reuse, for every Session with a live one. */
+  readonly cache: SessionCache.Interface["expiries"]
   /** Generates text from current Session context without admitting input or mutating history. */
   readonly generate: (input: {
     sessionID: SessionSchema.ID
@@ -497,6 +499,7 @@ const layer = Layer.effect(
         yield* result.get(sessionID)
         return yield* cache.dropped(sessionID)
       }),
+      cache: cache.expiries,
       command: Effect.fn("Session.command")(function* (input) {
         const session = yield* result.get(input.sessionID)
         return yield* SessionCommand.execute({ ...input, session }).pipe(

@@ -118,6 +118,8 @@ export type SessionStructuredError = {
 
 export type SessionActive = { type: "running" }
 
+export type SessionCacheExpiry = { expires: number; ttl: number; tokens: number }
+
 export type SessionInboxDelivery = "steer" | "queue"
 
 export type SessionCachePreflightStatus = "hit" | "partial" | "miss" | "unknown"
@@ -558,6 +560,8 @@ export type SessionMessageIdle = {
   outcome: "succeeded" | "failed" | "interrupted"
   error?: SessionStructuredError
 }
+
+export type SessionCacheResponse = { data: { [x: SessionID]: SessionCacheExpiry } }
 
 export type SessionCacheStaleThinking = {
   count: number
@@ -1039,7 +1043,14 @@ export type SessionCachePreflightReport = {
   status: SessionCachePreflightStatus
   format?: string
   model?: SessionCacheModelRef
-  previous?: { time: number; promptTokens: number; model: SessionCacheModelRef; ageMs: number }
+  previous?: {
+    time: number
+    promptTokens: number
+    model: SessionCacheModelRef
+    ageMs: number
+    expires?: number
+    ttl?: number
+  }
   reusableTokens: number
   reusableExact: boolean
   lostTokens: number
@@ -1655,6 +1666,15 @@ export type SessionThinkingDropped = {
   type: "session.thinking.dropped"
   location?: LocationRef
   data: { sessionID: SessionID; blocks: Array<SessionCacheDroppedThinkingBlock> }
+}
+
+export type SessionCacheUpdated = {
+  id: EventID
+  created: number
+  metadata?: { [x: string]: any }
+  type: "session.cache.updated"
+  location?: LocationRef
+  data: { sessionID: SessionID; expiry?: SessionCacheExpiry }
 }
 
 export type SessionToolInputDelta = {
@@ -2731,6 +2751,7 @@ export type V2Event =
   | SessionReasoningDelta
   | SessionReasoningEnded
   | SessionThinkingDropped
+  | SessionCacheUpdated
   | SessionToolInputStarted
   | SessionToolInputDelta
   | SessionToolInputEnded
@@ -3525,6 +3546,8 @@ export type SessionExportInput = {
 export type SessionExportOutput = { data: SessionTransferData }["data"]
 
 export type SessionActiveOutput = { data: { [x: SessionID]: SessionActive } }["data"]
+
+export type SessionCacheOutput = SessionCacheResponse["data"]
 
 export type SessionGetInput = { readonly sessionID: { readonly sessionID: string }["sessionID"] }
 

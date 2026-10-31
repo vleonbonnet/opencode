@@ -171,7 +171,18 @@ function memory() {
       return CacheLedger.refuseThinking(record(sessionID), sent, message, now)
     },
     unknown(sessionID: string, reason: string, now = NOW) {
-      return CacheLedger.unknown({ record: sessions.get(sessionID), reason, now })
+      const record = sessions.get(sessionID)
+      return CacheLedger.unknown({
+        record,
+        entries: record?.last ? entries.get(record.last.namespace) : undefined,
+        reason,
+        now,
+      })
+    },
+    /** The Session's cache expiry, as the service lists and publishes it. */
+    expiry(sessionID: string, now = NOW) {
+      const record = sessions.get(sessionID)
+      return CacheLedger.expiry(record, record?.last ? entries.get(record.last.namespace) : undefined, now)
     },
   }
 }
@@ -354,6 +365,8 @@ describe("CacheLedger", () => {
       promptTokens: 120_003,
       model: { id: REF.id, providerID: REF.providerID },
       ageMs: MINUTE,
+      expires: NOW + 60 * MINUTE,
+      ttl: 60 * MINUTE,
     })
   })
 
@@ -539,6 +552,7 @@ describe("CacheLedger", () => {
     const report = ledger.unknown(sessionID, "compaction")
     expect(report.lostTokens).toBe(120_003)
     expect(report.reasons).toEqual(["compaction"])
+    expect(report.previous).toMatchObject({ expires: NOW + 60 * MINUTE, ttl: 60 * MINUTE })
   })
 
   test("a request format the model does not know is unknown", () => {
@@ -550,6 +564,123 @@ describe("CacheLedger", () => {
     expect(report.status).toBe("unknown")
     expect(report.format).toBe("unknown")
     expect(report.reasons[0]).toContain("is not modelled")
+  })
+})
+
+describe("CacheLedger expiry", () => {
+  const sessionID = "ses_expiry"
+  const HOUR = 60 * MINUTE
+  const turn1 = [user("hello " + "x".repeat(4000))]
+  const turn2 = [...turn1, assistant("hi " + "y".repeat(4000)), user("second question")]
+  /** BODY with its message breakpoints at the default five-minute TTL; the system prompt keeps its hour. */
+  const fiveMinuteMessages = (body: Body): Body => ({
+    ...body,
+    messages: body.messages.map((message: Body) => ({
+      ...message,
+      content: message.content.map((block: Body) =>
+        block.cache_control ? { ...block, cache_control: { type: "ephemeral" } } : block,
+      ),
+    })),
+  })
+
+  test("a cached turn's full prompt lives an hour under a 1h TTL", () => {
+    const ledger = memory()
+    ledger.send(sessionID, request(ANTHROPIC, anthropicBody(turn1)))
+    ledger.observe(sessionID, { input: 3, read: 0, write: 120_000 })
+    expect(ledger.expiry(sessionID, NOW + MINUTE)).toEqual({ expires: NOW + HOUR, ttl: HOUR, tokens: 120_000 })
+    const report = ledger.predict(sessionID, request(ANTHROPIC, anthropicBody(turn2)), NOW + MINUTE)
+    expect(report.previous).toMatchObject({ expires: NOW + HOUR, ttl: HOUR })
+  })
+
+  test("a 5m conversation entry expires first; then the 1h system prompt is what remains", () => {
+    const ledger = memory()
+    ledger.send(sessionID, request(ANTHROPIC, fiveMinuteMessages(anthropicBody(turn1))))
+    ledger.observe(sessionID, { input: 3, read: 0, write: 120_000 })
+    expect(ledger.expiry(sessionID, NOW + MINUTE)).toEqual({
+      expires: NOW + 5 * MINUTE,
+      ttl: 5 * MINUTE,
+      tokens: 120_000,
+    })
+    const system = ledger.expiry(sessionID, NOW + 5 * MINUTE)
+    expect(system).toMatchObject({ expires: NOW + HOUR, ttl: HOUR })
+    expect(system!.tokens).toBeGreaterThan(0)
+    expect(system!.tokens).toBeLessThan(120_000)
+    const report = ledger.predict(
+      sessionID,
+      request(ANTHROPIC, fiveMinuteMessages(anthropicBody(turn2))),
+      NOW + 6 * MINUTE,
+    )
+    expect(report.previous).toMatchObject({ expires: NOW + HOUR, ttl: HOUR })
+  })
+
+  test("a request that reads the entry restarts its window", () => {
+    const ledger = memory()
+    ledger.send(sessionID, request(ANTHROPIC, anthropicBody(turn1)))
+    ledger.observe(sessionID, { input: 3, read: 0, write: 120_000 })
+    ledger.send(sessionID, request(ANTHROPIC, anthropicBody(turn2), {}, NOW + 30 * MINUTE))
+    ledger.observe(sessionID, { input: 3, read: 120_000, write: 2_000 })
+    expect(ledger.expiry(sessionID, NOW + 31 * MINUTE)).toEqual({
+      expires: NOW + 30 * MINUTE + HOUR,
+      ttl: HOUR,
+      tokens: 122_000,
+    })
+  })
+
+  test("is absent without a confirmed request, once every entry expired, or when nothing was cached", () => {
+    const ledger = memory()
+    expect(ledger.expiry(sessionID)).toBeUndefined()
+    ledger.send(sessionID, request(ANTHROPIC, anthropicBody(turn1)))
+    ledger.observe(sessionID, { input: 3, read: 0, write: 120_000 })
+    expect(ledger.expiry(sessionID, NOW + HOUR)).toBeUndefined()
+    const expired = ledger.predict(sessionID, request(ANTHROPIC, anthropicBody(turn2)), NOW + HOUR)
+    expect(expired.previous).toBeDefined()
+    expect(expired.previous?.expires).toBeUndefined()
+    expect(expired.previous?.ttl).toBeUndefined()
+
+    const uncached = memory()
+    uncached.send(sessionID, request(ANTHROPIC, anthropicBody(turn1)))
+    uncached.observe(sessionID, { input: 120_003, read: 0, write: 0 })
+    expect(uncached.expiry(sessionID)).toBeUndefined()
+    expect(uncached.unknown(sessionID, "compaction").previous?.expires).toBeUndefined()
+  })
+
+  test("automatic formats keep the newest request's full prompt for the provider's window", () => {
+    const ledger = memory()
+    ledger.send(sessionID, request(OPENAI, { model: "gpt-6-astra", input: [{ role: "user", content: "hello" }] }))
+    ledger.observe(sessionID, { input: 96, read: 117_248, write: 0 })
+    expect(ledger.expiry(sessionID)).toEqual({ expires: NOW + 30 * MINUTE, ttl: 30 * MINUTE, tokens: 117_344 })
+  })
+
+  test("a request to another namespace reports the expiry of the namespace it went to", () => {
+    const ledger = memory()
+    ledger.send(sessionID, request(ANTHROPIC, anthropicBody(turn1)))
+    ledger.observe(sessionID, { input: 3, read: 0, write: 120_000 })
+    const gateway = (time: number) =>
+      request(
+        "https://api.githubcopilot.com/v1/messages",
+        anthropicBody(turn2),
+        { "x-api-key": "", authorization: "Bearer c" },
+        time,
+        "account:c",
+      )
+    ledger.send(sessionID, gateway(NOW + 10 * MINUTE))
+    ledger.observe(sessionID, { input: 3, read: 0, write: 130_000 })
+    expect(ledger.expiry(sessionID, NOW + 11 * MINUTE)).toEqual({
+      expires: NOW + 10 * MINUTE + HOUR,
+      ttl: HOUR,
+      tokens: 130_000,
+    })
+    // Predicting a return to the first gateway still describes the previous request, on the second.
+    const record = ledger.sessions.get(sessionID)!
+    const report = CacheLedger.predict({
+      record,
+      entries: ledger.entries.get(CacheModel.normalize(request(ANTHROPIC, anthropicBody(turn2))).namespace),
+      previousEntries: ledger.entries.get(record.last!.namespace),
+      request: request(ANTHROPIC, anthropicBody(turn2)),
+      ref: REF,
+      now: NOW + 11 * MINUTE,
+    })
+    expect(report.previous).toMatchObject({ expires: NOW + 10 * MINUTE + HOUR, ttl: HOUR })
   })
 })
 

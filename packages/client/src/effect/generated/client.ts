@@ -33,6 +33,7 @@ import type {
   SessionExportInput,
   SessionExportOutput,
   SessionActiveOutput,
+  SessionCacheOutput,
   SessionGetInput,
   SessionGetOutput,
   SessionRemoveInput,
@@ -464,6 +465,14 @@ const EndpointSessionActive = (raw: RawClient["server.session"]) => () =>
     ),
   )
 
+const EndpointSessionCache = (raw: RawClient["server.session"]) => () =>
+  preserveEffect<SessionCacheOutput>()(
+    raw["session.cache"]({}).pipe(
+      Effect.mapError(mapClientError),
+      Effect.map((value) => value.data),
+    ),
+  )
+
 const EndpointSessionGet = (raw: RawClient["server.session"]) => (input: SessionGetInput) =>
   preserveEffect<SessionGetOutput>()(
     raw["session.get"]({ params: { sessionID: input["sessionID"] } }).pipe(
@@ -826,6 +835,7 @@ const adaptGroupSession = (raw: RawClient["server.session"]) => ({
   import: EndpointSessionImport(raw),
   export: EndpointSessionExport(raw),
   active: EndpointSessionActive(raw),
+  cache: EndpointSessionCache(raw),
   get: EndpointSessionGet(raw),
   remove: EndpointSessionRemove(raw),
   fork: EndpointSessionFork(raw),

@@ -160,6 +160,12 @@ export const SessionHandler = HttpApiBuilder.group(Api, "server.session", (handl
         }),
       )
       .handle(
+        "session.cache",
+        Effect.fn(function* () {
+          return { data: Object.fromEntries(yield* session.cache) }
+        }),
+      )
+      .handle(
         "session.get",
         Effect.fn(function* (ctx) {
           return {

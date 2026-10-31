@@ -14,7 +14,7 @@ export * as CacheLedger from "./ledger.js"
 // it, when a Step produced it), a provider refusal, and the dropped-thinking markers.
 
 import { SessionCache, THINKING_LOSS, UNKNOWN_BINDING } from "@opencode/schema/session-cache"
-import type { Divergence as PublicDivergence, PreflightReport } from "@opencode/schema/session-cache"
+import type { Divergence as PublicDivergence, Expiry, PreflightReport } from "@opencode/schema/session-cache"
 import { Schema, type Types } from "effect"
 import { CacheModel } from "./model.js"
 import type { Captured } from "./wire.js"
@@ -319,17 +319,43 @@ function tokensAt(index: number, normalized: CacheModel.Normalized, anchorIndex:
   return Math.round((anchorTokens * upTo) / anchor)
 }
 
-const previousOf = (record: SessionRecord | undefined, now: number) =>
-  record?.last
-    ? {
-        previous: {
-          time: Math.max(0, Math.round(record.last.time)),
-          promptTokens: Math.max(0, Math.round(record.last.prompt)),
-          model: { id: record.last.ref.id, providerID: record.last.ref.providerID },
-          ageMs: Math.max(0, Math.round(now - record.last.time)),
-        },
-      }
-    : {}
+const previousOf = (record: SessionRecord | undefined, entries: Entries | undefined, now: number) => {
+  if (!record?.last) return {}
+  const live = expiry(record, entries, now)
+  return {
+    previous: {
+      time: Math.max(0, Math.round(record.last.time)),
+      promptTokens: Math.max(0, Math.round(record.last.prompt)),
+      model: { id: record.last.ref.id, providerID: record.last.ref.providerID },
+      ageMs: Math.max(0, Math.round(now - record.last.time)),
+      ...(live ? { expires: live.expires, ttl: live.ttl } : {}),
+    },
+  }
+}
+
+/**
+ * The cache entry the Session of RECORD reuses at NOW if its next request extends its last confirmed one: the deepest
+ * prefix of that request with a live entry in ENTRIES, the entries of its namespace. Undefined when none is live.
+ *
+ * It is what `predict` finds for such a request, except that it keeps the windows as recorded and ignores the Anthropic
+ * lookback: a next request that drops part of the previous prompt, moves to another namespace, or adds more than
+ * {@link CacheModel.ANTHROPIC_LOOKBACK} blocks before its breakpoints reuses less, as its preflight reports.
+ */
+export function expiry(
+  record: SessionRecord | undefined,
+  entries: Entries | undefined,
+  now: number,
+): Expiry | undefined {
+  if (!record?.last || !entries) return
+  const block = record.last.blocks.findLast((item) => (entries[item.prefix]?.expires ?? 0) > now)
+  if (!block) return
+  const entry = entries[block.prefix]
+  return {
+    expires: Math.round(entry.expires),
+    ttl: Math.max(0, Math.round(entry.ttl)),
+    tokens: Math.max(0, Math.round(entry.tokens)),
+  }
+}
 
 /** The public form of a divergence: where the next request stops sharing the previous prompt. */
 export const divergenceUnit = (diff: Divergence): PublicDivergence => ({
@@ -345,6 +371,8 @@ export function predict(input: {
   readonly record: SessionRecord | undefined
   /** Entries of the request's namespace. */
   readonly entries: Entries | undefined
+  /** Entries of the namespace of RECORD's last request; ENTRIES when omitted and the namespace is the same. */
+  readonly previousEntries?: Entries
   readonly request: Captured
   readonly ref: ModelRef
   readonly now: number
@@ -358,7 +386,11 @@ export function predict(input: {
   const base = {
     format: normalized.format,
     model: { id: input.ref.id, providerID: input.ref.providerID },
-    ...previousOf(record, now),
+    ...previousOf(
+      record,
+      input.previousEntries ?? (previous?.namespace === normalized.namespace ? input.entries : undefined),
+      now,
+    ),
   }
   if (normalized.format === "unknown") {
     return {
@@ -449,6 +481,8 @@ export function predict(input: {
 /** A report for when no request could be built; everything cached may be lost. */
 export function unknown(input: {
   readonly record: SessionRecord | undefined
+  /** Entries of the namespace of RECORD's last request. */
+  readonly entries?: Entries
   readonly reason: string
   readonly now: number
   readonly ref?: ModelRef
@@ -460,7 +494,7 @@ export function unknown(input: {
     status: "unknown",
     ...(previous ? { format: previous.format } : {}),
     ...(input.ref ? { model: { id: input.ref.id, providerID: input.ref.providerID } } : {}),
-    ...previousOf(input.record, input.now),
+    ...previousOf(input.record, input.entries, input.now),
     reusableTokens: 0,
     reusableExact: false,
     lostTokens: Math.max(0, Math.round(input.lostTokens ?? previous?.prompt ?? 0)),

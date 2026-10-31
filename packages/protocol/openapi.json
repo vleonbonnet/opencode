@@ -1516,6 +1516,48 @@
         "summary": "List active sessions"
       }
     },
+    "/api/experimental/session/cache": {
+      "get": {
+        "tags": ["session"],
+        "operationId": "experimental.session.cache",
+        "parameters": [],
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "SessionCacheResponse",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionCacheResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "InvalidRequestError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InvalidRequestErrorEncoded"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "UnauthorizedError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UnauthorizedErrorEncoded"
+                }
+              }
+            }
+          }
+        },
+        "description": "The provider prompt-cache entry each session's next turn would reuse if it extends the session's last request: the longest prefix of that request still within its retention window, as the cache ledger knows it. expires is when the entry leaves the window and ttl the window's length (both in milliseconds; expires is epoch time), tokens the prompt tokens it covers. Sessions absent from the result have no live entry. session.cache.updated carries a session's new value each time a provider response of it is confirmed; nothing is published when an entry expires in time, and a shorter-lived entry may hide a longer-lived shorter prefix (a 1h system prompt under a 5m conversation), so list again once an expiry passes. A preflight reports what the next turn actually reuses.",
+        "summary": "List prompt-cache expiries"
+      }
+    },
     "/api/session/{sessionID}": {
       "get": {
         "tags": ["session"],
@@ -20557,6 +20599,25 @@
         "required": ["messageID", "ordinal", "reason", "asText", "time"],
         "additionalProperties": false
       },
+      "SessionCache.Expiry": {
+        "type": "object",
+        "properties": {
+          "expires": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "ttl": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "tokens": {
+            "type": "integer",
+            "minimum": 0
+          }
+        },
+        "required": ["expires", "ttl", "tokens"],
+        "additionalProperties": false
+      },
       "SessionCache.ModelRef": {
         "type": "object",
         "properties": {
@@ -20631,6 +20692,14 @@
                 "$ref": "#/components/schemas/SessionCache.ModelRef"
               },
               "ageMs": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "expires": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "ttl": {
                 "type": "integer",
                 "minimum": 0
               }
@@ -20723,6 +20792,22 @@
       "SessionCache.ThinkingLoss": {
         "type": "string",
         "enum": ["ask", "accept"]
+      },
+      "SessionCacheResponse": {
+        "type": "object",
+        "properties": {
+          "data": {
+            "type": "object",
+            "patternProperties": {
+              "^ses": {
+                "$ref": "#/components/schemas/SessionCache.Expiry"
+              }
+            },
+            "additionalProperties": false
+          }
+        },
+        "required": ["data"],
+        "additionalProperties": false
       },
       "SessionGenerateResponse": {
         "type": "object",

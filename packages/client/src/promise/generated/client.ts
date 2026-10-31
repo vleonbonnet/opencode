@@ -27,6 +27,7 @@ import type {
   SessionExportInput,
   SessionExportOutput,
   SessionActiveOutput,
+  SessionCacheOutput,
   SessionGetInput,
   SessionGetOutput,
   SessionRemoveInput,
@@ -641,6 +642,17 @@ export function make(options: ClientOptions) {
           {
             method: "GET",
             path: `/api/session/active`,
+            successStatus: 200,
+            declaredStatuses: [400, 401],
+            empty: false,
+          },
+          requestOptions,
+        ).then((value) => value.data),
+      cache: (requestOptions?: RequestOptions) =>
+        request<{ readonly data: SessionCacheOutput }>(
+          {
+            method: "GET",
+            path: `/api/experimental/session/cache`,
             successStatus: 200,
             declaredStatuses: [400, 401],
             empty: false,
