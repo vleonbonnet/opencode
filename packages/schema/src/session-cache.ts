@@ -76,11 +76,18 @@ export const StaleThinking = Schema.Struct({
 export const UNKNOWN_BINDING = "unknown binding"
 
 /**
- * The provider prompt-cache entry a Session's next turn reuses if it extends the Session's last confirmed request: the
- * longest prefix of that request whose entry is still within its retention window, as the cache ledger knows it. The
- * window is the ledger's: the TTL the request asked for (Anthropic `cache_control`: 5 minutes, or 1 hour when
- * requested) or, for formats that cache automatically, the provider's documented or estimated retention. Each request
- * that reads or writes the entry restarts it; the provider may still evict an entry earlier.
+ * The provider prompt-cache entry holding a Session's own conversation, while it is within its retention window as the
+ * cache ledger knows it: the entry at the tip of the Session's last confirmed request, which a next turn extending that
+ * request reuses for the whole conversation. The tip is the request's last cache breakpoint (Anthropic `cache_control`)
+ * or, for formats that cache every prefix automatically, its full prompt; it counts only when it lies in the
+ * conversation (messages), never in the tools or system prompt. Shorter prefixes, such as the system prompt and tools
+ * other Sessions share and keep warm, do not count: once the tip expired the Session has no live cache, even if a next
+ * turn would still reuse such a prefix (a preflight reports that).
+ *
+ * The window is the ledger's: the TTL the request asked for (Anthropic `cache_control`: 5 minutes, or 1 hour when
+ * requested) or, for automatic formats, the provider's documented or estimated retention. Each request that reads or
+ * writes the entry restarts it, a fork's request reading its parent's tip included; the provider may still evict an
+ * entry earlier.
  */
 export interface Expiry extends Schema.Schema.Type<typeof Expiry> {}
 export const Expiry = Schema.Struct({
@@ -88,8 +95,13 @@ export const Expiry = Schema.Struct({
   expires: NonNegativeInt,
   /** The retention window in milliseconds: the entry was last read or written at `expires - ttl`. */
   ttl: NonNegativeInt,
-  /** The prompt tokens the entry covers. */
+  /** The prompt tokens the entry covers, from the start of the prompt (tools and system prompt included). */
   tokens: NonNegativeInt,
+  /**
+   * The prompt tokens of the Session's last confirmed request (uncached input plus cache reads and writes, as the
+   * provider reported them): `tokens / promptTokens` is the share of that prompt the entry holds.
+   */
+  promptTokens: NonNegativeInt,
 }).annotate({ identifier: "SessionCache.Expiry" })
 
 export interface PreflightReport extends Schema.Schema.Type<typeof PreflightReport> {}
@@ -104,8 +116,10 @@ export const PreflightReport = Schema.Struct({
     model: ModelRef,
     ageMs: NonNegativeInt,
     /**
-     * When the Session's cache {@link Expiry} leaves its retention window, in epoch milliseconds; absent when no entry
-     * of the previous request is live.
+     * When the entry a next turn extending the previous request reuses leaves its retention window, in epoch
+     * milliseconds: the longest prefix of the previous request with a live entry in its namespace, shared prefixes (the
+     * system prompt and tools other Sessions keep warm) included. Absent when no entry of the previous request is live.
+     * This is not the Session's {@link Expiry}, which counts only the entry of its own conversation (the tip).
      */
     expires: NonNegativeInt.pipe(optional),
     /** That entry's retention window, in milliseconds. */

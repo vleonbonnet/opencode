@@ -118,7 +118,7 @@ export type SessionStructuredError = {
 
 export type SessionActive = { type: "running" }
 
-export type SessionCacheExpiry = { expires: number; ttl: number; tokens: number }
+export type SessionCacheExpiry = { expires: number; ttl: number; tokens: number; promptTokens: number }
 
 export type SessionInboxDelivery = "steer" | "queue"
 

@@ -572,6 +572,7 @@ describe("CacheLedger expiry", () => {
   const HOUR = 60 * MINUTE
   const turn1 = [user("hello " + "x".repeat(4000))]
   const turn2 = [...turn1, assistant("hi " + "y".repeat(4000)), user("second question")]
+  const turn3 = [...turn2, assistant("sure " + "z".repeat(4000)), user("third question")]
   /** BODY with its message breakpoints at the default five-minute TTL; the system prompt keeps its hour. */
   const fiveMinuteMessages = (body: Body): Body => ({
     ...body,
@@ -582,17 +583,30 @@ describe("CacheLedger expiry", () => {
       ),
     })),
   })
+  /** The tokens of TURN1's system prompt and tools, as the ledger spreads a 120_000-token first prompt over its bytes. */
+  const sharedPrefix = (ledger: ReturnType<typeof memory>, id = sessionID) => {
+    const last = ledger.sessions.get(id)!.last!
+    const system = last.blocks.findIndex((block) => block.path === "system[0]")
+    return ledger.entries.get(last.namespace)![last.blocks[system].prefix]
+  }
 
-  test("a cached turn's full prompt lives an hour under a 1h TTL", () => {
+  test("is the entry of the last request's tip, with the prompt it belongs to", () => {
     const ledger = memory()
     ledger.send(sessionID, request(ANTHROPIC, anthropicBody(turn1)))
     ledger.observe(sessionID, { input: 3, read: 0, write: 120_000 })
-    expect(ledger.expiry(sessionID, NOW + MINUTE)).toEqual({ expires: NOW + HOUR, ttl: HOUR, tokens: 120_000 })
+    const last = ledger.sessions.get(sessionID)!.last!
+    expect(last.blocks[last.tip!].path).toBe("messages[0].content[0] (user text)")
+    expect(ledger.expiry(sessionID, NOW + MINUTE)).toEqual({
+      expires: NOW + HOUR,
+      ttl: HOUR,
+      tokens: 120_000,
+      promptTokens: 120_003,
+    })
     const report = ledger.predict(sessionID, request(ANTHROPIC, anthropicBody(turn2)), NOW + MINUTE)
     expect(report.previous).toMatchObject({ expires: NOW + HOUR, ttl: HOUR })
   })
 
-  test("a 5m conversation entry expires first; then the 1h system prompt is what remains", () => {
+  test("a 5m conversation under a 1h system prompt is gone after five minutes; the preflight still reuses the system prompt", () => {
     const ledger = memory()
     ledger.send(sessionID, request(ANTHROPIC, fiveMinuteMessages(anthropicBody(turn1))))
     ledger.observe(sessionID, { input: 3, read: 0, write: 120_000 })
@@ -600,17 +614,52 @@ describe("CacheLedger expiry", () => {
       expires: NOW + 5 * MINUTE,
       ttl: 5 * MINUTE,
       tokens: 120_000,
+      promptTokens: 120_003,
     })
-    const system = ledger.expiry(sessionID, NOW + 5 * MINUTE)
-    expect(system).toMatchObject({ expires: NOW + HOUR, ttl: HOUR })
-    expect(system!.tokens).toBeGreaterThan(0)
-    expect(system!.tokens).toBeLessThan(120_000)
+    expect(sharedPrefix(ledger)).toMatchObject({ expires: NOW + HOUR })
+    expect(ledger.expiry(sessionID, NOW + 5 * MINUTE)).toBeUndefined()
+    // A next turn would still read the system prompt: the preflight says so, with that entry's window.
     const report = ledger.predict(
       sessionID,
       request(ANTHROPIC, fiveMinuteMessages(anthropicBody(turn2))),
       NOW + 6 * MINUTE,
     )
+    expect(report.reusableTokens).toBeGreaterThan(0)
     expect(report.previous).toMatchObject({ expires: NOW + HOUR, ttl: HOUR })
+  })
+
+  test("a sibling keeping the shared system prompt warm does not keep a session whose tip expired", () => {
+    const ledger = memory()
+    ledger.send(sessionID, request(ANTHROPIC, anthropicBody(turn1)))
+    ledger.observe(sessionID, { input: 3, read: 0, write: 120_000 })
+    // Another Session with the same tools and system prompt, 50 minutes later, reads and refreshes them.
+    const sibling = [user("another task " + "w".repeat(4000))]
+    const sharedTokens = sharedPrefix(ledger).tokens
+    ledger.send("ses_sibling", request(ANTHROPIC, anthropicBody(sibling), {}, NOW + 50 * MINUTE))
+    ledger.observe("ses_sibling", { input: 3, read: sharedTokens, write: 110_000 })
+    expect(sharedPrefix(ledger)).toMatchObject({ expires: NOW + 50 * MINUTE + HOUR })
+
+    expect(ledger.expiry(sessionID, NOW + 59 * MINUTE)).toMatchObject({ expires: NOW + HOUR, tokens: 120_000 })
+    expect(ledger.expiry(sessionID, NOW + HOUR)).toBeUndefined()
+    expect(ledger.expiry("ses_sibling", NOW + HOUR)).toEqual({
+      expires: NOW + 50 * MINUTE + HOUR,
+      ttl: HOUR,
+      tokens: sharedTokens + 110_000,
+      promptTokens: sharedTokens + 110_003,
+    })
+    // Its next turn would still read the sibling's system prompt: that is the preflight's answer, not its cache.
+    const report = ledger.predict(sessionID, request(ANTHROPIC, anthropicBody(turn2)), NOW + HOUR)
+    expect(report.previous).toMatchObject({ expires: NOW + 50 * MINUTE + HOUR, ttl: HOUR })
+  })
+
+  test("a request whose only breakpoint is the system prompt caches none of its conversation", () => {
+    const ledger = memory()
+    ledger.send(sessionID, request(ANTHROPIC, { ...anthropicBody(turn1), messages: turn1 }))
+    ledger.observe(sessionID, { input: 1_000, read: 0, write: 3_000 })
+    expect(ledger.sessions.get(sessionID)!.last!.tip).toBeUndefined()
+    expect(sharedPrefix(ledger)).toMatchObject({ expires: NOW + HOUR, tokens: 3_000 })
+    expect(ledger.expiry(sessionID, NOW + MINUTE)).toBeUndefined()
+    expect(ledger.unknown(sessionID, "compaction", NOW + MINUTE).previous).toMatchObject({ expires: NOW + HOUR })
   })
 
   test("a request that reads the entry restarts its window", () => {
@@ -623,10 +672,38 @@ describe("CacheLedger expiry", () => {
       expires: NOW + 30 * MINUTE + HOUR,
       ttl: HOUR,
       tokens: 122_000,
+      promptTokens: 122_003,
     })
   })
 
-  test("is absent without a confirmed request, once every entry expired, or when nothing was cached", () => {
+  test("a fork's own tip is what counts for it; its read of the parent's tip refreshes the parent's", () => {
+    const ledger = memory()
+    const fork = "ses_fork"
+    ledger.send(sessionID, request(ANTHROPIC, anthropicBody(turn1)))
+    ledger.observe(sessionID, { input: 3, read: 0, write: 120_000 })
+    // The fork replays the parent's history and adds its own turn: it reads the parent's tip.
+    ledger.send(fork, request(ANTHROPIC, anthropicBody(turn2), {}, NOW + 10 * MINUTE))
+    ledger.observe(fork, { input: 3, read: 120_000, write: 2_000 })
+    expect(ledger.expiry(fork, NOW + 11 * MINUTE)).toEqual({
+      expires: NOW + 10 * MINUTE + HOUR,
+      ttl: HOUR,
+      tokens: 122_000,
+      promptTokens: 122_003,
+    })
+    expect(ledger.expiry(sessionID, NOW + 11 * MINUTE)).toEqual({
+      expires: NOW + 10 * MINUTE + HOUR,
+      ttl: HOUR,
+      tokens: 120_000,
+      promptTokens: 120_003,
+    })
+    // The fork goes on from its own tip; the parent's is no longer read, and expires.
+    ledger.send(fork, request(ANTHROPIC, anthropicBody(turn3), {}, NOW + 65 * MINUTE))
+    ledger.observe(fork, { input: 3, read: 122_000, write: 2_000 })
+    expect(ledger.expiry(sessionID, NOW + 70 * MINUTE)).toBeUndefined()
+    expect(ledger.expiry(fork, NOW + 70 * MINUTE)).toMatchObject({ expires: NOW + 65 * MINUTE + HOUR, tokens: 124_000 })
+  })
+
+  test("is absent without a confirmed request, once the tip expired, when nothing was cached, or without a recorded tip", () => {
     const ledger = memory()
     expect(ledger.expiry(sessionID)).toBeUndefined()
     ledger.send(sessionID, request(ANTHROPIC, anthropicBody(turn1)))
@@ -636,6 +713,9 @@ describe("CacheLedger expiry", () => {
     expect(expired.previous).toBeDefined()
     expect(expired.previous?.expires).toBeUndefined()
     expect(expired.previous?.ttl).toBeUndefined()
+    // A snapshot recorded before tips were has none, even while its entry is live.
+    delete ledger.sessions.get(sessionID)!.last!.tip
+    expect(ledger.expiry(sessionID, NOW + MINUTE)).toBeUndefined()
 
     const uncached = memory()
     uncached.send(sessionID, request(ANTHROPIC, anthropicBody(turn1)))
@@ -644,11 +724,46 @@ describe("CacheLedger expiry", () => {
     expect(uncached.unknown(sessionID, "compaction").previous?.expires).toBeUndefined()
   })
 
-  test("automatic formats keep the newest request's full prompt for the provider's window", () => {
+  test("automatic formats count the newest request's full prompt for the provider's window", () => {
     const ledger = memory()
     ledger.send(sessionID, request(OPENAI, { model: "gpt-6-astra", input: [{ role: "user", content: "hello" }] }))
     ledger.observe(sessionID, { input: 96, read: 117_248, write: 0 })
-    expect(ledger.expiry(sessionID)).toEqual({ expires: NOW + 30 * MINUTE, ttl: 30 * MINUTE, tokens: 117_344 })
+    expect(ledger.expiry(sessionID)).toEqual({
+      expires: NOW + 30 * MINUTE,
+      ttl: 30 * MINUTE,
+      tokens: 117_344,
+      promptTokens: 117_344,
+    })
+  })
+
+  test("automatic formats: a sibling refreshing the shared instructions does not keep a session whose full prompt expired", () => {
+    const ledger = memory()
+    const body = (task: string) => ({
+      model: "gpt-6-astra",
+      instructions: "You are opencode. ".repeat(200),
+      tools: [{ type: "function", name: "read", parameters: { type: "object" } }],
+      input: [{ role: "user", content: task + " " + "x".repeat(4000) }],
+    })
+    ledger.send(sessionID, request(OPENAI, body("first task")))
+    ledger.observe(sessionID, { input: 6_000, read: 0, write: 0 })
+    ledger.send("ses_sibling", request(OPENAI, body("second task"), {}, NOW + 20 * MINUTE))
+    ledger.observe("ses_sibling", { input: 3_000, read: 3_000, write: 0 })
+    const last = ledger.sessions.get(sessionID)!.last!
+    const entries = ledger.entries.get(last.namespace)!
+    const instructions = last.blocks.findIndex((block) => block.path === "instructions")
+    expect(entries[last.blocks[instructions].prefix]).toMatchObject({ expires: NOW + 50 * MINUTE })
+
+    expect(ledger.expiry(sessionID, NOW + 29 * MINUTE)).toMatchObject({ expires: NOW + 30 * MINUTE, tokens: 6_000 })
+    expect(ledger.expiry(sessionID, NOW + 30 * MINUTE)).toBeUndefined()
+    expect(ledger.expiry("ses_sibling", NOW + 30 * MINUTE)).toEqual({
+      expires: NOW + 50 * MINUTE,
+      ttl: 30 * MINUTE,
+      tokens: 6_000,
+      promptTokens: 6_000,
+    })
+    // A next turn still reuses the instructions: the preflight's previous entry is theirs.
+    const report = ledger.predict(sessionID, request(OPENAI, body("first task")), NOW + 30 * MINUTE)
+    expect(report.previous).toMatchObject({ expires: NOW + 50 * MINUTE, ttl: 30 * MINUTE })
   })
 
   test("a request to another namespace reports the expiry of the namespace it went to", () => {
@@ -669,6 +784,7 @@ describe("CacheLedger expiry", () => {
       expires: NOW + 10 * MINUTE + HOUR,
       ttl: HOUR,
       tokens: 130_000,
+      promptTokens: 130_003,
     })
     // Predicting a return to the first gateway still describes the previous request, on the second.
     const record = ledger.sessions.get(sessionID)!

@@ -221,7 +221,7 @@ export interface Interface {
   >
   /** The reasoning blocks later requests leave out (dropped thinking), oldest first. */
   readonly thinking: (sessionID: SessionSchema.ID) => Effect.Effect<ReadonlyArray<SessionCache.Dropped>, NotFoundError>
-  /** The prompt-cache entry each Session's next turn would reuse, for every Session with a live one. */
+  /** The prompt-cache entry of each Session's own conversation (its last request's tip), for each one still live. */
   readonly cache: SessionCache.Interface["expiries"]
   /** Generates text from current Session context without admitting input or mutating history. */
   readonly generate: (input: {

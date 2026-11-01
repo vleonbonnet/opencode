@@ -61,6 +61,12 @@ export const Snapshot = Schema.Struct({
   ),
   totalBytes: Schema.Number,
   time: Schema.Number,
+  /**
+   * The index in `blocks` of the request's own conversation entry (its tip): the last breakpoint of an explicit format,
+   * the full prompt of an automatic one; absent when that block is not in the messages region (the request cached none
+   * of its conversation), and in snapshots recorded before the tip was.
+   */
+  tip: Schema.optional(Schema.Number),
 })
 export type Snapshot = Types.DeepMutable<typeof Snapshot.Type>
 
@@ -182,6 +188,9 @@ const tolerance = (value: number, exact = true) => Math.max(4096, Math.round(val
 export const emptyRecord = (): SessionRecord => ({ verifications: [], thinking: {}, dropped: [] })
 
 function snapshot(normalized: CacheModel.Normalized, ref: ModelRef, time: number): Snapshot {
+  const tip = normalized.automatic
+    ? normalized.blocks.length - 1
+    : normalized.blocks.findLastIndex((block) => block.breakpoint !== undefined)
   return {
     namespace: normalized.namespace,
     format: normalized.format,
@@ -198,6 +207,7 @@ function snapshot(normalized: CacheModel.Normalized, ref: ModelRef, time: number
     })),
     totalBytes: normalized.totalBytes,
     time,
+    ...(normalized.blocks[tip]?.region === "messages" ? { tip } : {}),
   }
 }
 
@@ -321,40 +331,63 @@ function tokensAt(index: number, normalized: CacheModel.Normalized, anchorIndex:
 
 const previousOf = (record: SessionRecord | undefined, entries: Entries | undefined, now: number) => {
   if (!record?.last) return {}
-  const live = expiry(record, entries, now)
+  const last = record.last
+  const reused = entries && last.blocks.findLast((item) => (entries[item.prefix]?.expires ?? 0) > now)
+  const live = reused && entries[reused.prefix]
   return {
     previous: {
-      time: Math.max(0, Math.round(record.last.time)),
-      promptTokens: Math.max(0, Math.round(record.last.prompt)),
-      model: { id: record.last.ref.id, providerID: record.last.ref.providerID },
-      ageMs: Math.max(0, Math.round(now - record.last.time)),
-      ...(live ? { expires: live.expires, ttl: live.ttl } : {}),
+      time: Math.max(0, Math.round(last.time)),
+      promptTokens: Math.max(0, Math.round(last.prompt)),
+      model: { id: last.ref.id, providerID: last.ref.providerID },
+      ageMs: Math.max(0, Math.round(now - last.time)),
+      // What a next turn extending the previous request reuses, shared prefixes included; unlike `expiry`, which only
+      // counts the Session's own conversation. It keeps the windows as recorded and ignores the Anthropic lookback.
+      ...(live ? { expires: Math.round(live.expires), ttl: Math.max(0, Math.round(live.ttl)) } : {}),
     },
   }
 }
 
 /**
- * The cache entry the Session of RECORD reuses at NOW if its next request extends its last confirmed one: the deepest
- * prefix of that request with a live entry in ENTRIES, the entries of its namespace. Undefined when none is live.
+ * Where the entry of the Session's own conversation lives: the namespace and block prefix of the tip of RECORD's last
+ * confirmed request ({@link Snapshot} `tip`). Undefined when that request cached none of its conversation, or was
+ * recorded before tips were.
+ */
+export function tipOf(record: SessionRecord | undefined) {
+  const last = record?.last
+  if (last?.tip === undefined) return
+  const block = last.blocks[last.tip]
+  return block ? { namespace: last.namespace, prefix: block.prefix } : undefined
+}
+
+/** ENTRY as an {@link Expiry} reports it at NOW, without the prompt size; undefined unless it is live. */
+export function liveEntry(entry: Entry | undefined, now: number) {
+  if (!entry || entry.expires <= now) return
+  return {
+    expires: Math.round(entry.expires),
+    ttl: Math.max(0, Math.round(entry.ttl)),
+    tokens: Math.max(0, Math.round(entry.tokens)),
+  }
+}
+
+/**
+ * The Session's own cache entry at NOW: the entry, in ENTRIES (its namespace's), of the tip of RECORD's last confirmed
+ * request ({@link tipOf}), which a next turn extending that request reuses for its whole conversation. Undefined when
+ * it is not live, even when a shorter prefix is: the system prompt and tools other Sessions share and keep warm are not
+ * this Session's cache. A fork's own tip is what counts for it; its requests reading the parent's tip refresh the
+ * parent's.
  *
- * It is what `predict` finds for such a request, except that it keeps the windows as recorded and ignores the Anthropic
- * lookback: a next request that drops part of the previous prompt, moves to another namespace, or adds more than
- * {@link CacheModel.ANTHROPIC_LOOKBACK} blocks before its breakpoints reuses less, as its preflight reports.
+ * Automatic formats cache every prefix of a request; the tip is its full prompt, so a Session counts as cached only
+ * while all of its last request is. The windows stay as recorded.
  */
 export function expiry(
   record: SessionRecord | undefined,
   entries: Entries | undefined,
   now: number,
 ): Expiry | undefined {
-  if (!record?.last || !entries) return
-  const block = record.last.blocks.findLast((item) => (entries[item.prefix]?.expires ?? 0) > now)
-  if (!block) return
-  const entry = entries[block.prefix]
-  return {
-    expires: Math.round(entry.expires),
-    ttl: Math.max(0, Math.round(entry.ttl)),
-    tokens: Math.max(0, Math.round(entry.tokens)),
-  }
+  const tip = tipOf(record)
+  const live = tip && liveEntry(entries?.[tip.prefix], now)
+  if (!live || !record?.last) return
+  return { ...live, promptTokens: Math.max(0, Math.round(record.last.prompt)) }
 }
 
 /** The public form of a divergence: where the next request stops sharing the previous prompt. */

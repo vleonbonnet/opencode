@@ -4,8 +4,9 @@ export * as SessionCache from "./service.js"
 //
 // Every Session model request passes through a wire tap (model-request.ts) that sees its final bytes. Primary
 // requests are kept as pending sends, keyed by their Step's assistant message, and confirmed when the Step ends with
-// the provider's cache read/write counts; each confirmation publishes the Session's cache expiry
-// (`session.cache.updated`). Preflights dry-run the next turn and compare it with what was confirmed.
+// the provider's cache read/write counts. Each confirmation publishes (`session.cache.updated`) the cache expiry of
+// its Session and of every other Session whose own entry, the tip of its last request (`CacheLedger.expiry`), it
+// changed. Preflights dry-run the next turn and compare it with what was confirmed.
 //
 // Claude 5.1+ binds each thinking signature to the prompt before it. A prompt chooses what happens to thinking that no
 // longer matches (`metadata.thinkingLoss`). "ask": requests ask the provider to fail on a mismatch, and before a Step
@@ -131,8 +132,8 @@ export interface Interface {
   /** The reasoning blocks later requests leave out, oldest first. */
   readonly dropped: (sessionID: SessionSchema.ID) => Effect.Effect<readonly Dropped[]>
   /**
-   * The cache entry each Session's next turn reuses if it extends the Session's last confirmed request
-   * (`CacheLedger.expiry`), for every Session that has a live one.
+   * The cache entry of each Session's own conversation, the tip of its last confirmed request (`CacheLedger.expiry`),
+   * for every Session whose tip entry is live.
    */
   readonly expiries: Effect.Effect<ReadonlyMap<SessionSchema.ID, Expiry>>
 }
@@ -233,6 +234,28 @@ const layer = Layer.effect(
     // Decoded copies of what KV holds; `null` records a Session known to have none.
     const records = new Map<SessionSchema.ID, CacheLedger.SessionRecord | null>()
     const namespaces = new Map<string, CacheLedger.Entries>()
+    // Where each Session's own entry (the tip of its last request, `CacheLedger.tipOf`) lives, and the reverse, so a
+    // confirmation can tell which Sessions' entries it changed. Kept with every record write; `indexed` fills it from
+    // the records persisted before this process started.
+    const tips = new Map<SessionSchema.ID, { readonly namespace: string; readonly prefix: string }>()
+    const owners = new Map<string, Map<string, Set<SessionSchema.ID>>>()
+    const indexTip = (sessionID: SessionSchema.ID, record: CacheLedger.SessionRecord | undefined) => {
+      const previous = tips.get(sessionID)
+      const next = CacheLedger.tipOf(record)
+      if (previous?.namespace === next?.namespace && previous?.prefix === next?.prefix) return
+      const stale = previous && owners.get(previous.namespace)
+      const sessions = previous && stale?.get(previous.prefix)
+      if (previous && stale && sessions) {
+        sessions.delete(sessionID)
+        if (sessions.size === 0) stale.delete(previous.prefix)
+        if (stale.size === 0) owners.delete(previous.namespace)
+      }
+      if (!next) return void tips.delete(sessionID)
+      tips.set(sessionID, next)
+      const prefixes = owners.get(next.namespace) ?? new Map<string, Set<SessionSchema.ID>>()
+      owners.set(next.namespace, prefixes)
+      prefixes.set(next.prefix, (prefixes.get(next.prefix) ?? new Set()).add(sessionID))
+    }
 
     // A read outside a key's lock keeps its copy only if no write stored a newer one meanwhile.
     const readRecord = (sessionID: SessionSchema.ID) =>
@@ -274,6 +297,7 @@ const layer = Layer.effect(
       Effect.suspend(() => {
         const empty = CacheLedger.prune(record, now)
         remember(records, sessionID, empty ? null : record, RECORD_COPIES)
+        indexTip(sessionID, record)
         return empty ? kv.remove(sessionKey(sessionID)) : kv.set(sessionKey(sessionID), encodeRecord(record))
       })
     const storeEntries = (namespace: string, entries: CacheLedger.Entries, now: number) =>
@@ -298,13 +322,26 @@ const layer = Layer.effect(
         }),
       )
 
+    /** Read-modify-write a namespace's entries under its lock; returns the Sessions whose own entry changed. */
     const updateEntries = (namespace: string, update: (entries: CacheLedger.Entries) => void) =>
       locks.withLock(namespaceKey(namespace))(
         Effect.gen(function* () {
           const now = yield* Clock.currentTimeMillis
           const entries = yield* readEntries(namespace)
+          const before = new Map(
+            [...(owners.get(namespace)?.keys() ?? [])].map((prefix) => [
+              prefix,
+              CacheLedger.liveEntry(entries[prefix], now),
+            ]),
+          )
           update(entries)
           yield* storeEntries(namespace, entries, now)
+          return [...before].flatMap(([prefix, previous]) => {
+            const next = CacheLedger.liveEntry(entries[prefix], now)
+            const same =
+              previous?.expires === next?.expires && previous?.ttl === next?.ttl && previous?.tokens === next?.tokens
+            return same ? [] : [...(owners.get(namespace)?.get(prefix) ?? [])]
+          })
         }),
       )
 
@@ -325,13 +362,32 @@ const layer = Layer.effect(
     const lastEntries = (record: CacheLedger.SessionRecord | undefined) =>
       record?.last ? readEntries(record.last.namespace) : Effect.succeed(undefined)
 
-    // Other Sessions sharing the prefix (a fork replaying its parent's history) may refresh this Session's entry
-    // too; their confirmations publish only for themselves.
     const publishExpiry = Effect.fnUntraced(function* (sessionID: SessionSchema.ID) {
       const record = yield* readRecord(sessionID)
       const expiry = CacheLedger.expiry(record, yield* lastEntries(record), yield* Clock.currentTimeMillis)
       yield* bus.publish(SessionEvent.Cache.Updated, { sessionID, ...(expiry ? { expiry } : {}) })
     })
+
+    // The records persisted before this process started enter the tip index once, before the first confirmation needs
+    // it. Each is read under its Session's lock, so a write racing the scan is never replaced by an older value.
+    const indexed = yield* Effect.cached(
+      Effect.gen(function* () {
+        let after: string | undefined
+        do {
+          const page = yield* kv.scan({ prefix: SESSION_PREFIX, after, limit: 200 })
+          for (const entry of page.entries) {
+            const sessionID = entry.key.slice(SESSION_PREFIX.length) as SessionSchema.ID
+            yield* locks.withLock(entry.key)(
+              Effect.gen(function* () {
+                const copy = records.get(sessionID)
+                indexTip(sessionID, copy === undefined ? decodeRecord(yield* kv.get(entry.key)) : (copy ?? undefined))
+              }),
+            )
+          }
+          after = page.next
+        } while (after !== undefined)
+      }),
+    )
 
     const historyOf = Effect.fnUntraced(function* (sessionID: SessionSchema.ID) {
       const rows = yield* db
@@ -388,21 +444,25 @@ const layer = Layer.effect(
       dropped: readonly CacheLedger.Drop[] | undefined,
     ) {
       // Keep-alive generations share the prefix but are not the Session's turn: they refresh the cache entries and
-      // never change what the Session knows about its thinking.
+      // never change what the Session knows about its thinking. The tip index must be complete before a confirmation
+      // compares the entries it changes, and is filled outside every lock (it takes the Session locks).
+      yield* indexed
       if (!sent.snapshot) {
-        yield* updateEntries(sent.normalized.namespace, (entries) =>
+        const changed = yield* updateEntries(sent.normalized.namespace, (entries) =>
           CacheLedger.confirmEntries({ sent, entries, usage }),
         )
-        return yield* publishExpiry(sessionID)
+        return yield* Effect.forEach(new Set(changed), publishExpiry, { discard: true })
       }
       const produced = sent.produced && messageID ? yield* producedBy(sessionID, messageID) : []
       const lost: CacheLedger.LostThinking[] = []
-      yield* updateRecord(sessionID, (record) =>
+      const changed = yield* updateRecord(sessionID, (record) =>
         updateEntries(sent.normalized.namespace, (entries) => {
           lost.push(...CacheLedger.observe({ sent, record, entries, usage, dropped, produced }))
         }),
       )
-      yield* publishExpiry(sessionID)
+      // The Session's own Step always moves its tip; other Sessions publish only when this request changed their entry
+      // (a fork reading its parent's tip refreshes it).
+      yield* Effect.forEach(new Set([sessionID, ...changed]), publishExpiry, { discard: true })
       if (lost.length === 0) return
       // Blocks the provider removed stay out of later requests: the thinking that request produced is bound to a
       // prompt without them.
@@ -458,6 +518,7 @@ const layer = Layer.effect(
         yield* locks.withLock(sessionKey(event.data.sessionID))(
           Effect.suspend(() => {
             records.delete(event.data.sessionID)
+            indexTip(event.data.sessionID, undefined)
             return kv.remove(sessionKey(event.data.sessionID))
           }),
         )
@@ -555,6 +616,7 @@ const layer = Layer.effect(
                   const record = records.get(sessionID) ?? decodeRecord(yield* kv.get(entry.key))
                   if (!record) {
                     records.delete(sessionID)
+                    indexTip(sessionID, undefined)
                     return yield* kv.remove(entry.key)
                   }
                   return yield* storeRecord(sessionID, record, now)

@@ -502,9 +502,10 @@ export namespace Thinking {
 
 export namespace Cache {
   /**
-   * The Session's prompt-cache {@link SessionCache.Expiry} after the ledger confirmed one of its requests with the
-   * provider's usage: a Step, or a keep-alive generation. `expiry` is absent when no entry of the request is live.
-   * Expiring in time publishes nothing.
+   * The Session's prompt-cache {@link SessionCache.Expiry}, the entry of its own conversation (the tip of its last
+   * request), after it changed: each confirmed Step of the Session (its tip moves), and each confirmed request of any
+   * Session that refreshed, rewrote or evicted that entry (a keep-alive generation reading it, a fork's request reading
+   * its parent's tip). `expiry` is absent when the tip has no live entry. Expiring in time publishes nothing.
    */
   export const Updated = Event.ephemeral({
     type: "session.cache.updated",
