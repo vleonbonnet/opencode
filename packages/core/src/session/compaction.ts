@@ -18,7 +18,7 @@ import type { StreamOptions } from "@opencode/ai/route"
 import type { SessionCompactionResult } from "@opencode/plugin/effect/session"
 import type { SessionError } from "@opencode/schema/session-error"
 import { makeLocationNode } from "@opencode/util/effect/app-node"
-import { Context, Effect, Exit, Fiber, Layer, Result, Scope, Stream } from "effect"
+import { Context, DateTime, Effect, Exit, Fiber, Layer, Result, Scope, Stream } from "effect"
 import { Agent } from "../agent.js"
 import { Bus } from "../bus.js"
 import { Database } from "../database/database.js"
@@ -29,7 +29,7 @@ import { Token } from "../util/token.js"
 import type { SessionContext } from "./context.js"
 import { SessionEvent } from "./event.js"
 import { SessionHistory } from "./history.js"
-import type { SessionMessage } from "./message.js"
+import { SessionMessage } from "./message.js"
 import { SessionModelRequest } from "./model-request.js"
 import { SessionRunnerModel } from "./runner/model.js"
 import { SessionRunnerRetry } from "./runner/retry.js"
@@ -314,7 +314,9 @@ export const layer = Layer.effect(
           : summarize(selected, budget, settings.keep)
       return yield* compaction.pipe(
         Effect.matchEffect({
-          onSuccess: (result) => publish(selected, result),
+          // The next request is the session's own, whichever model wrote the summary.
+          onSuccess: (result) =>
+            nextPrompt(trigger, result).pipe(Effect.flatMap((estimate) => publish(selected, result, estimate))),
           onFailure: (failure) => publish(selected, failure),
         }),
       )
@@ -857,9 +859,50 @@ export const layer = Layer.effect(
         yield* bus.publish(SessionEvent.UsageRecorded, { sessionID, source: "compaction", ...usage })
       })
 
+    /**
+     * The estimated prompt of the next request once `result` replaces the history before the compaction's message,
+     * which nothing measures until that request's step ends: the system prompt and tools, the checkpoint with the text
+     * of the messages it keeps, and what was added after the message opened, such as a shell command run meanwhile. The
+     * instruction updates it replaces still count, since completing the compaction folds them into the system prompt.
+     * Undefined for a native window, which cannot be measured locally.
+     */
+    const nextPrompt = Effect.fnUntraced(function* (trigger: Trigger, result: Result) {
+      if (result.native) return undefined
+      const context = trigger.context
+      const history = yield* SessionHistory.load(db, context.session.id, context.model.ref).pipe(Effect.orDie)
+      const opened = history.findLastIndex((message) => message.type === "compaction" && message.status === "running")
+      // Without an opened message, the completed one is appended after everything.
+      const end = opened === -1 ? history.length : opened
+      const replaced = history.slice(0, end)
+      const kept = replaced.findIndex((message) => message.id === result.metadata?.keepID)
+      const checkpoint = SessionMessage.CompactionCompleted.make({
+        id: SessionMessage.ID.create(),
+        type: "compaction",
+        status: "completed",
+        reason: trigger.reason === "manual" ? "manual" : "auto",
+        summary: result.text,
+        // As history rebuilds it from `keepID` (see `SessionRecentText.kept`).
+        metadata: {
+          ...result.metadata,
+          recent:
+            kept === -1 ? "" : replaced.slice(kept).map(SessionRecentText.messageToText).filter(Boolean).join("\n\n"),
+        },
+        time: { created: DateTime.makeUnsafe(0) },
+      })
+      return estimateContext({
+        ...context,
+        messages: [
+          ...replaced.filter((message) => message.type === "system"),
+          checkpoint,
+          ...history.slice(end + 1),
+        ],
+      })
+    })
+
     const publish = Effect.fnUntraced(function* (
       trigger: Trigger,
       outcome: Result | Failure,
+      nextContext?: number,
     ): Effect.fn.Return<Outcome> {
       const context = trigger.context
       const sessionID = context.session.id
@@ -885,6 +928,7 @@ export const layer = Layer.effect(
           model: context.model.ref,
           native: outcome.native,
           text: outcome.text,
+          context: nextContext,
           ...usage,
         },
         { metadata: outcome.metadata },

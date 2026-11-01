@@ -959,6 +959,7 @@ export type SessionMessageCompactionCompleted = {
   model?: ModelRef
   native?: SessionMessageNative
   summary: string
+  context?: number
   cost?: MoneyUSD
   tokens?: TokenUsageInfo
 }
@@ -1498,6 +1499,7 @@ export type SessionCompactionEnded = {
     model?: ModelRef
     native?: SessionMessageNative1
     text: string
+    context?: number
     cost?: MoneyUSD
     tokens?: TokenUsageInfo
   }

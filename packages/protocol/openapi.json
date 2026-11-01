@@ -19864,6 +19864,10 @@
           "summary": {
             "type": "string"
           },
+          "context": {
+            "type": "integer",
+            "minimum": 0
+          },
           "cost": {
             "$ref": "#/components/schemas/Money.USD"
           },

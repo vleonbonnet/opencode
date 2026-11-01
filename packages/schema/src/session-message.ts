@@ -7,7 +7,7 @@ import { Location } from "./location.js"
 import { Model } from "./model.js"
 import { Project } from "./project.js"
 import { Prompt } from "./prompt.js"
-import { DateTimeUtcFromMillis, PositiveInt, RelativePath, statics } from "./schema.js"
+import { DateTimeUtcFromMillis, NonNegativeInt, PositiveInt, RelativePath, statics } from "./schema.js"
 import { ascending } from "./identifier.js"
 import { Shell as ShellSchema } from "./shell.js"
 import { FinishReason } from "./llm.js"
@@ -263,6 +263,13 @@ export const CompactionCompleted = Schema.Struct({
   /** A provider compaction stores its replacement window in `native.messages`, replayed instead of `summary`. */
   native: Native.pipe(optional),
   summary: Schema.String,
+  /**
+   * The estimated prompt tokens of the next request, as the compaction left the conversation: system prompt, tools,
+   * this summary with the messages it keeps verbatim, and whatever followed. Unlike `tokens`, this is the size of the
+   * resulting context, until the next step reports the measured one. Absent for a provider compaction, whose window
+   * cannot be measured locally, and for compactions recorded before it was reported.
+   */
+  context: NonNegativeInt.pipe(optional),
   ...CompactionUsage,
 }).annotate({ identifier: "Session.Message.Compaction.Completed" })
 

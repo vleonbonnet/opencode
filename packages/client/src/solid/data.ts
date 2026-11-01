@@ -1181,6 +1181,7 @@ export function createData(config: CreateDataInput) {
               model: event.data.model,
               native: event.data.native,
               summary: event.data.text,
+              context: event.data.context,
               cost: event.data.cost,
               tokens: event.data.tokens,
             })
@@ -1194,6 +1195,7 @@ export function createData(config: CreateDataInput) {
             model: event.data.model,
             native: event.data.native,
             summary: event.data.text,
+            context: event.data.context,
             cost: event.data.cost,
             tokens: event.data.tokens,
             time: { created: event.created },

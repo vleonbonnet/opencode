@@ -221,6 +221,8 @@ const setup = Effect.fnUntraced(function* (options: { endpoint?: boolean } = {})
     expect(last.metadata?.recent).toBeUndefined()
     // Provider compaction has no summary, so the request usage is the only visible cost of the operation.
     expect(last.tokens).toMatchObject({ input: 20, output: 4 })
+    // An encrypted window has no locally measurable size, so the next request's prompt is left unestimated.
+    expect(last).not.toHaveProperty("context")
     return last
   })
   return {

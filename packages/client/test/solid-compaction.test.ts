@@ -130,6 +130,21 @@ test.each(["started", "cancelled", "failed"])(
   },
 )
 
+test("keeps the estimated prompt of the next request a summary compaction reports", () => {
+  using fixture = setup()
+  fixture.emit({ ...event, type: "session.compaction.started", data: { sessionID, reason: "auto" } })
+  fixture.emit({
+    ...event,
+    id: "evt_compact_ended",
+    type: "session.compaction.ended",
+    data: { sessionID, reason: "auto", text: "Summary", context: 4_200 },
+  })
+  // A reloaded session reads the same size from the stored message.
+  expect(fixture.data.session.message.list(sessionID)).toMatchObject([
+    { type: "compaction", status: "completed", summary: "Summary", context: 4_200 },
+  ])
+})
+
 test.each(["model", "compact"])("rolls back a rejected %s RPC and releases the following prompt", async (rpc) => {
   using fixture = setup()
   const request = fixture.data.session.compact({ sessionID, model: { providerID: "demo", id: "model" } })

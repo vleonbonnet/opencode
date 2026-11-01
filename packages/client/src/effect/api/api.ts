@@ -1161,6 +1161,7 @@ export type SessionLogOutput =
             readonly model?: Model.Ref | undefined
             readonly native?: SessionMessage.Native | undefined
             readonly text: string
+            readonly context?: number | undefined
             readonly cost?: Money.USD | undefined
             readonly tokens?:
               | {
