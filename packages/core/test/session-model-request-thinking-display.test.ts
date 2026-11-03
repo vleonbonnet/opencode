@@ -1,6 +1,6 @@
 import { describe, expect } from "bun:test"
 import { LanguageModel, Message, SystemPart } from "@opencode/ai/effect"
-import { mergeHttpOptions, mergeJsonRecords } from "@opencode/ai/route"
+import { mergeJsonRecords, mergeTransport } from "@opencode/ai/route"
 import { AnthropicMessages, OpenAIChat } from "@opencode/ai/protocols"
 import { AmazonBedrock, AmazonBedrockMantle, GoogleVertexMessages, MiniMax } from "@opencode/ai/providers"
 import { compileRequest } from "@opencode/ai/testing"
@@ -49,7 +49,7 @@ const sent = (model: LanguageModel, kind: "primary" | "compaction" | "generate" 
       messages: [Message.user("Think it through")],
     })
     const compiled = yield* compileRequest(prepared.request)
-    const http = mergeHttpOptions(model.route.defaults.http, model.defaults?.http, prepared.request.http)
+    const http = mergeTransport(model.route.defaults, model.defaults, prepared.request).http
     return mergeJsonRecords(compiled.body as Record<string, unknown>, http?.body) ?? {}
   }).pipe(Effect.provideService(SessionModelTransport.Service, transport))
 

@@ -266,6 +266,16 @@ export interface Panel {
   readonly region: "side"
   /** Asks for the wider session minimum while the side region is open. Reactive. */
   readonly wide?: boolean
+  /**
+   * Gives the panel a side region width of its own, for content that wants less room or more than other tabs. While the
+   * side pane shows one of the panel's tabs, the region takes the width the user last dragged it to on this panel,
+   * app-wide, else this one; other tabs keep the conversation's width. The host keeps the conversation at its minimum
+   * width and the region at least `narrow`. Omit it to share the conversation's width, unless `Layout.side.resize`
+   * stored one for the panel.
+   * - A number: CSS pixels.
+   * - `narrow`: the narrowest the region goes.
+   */
+  readonly width?: number | "narrow"
   /** Tabs are not restored: stored keys this panel stops listing leave the strip. See also `PanelTab.transient`. */
   readonly transient?: boolean
   /**
@@ -673,6 +683,103 @@ export interface ComposerPill {
   menu?(input: ComposerPillMenuProps): JSX.Element
 }
 
+/**
+ * The seed colors a theme variant generates its scales from. Each is a hex color: `#rgb`, `#rgba`, `#rrggbb` or
+ * `#rrggbbaa`.
+ */
+export interface ThemeSeedColors {
+  /** Base of the gray scale. */
+  readonly neutral: string
+  /** The brand and accent color. */
+  readonly primary: string
+  /** Success states, usually green. */
+  readonly success: string
+  /** Warning states, usually yellow or orange. */
+  readonly warning: string
+  /** Error and critical states, usually red. */
+  readonly error: string
+  /** Informational states, usually blue or purple. */
+  readonly info: string
+  /** Links and interactive elements. */
+  readonly interactive: string
+  /** Added lines in diffs. */
+  readonly diffAdd: string
+  /** Deleted lines in diffs. */
+  readonly diffDelete: string
+}
+
+/**
+ * The palette a theme variant derives its colors from, the form most of the app's own themes use. Each is a hex color:
+ * `#rgb`, `#rgba`, `#rrggbb` or `#rrggbbaa`.
+ */
+export interface ThemePaletteColors {
+  /** The background the neutral scale starts from. */
+  readonly neutral: string
+  /** The text color the neutral scale ends at. */
+  readonly ink: string
+  /** The brand color. */
+  readonly primary: string
+  /** Success states, usually green. */
+  readonly success: string
+  /** Warning states, usually yellow or orange. */
+  readonly warning: string
+  /** Error and critical states, usually red. */
+  readonly error: string
+  /** Informational states, usually blue or purple. */
+  readonly info: string
+  /** A secondary accent. Defaults to `info`. */
+  readonly accent?: string
+  /** Links and interactive elements. Defaults to `primary`. */
+  readonly interactive?: string
+  /** Added lines in diffs. Defaults to one derived from `success`. */
+  readonly diffAdd?: string
+  /** Deleted lines in diffs. Defaults to one derived from `error`. */
+  readonly diffDelete?: string
+}
+
+/** The fields every theme variant can have, whichever colors it starts from. */
+interface ThemeVariantBase {
+  /** Exact values for single tokens, such as `syntax-keyword`: a hex color or a `var(--token)` reference. */
+  readonly overrides?: Readonly<Record<string, string>>
+  /** Exact values for single tokens of the app's newer token set: a hex color, a `var(--token)` reference, or CSS. */
+  readonly v2Overrides?: Readonly<Record<string, string>>
+}
+
+/** The colors of one color scheme of a `Theme`: generated from `seeds` or from a `palette`, never both. */
+export type ThemeVariant =
+  | (ThemeVariantBase & {
+      /** The seed colors to generate from. */
+      readonly seeds: ThemeSeedColors
+      /** Not allowed beside `seeds`. */
+      readonly palette?: never
+    })
+  | (ThemeVariantBase & {
+      /** The palette to derive from. */
+      readonly palette: ThemePaletteColors
+      /** Not allowed beside `palette`. */
+      readonly seeds?: never
+    })
+
+/**
+ * A color theme, in the format of the app's own themes (`https://opencode.ai/desktop-theme.json`), so a theme file
+ * imports as it is. The host lists it in Settings › Appearance › Theme among the app's themes, alphabetically by
+ * `name`, under the key `${plugin}:${id}`; withdrawing the theme takes it out of the list. A user who picked it keeps the choice: the window
+ * shows the theme's colors from the last run until the plugin contributes it again, and the default theme while it is
+ * withdrawn.
+ */
+export interface Theme {
+  /** The JSON Schema reference of a theme file. Ignored. */
+  readonly $schema?: string
+  /** The name the theme list shows. */
+  readonly name: string
+  /** The theme's id, unique within the plugin, in lowercase letters, digits and hyphens. */
+  readonly id: string
+  /** The light color scheme. */
+  readonly light: ThemeVariant
+  /** The dark color scheme. */
+  readonly dark: ThemeVariant
+}
+
 /** The places a `Slot` renders, with the input each passes to `render`. */
 export interface SlotMap {
   /** Full-width strip under the window content, above toasts. */
@@ -847,3 +954,14 @@ export const Slot = Registry.define<Slot>("slot")
  * ```
  */
 export const Style = Registry.define<string>("style")
+
+/**
+ * The registry of color themes the user can pick in Settings › Appearance, in the format of the app's own theme files.
+ *
+ * @example
+ * ```ts
+ * import theme from "./midnight.json"
+ * ctx.add(Theme, theme)
+ * ```
+ */
+export const Theme = Registry.define<Theme>("theme")

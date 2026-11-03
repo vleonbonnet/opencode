@@ -188,28 +188,25 @@ describe("request option precedence", () => {
           .with({
             endpoint: { baseURL: "https://api.openai.test/v1/" },
             auth: Auth.bearer("fresh-key"),
+            headers: { "x-route": "route", "x-shared": "route" },
             http: {
               body: { metadata: { route: true, shared: "route" }, value: "route" },
-              headers: { "x-route": "route", "x-shared": "route" },
               query: { route: "1", shared: "route" },
             },
           })
           .model({
             id: "gpt-4o-mini",
             defaults: {
+              headers: { "x-model": "model", "x-shared": "model" },
               http: {
                 body: { metadata: { model: true, shared: "model" }, value: "model" },
-                headers: { "x-model": "model", "x-shared": "model" },
                 query: { model: "1", shared: "model" },
               },
             },
           }),
         prompt: "Say hello.",
-        http: {
-          body: { metadata: { request: true }, value: null },
-          headers: { "x-request": "request" },
-          query: { request: "1" },
-        },
+        headers: { "x-request": "request" },
+        http: { body: { metadata: { request: true }, value: null }, query: { request: "1" } },
       }),
     ).pipe(
       Effect.provide(
@@ -469,7 +466,8 @@ describe("compileHttpRequest", () => {
         model,
         prompt: "Say hello.",
         cache: "none",
-        http: { headers: { "x-extra": "1" }, body: { store: false } },
+        headers: { "x-extra": "1" },
+        http: { body: { store: false } },
       })
       const sent: Array<{ url: string; headers: Record<string, string>; body: string }> = []
       yield* LLMClient.generate(request).pipe(
@@ -508,7 +506,8 @@ describe("compileHttpRequest", () => {
           .with({ endpoint: { baseURL: "https://api.anthropic.test/v1" }, auth: credential.header("x-api-key") })
           .model({ id: "claude-opus-5-5" }),
         prompt: "Say hello.",
-        http: { headers: { "x-extra": "1" }, body: { metadata: { user_id: "u" } } },
+        headers: { "x-extra": "1" },
+        http: { body: { metadata: { user_id: "u" } } },
       })
       const rendered = yield* LLMClient.compileHttpRequest(request, { authenticate: false })
       expect(loaded).toBe(0)
