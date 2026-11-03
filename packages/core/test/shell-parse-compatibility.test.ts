@@ -1,50 +1,279 @@
 import { describe, expect, test } from "bun:test"
 import { Effect } from "effect"
+import os from "os"
+import path from "path"
 import { ShellParse } from "../src/shell/parse.js"
 
 describe("portable shell parser compatibility", () => {
-  test.each([
-    ["bash", "echo $((1+1))", {}],
-    ["bash", "echo $((1 + $(printf hidden)))", {}],
-    ["bash", "cd ~/project", {}],
-    ["bash", "cd src&&cd..", {}],
-    ["bash", "cd src && cd .. && git status", {}],
-    ["zsh", "git status", {}],
-    ["fish", "git status", {}],
-    ["bash", "git status", { BASH_ENV: "/startup" }],
-    ["bash", "git status", { "BASH_FUNC_cd%%": "() { :; }" }],
-    ["bash", "cd $HOME; pwd", { HOME: "/session-home" }],
-    ["bash", "cd; pwd", { HOME: "/session-home" }],
-    ["bash", 'target=/outside; cd "$target"; pwd', {}],
-    ["bash", "cd 'src dir' && git status", {}],
-    ["bash", 'cd "src dir"; cd escaped\\ space', {}],
-    ["bash", "cd '$HOME'; cd '~/outside'", {}],
-    ["bash", 'g""it status', {}],
-    ["bash", 'npm "run" test', {}],
-    ["bash", "git '*'", {}],
-    ["bash", "FOO=bar git status", {}],
-    ["bash", "HOME=/outside; cd; pwd", {}],
-    ["bash", "CDPATH=/outside cd child", {}],
-    ["bash", "cd child; pwd", { CDPATH: "/outside" }],
-    ["bash", "cd /workspace > output", {}],
-    ["bash", "export X=value; unset X; git status", {}],
-    ["bash", "printf ok && git status > output", {}],
-    ["bash", "printf ok | cat < input > output", {}],
-    ["bash", "cd -- -/../../../etc; pwd", {}],
-    ["bash", "cd -; pushd; popd; pwd", {}],
-    ["bash", "command cd /outside; builtin cd /elsewhere", {}],
-    ["pwsh", "Get-ChildItem | ForEach-Object { Write-Output $_ }", {}],
-    ["pwsh", "ForEach-Object { Remove-Item victim }", {}],
-    ["pwsh", "Set-Location -LiteralPath '../outside'; Get-ChildItem", {}],
-    ["pwsh", "Set-Location -LiteralPath:/outside", {}],
-    ["pwsh", "Set-Location -LiteralPath:'/outside path'", {}],
-    ["pwsh", 'Set-Location -PATH:"../outside path"', {}],
-    ["pwsh", "Set-Location $HOME; Set-Location $PWD; Set-Location $target", { HOME: "/session-home" }],
-    ["pwsh", "Set-Item Env:T /outside; Set-Location $env:T", { T: "/workspace" }],
-    ["pwsh", "sl /outside; Microsoft.PowerShell.Management\\Set-Location /outside", {}],
-  ] as const)(
-    "matches supported legacy resources, saved prefixes, and directories natively: %s %s %j",
-    async (shell, command, env) => {
+const compatibilityCases: Array<[string, string, Record<string, string>, ShellParse.Result]> = [
+    ["bash", "echo $((1+1))", {}, { commands: [{ resource: "echo $((1+1))", save: "echo *" }], directories: [] }],
+    [
+      "bash",
+      "echo $((1 + $(printf hidden)))",
+      {},
+      {
+        commands: [
+          { resource: "echo $((1 + $(printf hidden)))", save: "echo *" },
+          { resource: "printf hidden", save: "printf *" },
+        ],
+        directories: [],
+      },
+    ],
+    ["bash", "cd ~/project", {}, { commands: [], directories: [path.join(os.homedir(), "project")] }],
+    ["bash", "cd src&&cd..", {}, { commands: [{ resource: "cd..", save: "cd.. *" }], directories: ["src"] }],
+    [
+      "bash",
+      "cd src && cd .. && git status",
+      {},
+      { commands: [{ resource: "git status", save: "git status *" }], directories: ["src", ".."] },
+    ],
+    ["zsh", "git status", {}, { commands: [{ resource: "git status", save: "git status *" }], directories: [] }],
+    ["fish", "git status", {}, { commands: [{ resource: "git status", save: "git status *" }], directories: [] }],
+    [
+      "bash",
+      "git status",
+      { BASH_ENV: "/startup" },
+      { commands: [{ resource: "git status", save: "git status *" }], directories: [] },
+    ],
+    [
+      "bash",
+      "git status",
+      { "BASH_FUNC_cd%%": "() { :; }" },
+      { commands: [{ resource: "git status", save: "git status *" }], directories: [] },
+    ],
+    [
+      "bash",
+      "cd $HOME; pwd",
+      { HOME: "/session-home" },
+      {
+        commands: [
+          { resource: "cd $HOME", save: "cd *" },
+          { resource: "pwd", save: "pwd *" },
+        ],
+        directories: [],
+      },
+    ],
+    [
+      "bash",
+      "cd; pwd",
+      { HOME: "/session-home" },
+      {
+        commands: [
+          { resource: "cd", save: "cd *" },
+          { resource: "pwd", save: "pwd *" },
+        ],
+        directories: [],
+      },
+    ],
+    [
+      "bash",
+      'target=/outside; cd "$target"; pwd',
+      {},
+      {
+        commands: [
+          // An assignment on its own is checked and saved as written.
+          { resource: "target=/outside", save: "target=/outside" },
+          { resource: 'cd "$target"', save: "cd *" },
+          { resource: "pwd", save: "pwd *" },
+        ],
+        directories: [],
+      },
+    ],
+    [
+      "bash",
+      "cd 'src dir' && git status",
+      {},
+      { commands: [{ resource: "git status", save: "git status *" }], directories: ["src dir"] },
+    ],
+    ["bash", 'cd "src dir"; cd escaped\\ space', {}, { commands: [], directories: ["src dir", "escaped space"] }],
+    [
+      "bash",
+      "cd '$HOME'; cd '~/outside'",
+      {},
+      { commands: [], directories: ["$HOME", path.join(os.homedir(), "outside")] },
+    ],
+    // Quoted words are also checked, and saved, unquoted; a glob in the prefix saves no pattern.
+    [
+      "bash",
+      'g""it status',
+      {},
+      { commands: [{ resource: 'g""it status', save: "git status *", alternates: ["git status"] }], directories: [] },
+    ],
+    [
+      "bash",
+      'npm "run" test',
+      {},
+      {
+        commands: [{ resource: 'npm "run" test', save: "npm run test *", alternates: ["npm run test"] }],
+        directories: [],
+      },
+    ],
+    ["bash", "git '*'", {}, { commands: [{ resource: "git '*'", alternates: ["git *"] }], directories: [] }],
+    [
+      "bash",
+      "FOO=bar git status",
+      {},
+      {
+        commands: [
+          { resource: "FOO=bar git status", save: "git status *", alternates: ["git status"] },
+          { resource: "FOO=bar", save: "FOO=bar" },
+        ],
+        directories: [],
+      },
+    ],
+    [
+      "bash",
+      "HOME=/outside; cd; pwd",
+      {},
+      {
+        commands: [
+          { resource: "HOME=/outside", save: "HOME=/outside" },
+          { resource: "cd", save: "cd *" },
+          { resource: "pwd", save: "pwd *" },
+        ],
+        directories: [],
+      },
+    ],
+    ["bash", "CDPATH=/outside cd child", {}, { commands: [], directories: ["child"] }],
+    [
+      "bash",
+      "cd child; pwd",
+      { CDPATH: "/outside" },
+      { commands: [{ resource: "pwd", save: "pwd *" }], directories: ["child"] },
+    ],
+    ["bash", "cd /workspace > output", {}, { commands: [], directories: ["/workspace"] }],
+    [
+      "bash",
+      "export X=value; unset X; git status",
+      {},
+      {
+        commands: [
+          { resource: "export X=value", save: "export X=*" },
+          { resource: "unset X", save: "unset X" },
+          { resource: "git status", save: "git status *" },
+        ],
+        directories: [],
+      },
+    ],
+    [
+      "bash",
+      "printf ok && git status > output",
+      {},
+      {
+        commands: [
+          { resource: "printf ok", save: "printf *" },
+          { resource: "git status > output", save: "git status *" },
+        ],
+        directories: [],
+      },
+    ],
+    [
+      "bash",
+      "printf ok | cat < input > output",
+      {},
+      {
+        commands: [
+          { resource: "printf ok", save: "printf *" },
+          { resource: "cat < input > output", save: "cat *" },
+        ],
+        directories: [],
+      },
+    ],
+    [
+      "bash",
+      "cd -- -/../../../etc; pwd",
+      {},
+      { commands: [{ resource: "pwd", save: "pwd *" }], directories: ["-/../../../etc"] },
+    ],
+    [
+      "bash",
+      "cd -; pushd; popd; pwd",
+      {},
+      {
+        commands: [
+          { resource: "cd -", save: "cd *" },
+          { resource: "pushd", save: "pushd *" },
+          { resource: "popd", save: "popd *" },
+          { resource: "pwd", save: "pwd *" },
+        ],
+        directories: [],
+      },
+    ],
+    [
+      "bash",
+      "command cd /outside; builtin cd /elsewhere",
+      {},
+      {
+        commands: [
+          { resource: "command cd /outside", save: "command *" },
+          { resource: "builtin cd /elsewhere", save: "builtin *" },
+        ],
+        directories: ["/outside", "/elsewhere"],
+      },
+    ],
+    [
+      "pwsh",
+      "Get-ChildItem | ForEach-Object { Write-Output $_ }",
+      {},
+      {
+        commands: [
+          { resource: "Get-ChildItem", save: "Get-ChildItem *" },
+          { resource: "ForEach-Object { Write-Output $_ }", save: "ForEach-Object *" },
+          { resource: "Write-Output $_", save: "Write-Output *" },
+        ],
+        directories: [],
+      },
+    ],
+    [
+      "pwsh",
+      "ForEach-Object { Remove-Item victim }",
+      {},
+      { commands: [{ resource: "Remove-Item victim", save: "Remove-Item *" }], directories: [] },
+    ],
+    [
+      "pwsh",
+      "Set-Location -LiteralPath '../outside'; Get-ChildItem",
+      {},
+      { commands: [{ resource: "Get-ChildItem", save: "Get-ChildItem *" }], directories: ["../outside"] },
+    ],
+    ["pwsh", "Set-Location -LiteralPath:/outside", {}, { commands: [], directories: ["/outside"] }],
+    ["pwsh", "Set-Location -LiteralPath:'/outside path'", {}, { commands: [], directories: ["/outside path"] }],
+    ["pwsh", 'Set-Location -PATH:"../outside path"', {}, { commands: [], directories: ["../outside path"] }],
+    [
+      "pwsh",
+      "Set-Location $HOME; Set-Location $PWD; Set-Location $target",
+      { HOME: "/session-home" },
+      {
+        commands: [{ resource: "Set-Location $target", save: "Set-Location *" }],
+        directories: [process.platform === "win32" ? os.homedir() : "/session-home", "/workspace"],
+      },
+    ],
+    [
+      "pwsh",
+      "Set-Item Env:T /outside; Set-Location $env:T",
+      { T: "/workspace" },
+      { commands: [{ resource: "Set-Item Env:T /outside", save: "Set-Item *" }], directories: ["/workspace"] },
+    ],
+    [
+      "pwsh",
+      "sl /outside; Microsoft.PowerShell.Management\\Set-Location /outside",
+      {},
+      {
+        commands: [
+          { resource: "sl /outside", save: "sl *", alternates: ["Set-Location /outside"] },
+          {
+            resource: "Microsoft.PowerShell.Management\\Set-Location /outside",
+            save: "Microsoft.PowerShell.Management\\Set-Location *",
+            alternates: ["Set-Location /outside"],
+          },
+        ],
+        directories: [],
+      },
+    ],
+  ]
+  test.each(compatibilityCases)(
+    "extracts resources, saved prefixes, and directories: %s %s %j",
+    async (shell, command, env, expected) => {
       if (Object.keys(env).length > 0) {
         const child = Bun.spawn({
           cmd: [
@@ -55,10 +284,8 @@ describe("portable shell parser compatibility", () => {
           import { ShellParse } from "./src/shell/parse.ts"
           const command = ${JSON.stringify(command)}
           const shell = ${JSON.stringify(shell)}
-          const legacy = await Effect.runPromise(ShellParse.scan(command, shell, "/workspace"))
-          const portable = await Effect.runPromise(ShellParse.scan(command, shell, "/workspace", { portable: true }))
-          const native = await Effect.runPromise(ShellParse.scanPortable(command, shell, "/workspace"))
-          console.log(JSON.stringify([legacy, portable, native]))
+          const scanned = await Effect.runPromise(ShellParse.scan(command, shell, "/workspace"))
+          console.log(JSON.stringify(scanned))
         `,
           ],
           cwd: `${import.meta.dir}/..`,
@@ -72,27 +299,23 @@ describe("portable shell parser compatibility", () => {
           child.exited,
         ])
         expect(code, error).toBe(0)
-        const [legacy, portable, native] = JSON.parse(output)
-        expect(portable).toEqual(legacy)
-        expect(native).toEqual(legacy)
+        expect(JSON.parse(output)).toEqual(expected)
         return
       }
-      const legacy = await Effect.runPromise(ShellParse.scan(command, shell, "/workspace"))
-      const portable = await Effect.runPromise(ShellParse.scan(command, shell, "/workspace", { portable: true }))
-      expect(portable).toEqual(legacy)
-      expect(await Effect.runPromise(ShellParse.scanPortable(command, shell, "/workspace"))).toEqual(legacy)
+      const scanned = await Effect.runPromise(ShellParse.scan(command, shell, "/workspace"))
+      expect(scanned).toEqual(expected)
     },
   )
 
-  test("derives the legacy prefix for long argument lists", async () => {
+  test("derives the prefix for long argument lists", async () => {
     const command = `echo ${"x ".repeat(16_000)}`.trimEnd()
-    const result = await Effect.runPromise(ShellParse.scan(command, "bash", "/workspace", { portable: true }))
+    const result = await Effect.runPromise(ShellParse.scan(command, "bash", "/workspace"))
     expect(result).toEqual({ commands: [{ resource: command, save: "echo *" }], directories: [] })
   })
 
   test("extracts inline PowerShell directory flags with case-insensitive names and quoted values", async () => {
     const result = await Effect.runPromise(
-      ShellParse.scanPortable(
+      ShellParse.scan(
         "Set-Location -LITERALPATH:C:\\outside; Set-Location -pAtH:'../other dir'; Set-Location -p:/short; Set-Location -lp /literal; Set-Location -l:/prefix; Set-Location -lit:/litprefix; Set-Location -pat:/patprefix; Set-Location -PSPath:/pspath; Set-Location '-outside'; Set-Location -/../../outside; Set-Location -Path -- -/../../outside2; Set-Location -- -outside2; Set-Location -`outside3; Set-Location \"../`$a/../outside4\"; Set-Location /out`side; Set-Location 'C:\\quoted'",
         "pwsh",
         "/workspace",
@@ -123,7 +346,7 @@ describe("portable shell parser compatibility", () => {
 
   test("retains statement-head ForEach-Object cmdlet calls when non-scriptblock parameters are present", async () => {
     const result = await Effect.runPromise(
-      ShellParse.scanPortable("ForEach-Object -InputObject $proc -MemberName Kill", "pwsh", "/workspace"),
+      ShellParse.scan("ForEach-Object -InputObject $proc -MemberName Kill", "pwsh", "/workspace"),
     )
     expect(result).toEqual({
       commands: [{ resource: "ForEach-Object -InputObject $proc -MemberName Kill", save: "ForEach-Object *" }],
@@ -132,60 +355,65 @@ describe("portable shell parser compatibility", () => {
   })
 })
 
-describe("closed native and legacy parity gaps", () => {
-  // Both scanners save the prefix of the words the command runs, and read assignments with a redirect as assignments.
-  test.each<{ command: string; commands: ShellParse.Result["commands"] }>([
-    {
-      command: "FOO=bar > output",
-      commands: [{ resource: "FOO=bar > output", save: "FOO=*", alternates: ["FOO=bar"] }],
-    },
-    {
-      command: "FOO=$(printf value) > output",
-      commands: [
-        { resource: "FOO=$(printf value) > output", save: "FOO=*", alternates: ["FOO=$(printf value)"] },
-        { resource: "printf value", save: "printf *" },
-      ],
-    },
-    { command: "git 2 status", commands: [{ resource: "git 2 status", save: "git 2 *" }] },
-    {
-      command: "git $(printf status) diff",
-      commands: [
-        { resource: "git $(printf status) diff", save: "git $(printf status) *" },
-        { resource: "printf status", save: "printf *" },
-      ],
-    },
-  ])("$command", async ({ command, commands }) => {
-    for (const portable of [false, true])
-      expect(await Effect.runPromise(ShellParse.scan(command, "bash", "/workspace", { portable }))).toEqual({
-        commands,
-        directories: [],
-      })
-  })
-})
-
-describe("current native and legacy parity gaps", () => {
-  // These are observed parser gaps, not permission-policy changes that must be preserved.
+describe("scanner behavior on former tree-sitter gaps", () => {
   for (const fixture of [
     {
-      name: "native keeps numeric directory names",
+      name: "retains redirect resource for an assignment with redirection",
+      shell: "bash",
+      command: "FOO=bar > output",
+      // The assignment is read as one, with its redirect in its text, and saved with it.
+      expected: {
+        commands: [{ resource: "FOO=bar > output", save: "FOO=bar > output" }],
+        directories: [],
+      },
+    },
+    {
+      name: "retains both redirect resource and nested executable commands on assignment redirection",
+      shell: "bash",
+      command: "FOO=$(printf value) > output",
+      expected: {
+        commands: [
+          { resource: "FOO=$(printf value) > output", save: "FOO=$(printf value) > output" },
+          { resource: "printf value", save: "printf *" },
+        ],
+        directories: [],
+      },
+    },
+    {
+      name: "keeps numeric arguments in saved prefixes",
+      shell: "bash",
+      command: "git 2 status",
+      expected: { commands: [{ resource: "git 2 status", save: "git 2 *" }], directories: [] },
+    },
+    {
+      name: "keeps numeric directory names and operator-shaped arguments",
       shell: "bash",
       command: "cd 123; git == value",
-      legacy: { commands: [{ resource: "git == value", save: "git == *" }], directories: [] },
-      native: { commands: [{ resource: "git == value", save: "git == *" }], directories: ["123"] },
+      expected: { commands: [{ resource: "git == value", save: "git == *" }], directories: ["123"] },
     },
     {
-      name: "directory line continuations remain unresolved source rather than legacy split operands",
+      name: "preserves substitution source in saved prefixes instead of skipping the argument",
+      shell: "bash",
+      command: "git $(printf status) diff",
+      expected: {
+        commands: [
+          { resource: "git $(printf status) diff", save: "git $(printf status) *" },
+          { resource: "printf status", save: "printf *" },
+        ],
+        directories: [],
+      },
+    },
+    {
+      name: "joins directory line continuations into the resolved path",
       shell: "bash",
       command: "cd before\\\nafter",
-      legacy: { commands: [], directories: ["before", "after"] },
-      native: { commands: [], directories: ["before\\\nafter"] },
+      expected: { commands: [], directories: ["beforeafter"] },
     },
     {
-      name: "native recognizes PowerShell carriage-return separators omitted by the legacy AST",
+      name: "recognizes PowerShell carriage-return separators",
       shell: "pwsh",
       command: "Get-ChildItem\rRemove-Item victim",
-      legacy: { commands: [], directories: [] },
-      native: {
+      expected: {
         commands: [
           { resource: "Get-ChildItem", save: "Get-ChildItem *" },
           { resource: "Remove-Item victim", save: "Remove-Item *" },
@@ -194,43 +422,47 @@ describe("current native and legacy parity gaps", () => {
       },
     },
     {
-      name: "native recognizes tab-separated PowerShell commands omitted by the legacy AST",
+      name: "recognizes tab-separated PowerShell commands",
       shell: "pwsh",
       command: "git\tstatus",
-      legacy: { commands: [], directories: [] },
-      native: { commands: [{ resource: "git\tstatus", save: "git\tstatus *" }], directories: [] },
+      expected: { commands: [{ resource: "git\tstatus", save: "git\tstatus *" }], directories: [] },
     },
     {
-      name: "native preserves complete PowerShell flag=value resources",
+      name: "preserves complete PowerShell flag=value resources",
       shell: "pwsh",
       command: "git --flag=value",
-      legacy: { commands: [{ resource: "git --flag", save: "git --flag *" }], directories: [] },
-      native: { commands: [{ resource: "git --flag=value", save: "git --flag=value *" }], directories: [] },
+      expected: { commands: [{ resource: "git --flag=value", save: "git --flag=value *" }], directories: [] },
     },
     {
-      name: "native does not split comma-separated PowerShell directory operands",
+      name: "does not split comma-separated PowerShell directory operands",
       shell: "pwsh",
       command: "Set-Location a,b",
-      legacy: { commands: [], directories: ["a", ",b"] },
-      native: { commands: [], directories: ["a,b"] },
+      expected: { commands: [], directories: ["a,b"] },
+    },
+    {
+      name: "retains unresolved PowerShell stack, history, and dot-wildcard directory commands",
+      shell: "pwsh",
+      command: "Set-Location -StackName old; Set-Location -; Set-Location +; Set-Location .[.] ; Set-Location -LiteralPath '.[.]'",
+      expected: {
+        commands: [
+          { resource: "Set-Location -StackName old", save: "Set-Location *" },
+          { resource: "Set-Location -", save: "Set-Location *" },
+          { resource: "Set-Location +", save: "Set-Location *" },
+          { resource: "Set-Location .[.]", save: "Set-Location *" },
+        ],
+        directories: [".[.]"],
+      },
     },
   ]) {
     test(fixture.name, async () => {
-      const native = await Effect.runPromise(ShellParse.scanPortable(fixture.command, fixture.shell, "/workspace"))
-      expect(native).toEqual(fixture.native)
-      expect(await Effect.runPromise(ShellParse.scan(fixture.command, fixture.shell, "/workspace"))).toEqual(
-        fixture.legacy,
-      )
-      expect(
-        await Effect.runPromise(ShellParse.scan(fixture.command, fixture.shell, "/workspace", { portable: true })),
-      ).toEqual(native)
-      expect(native).not.toEqual(fixture.legacy)
+      const scanned = await Effect.runPromise(ShellParse.scan(fixture.command, fixture.shell, "/workspace"))
+      expect(scanned).toEqual(fixture.expected)
     })
   }
 })
 
-describe("legacy directory command behavior", () => {
-  test.each(["bash", "zsh", "pwsh"])("retains the original shared directory command set: %s", async (shell) => {
+describe("directory command set", () => {
+  test.each(["bash", "zsh", "pwsh"])("retains the shared directory command set: %s", async (shell) => {
     const result = await Effect.runPromise(
       ShellParse.scan(
         "chdir /outside; set-location /elsewhere; push-location /stack; sl .; pop-location",

@@ -70,14 +70,22 @@ describe("McpInstructions", () => {
     ),
   )
 
-  it.effect("omits instructions when the agent cannot use execute", () =>
+  it.effect("lists Code Mode servers as direct tools when the agent cannot use execute", () =>
     Effect.gen(function* () {
       const service = yield* McpInstructions.Service
       const generation = yield* service
         .load([[{ action: "execute", resource: "*", effect: "deny" }]])
         .pipe(Effect.flatMap(readInitial))
 
-      expect(generation.text).toBe("")
+      expect(generation.text).toBe(
+        [
+          "<mcp_instructions>",
+          '  <server name="alpha">',
+          "    Alpha instructions",
+          "  </server>",
+          "</mcp_instructions>",
+        ].join("\n"),
+      )
     }).pipe(
       Effect.provide(
         layer(
@@ -123,11 +131,12 @@ describe("McpInstructions", () => {
 
       expect(bounded).not.toContain('<server name="alpha">')
       expect(bounded).toContain('<server name="beta">')
-      expect(
-        (yield* service
-          .load([[]], [ceiling([{ action: "execute", resource: "*", effect: "deny" }])])
-          .pipe(Effect.flatMap(readInitial))).text,
-      ).toBe("")
+      // Without execute, Code Mode server tools are exposed directly, so their instructions stay.
+      const direct = (yield* service
+        .load([[]], [ceiling([{ action: "execute", resource: "*", effect: "deny" }])])
+        .pipe(Effect.flatMap(readInitial))).text
+      expect(direct).toContain('<server name="alpha">')
+      expect(direct).toContain('<server name="beta">')
     }).pipe(
       Effect.provide(
         layer(

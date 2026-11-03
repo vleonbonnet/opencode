@@ -88,9 +88,13 @@ function stripMarkers(value: unknown): unknown {
   return out
 }
 
+const DURATION_UNITS: Record<string, number> = { ms: 1, s: 1000, m: 60_000, h: 60 * 60_000, d: 24 * 60 * 60_000 }
+
+// Markers carry a lifetime in models.dev's duration format ("5m", "1h"); a marker without one gets the default.
 function ttlOf(marker: unknown) {
   if (!isRecord(marker)) return
-  return marker.ttl === "1h" ? 60 * 60_000 : ANTHROPIC_DEFAULT_TTL
+  const match = typeof marker.ttl === "string" ? /^(\d+)(ms|s|m|h|d)$/.exec(marker.ttl) : null
+  return match ? Number(match[1]) * DURATION_UNITS[match[2]]! : ANTHROPIC_DEFAULT_TTL
 }
 
 function excerptOf(value: unknown) {

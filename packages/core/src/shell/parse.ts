@@ -1,42 +1,20 @@
 export * as ShellParse from "./parse.js"
 
-import { Effect } from "effect"
-import { fileURLToPath } from "url"
+import { Effect, Result } from "effect"
+import fs from "fs"
 import os from "os"
 import path from "path"
-import type { Node } from "web-tree-sitter"
-import { shellParserWasm } from "#shell-parser-wasm"
 import { ShellPowerShell } from "./powershell.js"
-import type { ShellScan } from "./scan.js"
+import { ShellScan } from "./scan.js"
 import { ShellSelect } from "./select.js"
 import { ShellUnwrap } from "./unwrap.js"
-import { lazy } from "../util/lazy.js"
 import { Wildcard } from "../util/wildcard.js"
 
-type Part = { type: string; text: string }
+type Part = { type: string; text: string; raw: string; unquotedTilde?: boolean }
 const CWD = new Set(["cd", "chdir", "popd", "pushd", "push-location", "set-location"])
-const POWERSHELL_PATH_FLAG_RE =
-  /^-(?:p(?:ath|at|a)?|lp|l(?:i(?:t(?:e(?:r(?:a(?:l(?:p(?:a(?:t(?:h)?)?)?)?)?)?)?)?)?)?|psp(?:a(?:t(?:h)?)?)?):?$/i
-// A redirect operator after line continuations, which make a descriptor word before them part of the redirect.
-const CONTINUED_REDIRECT_RE = /(?:\\\n)+[<>]/y
-// Statements that change the environment of the commands after them, which bash parses apart from commands:
-// `export`, `declare`, `local`, `readonly`, `typeset`, `unset`, and `NAME=value` on its own. Their text decides what
-// the commands after them see (`export KUBECONFIG=…`), so it is checked as well.
-const LEGACY_STATEMENTS = [
-  "command",
-  "declaration_command",
-  "unset_command",
-  "variable_assignments",
-  "variable_assignment",
-]
-// An assignment prefixed to a command, in a declaration or among other assignments is checked with them; one in the
-// header of `for ((…))` is arithmetic, as in `((…))`.
-const LEGACY_ASSIGNMENT_OWNERS = new Set([
-  "command",
-  "declaration_command",
-  "variable_assignments",
-  "c_style_for_statement",
-])
+const POWERSHELL_LITERAL_FLAG_RE =
+  /^-(?:lp|l(?:i(?:t(?:e(?:r(?:a(?:l(?:p(?:a(?:t(?:h)?)?)?)?)?)?)?)?)?)?|psp(?:a(?:t(?:h)?)?)?):?$/i
+const POWERSHELL_STACK_FLAG_RE = /^-(?:stack(?:name|nam|na|n)?|st):?$/i
 
 export type Result = {
   // Each command found: the resource as written; the prefix an approval saves, absent when no pattern would match
@@ -187,97 +165,56 @@ const ARITY: Record<string, number> = {
 }
 const PREFIX_LENGTH = Math.max(...Object.values(ARITY))
 
-export const scan = Effect.fnUntraced(function* (
-  command: string,
-  shell: string,
-  cwd: string,
-  options?: { portable?: boolean; wasm?: typeof shellParserWasm },
-) {
-  if (options?.portable || (options?.wasm ?? shellParserWasm).bash === "")
-    return yield* scanPortable(command, shell, cwd)
-  return yield* scanLegacy(command, shell, cwd)
-})
-
-const portableScanner = Effect.tryPromise({
-  try: () => import("./scan.js"),
-  catch: (cause) => new Error(`Portable shell scanner failed to load: ${cause}`, { cause }),
-})
-
-const scanLegacy = Effect.fnUntraced(function* (command: string, shell: string, cwd: string) {
-  const parsers = yield* Effect.promise(load)
-  const { ShellScan } = yield* portableScanner
-  const powershell = ShellSelect.ps(shell)
-  const tree = (powershell ? parsers.ps : parsers.bash).parse(command)
-  if (!tree) return yield* Effect.fail(new Error("Failed to parse shell command"))
-
-  // The commands of a script, for what it does with what it reads.
-  const commands = (script: Script) => {
-    const nested = parsers.bash.parse(script.text)
-    if (!nested) return
-    try {
-      return nested.rootNode
-        .descendantsOfType("command")
-        .filter((node): node is Node => Boolean(node))
-        .map((node) => ShellUnwrap.unwrap(legacyWords(node, script.text, []), script.dialect))
-    } finally {
-      nested.delete()
+// A command the portable scanner cannot read fails the scan, and so does one nesting scripts too deep or running too
+// many commands to check.
+export function scan(command: string, shell: string, cwd: string): Effect.Effect<Result, Error> {
+  return Effect.suspend(() => {
+    const powershell = ShellSelect.ps(shell)
+    // The commands of a script, for what it does with what it reads.
+    const commands = (script: Script) => {
+      const nested = ShellScan.statements(script.text, script.dialect)
+      if (nested.kind === "opaque") return
+      return nested.commands
+        .filter((item) => !item.declaration && !item.assignment && item.redirectPrefixEnd === undefined)
+        .map((item) => ShellUnwrap.unwrap(portableWords(item), script.dialect))
     }
-  }
-  // The commands of a script handed to PowerShell: what Tree-sitter finds in it, errors and all.
-  const powershellCommands = (text: string) => {
-    const nested = parsers.ps.parse(text)
-    if (!nested) return
-    try {
-      return nested.rootNode
-        .descendantsOfType("command")
-        .filter((node): node is Node => Boolean(node))
-        .map((node) => ({ text: node.text.trim(), words: powershellWords(node, text) }))
-    } finally {
-      nested.delete()
+    // The commands of a script handed to PowerShell, as those of a PowerShell command are read.
+    const powershellCommands = (text: string) => {
+      const nested = ShellScan.scanPowerShell(text)
+      if (nested.kind === "opaque") return
+      return nested.commands
+        .filter((item) => !item.declaration && !item.assignment && !foreachBlock(item))
+        .map((item) => ({ text: item.resource, words: portableWords(item) }))
     }
-  }
-  const output = yield* Effect.acquireUseRelease(
-    Effect.succeed(tree),
-    (tree) =>
-      Effect.sync(() => {
-        const output = collector()
-        const options: Options = {
-          powershell,
-          posix: posix(shell),
-          cwd,
-          shell,
-          dialect: dialect(shell),
-          commands,
-          powershellCommands,
-        }
-        const scripts = legacyCommands(output, tree.rootNode, command, options, ShellScan.heredocExtent)
-        // A script is read as the command is: what Tree-sitter finds in it, errors and all.
-        follow(output, scripts, (script) => {
-          const nested = parsers.bash.parse(script.text)
-          if (!nested) {
-            output.fail("Failed to parse shell command")
-            return []
-          }
-          try {
-            return legacyCommands(
-              output,
-              nested.rootNode,
-              script.text,
-              { ...options, posix: true, dialect: script.dialect },
-              ShellScan.heredocExtent,
-            )
-          } finally {
-            nested.delete()
-          }
-        })
-        return output
-      }),
-    (tree) => Effect.sync(() => tree.delete()),
-  )
-  // Where Tree-sitter ends a heredoc elsewhere than bash does, the portable scanner reads the command as bash does.
-  if (output.misread) return yield* scanPortable(command, shell, cwd)
-  return yield* finish(output)
-})
+    const options: Options = {
+      powershell,
+      posix: posix(shell),
+      cwd,
+      shell,
+      dialect: dialect(shell),
+      commands,
+      powershellCommands,
+    }
+    const result = powershell
+      ? statementsOf(ShellScan.scanPowerShell(command))
+      : ShellScan.statements(command, options.dialect)
+    if (result.kind === "opaque")
+      return Effect.fail(new Error(`Portable shell scanner cannot analyze command: ${result.reason}`))
+
+    const output = collector()
+    const scripts = portableCommands(output, result, options)
+    // A script is read in the dialect of the shell that runs it, and refused as the command would be when it cannot be.
+    follow(output, scripts, (script) => {
+      const nested = ShellScan.statements(script.text, script.dialect)
+      if (nested.kind === "opaque") {
+        output.fail(`Portable shell scanner cannot analyze command: ${nested.reason} in a script it runs`)
+        return []
+      }
+      return portableCommands(output, nested, { ...options, powershell: false, posix: true, dialect: script.dialect })
+    })
+    return finish(output)
+  })
+}
 
 type Options = {
   powershell: boolean
@@ -292,259 +229,6 @@ type Options = {
 }
 type PowerShellCommand = { text: string; words: string[] }
 type Script = ShellUnwrap.Script
-type Extent = typeof ShellScan.heredocExtent
-
-// Adds the commands of a tree parsed from SOURCE and returns the script strings they hand to a shell.
-function legacyCommands(output: Collector, root: Node, source: string, options: Options, extent: Extent) {
-  // The grammar reads the words after a redirect's target as more targets, where bash reads them as the command's.
-  if (
-    options.posix &&
-    root
-      .descendantsOfType("file_redirect")
-      .some((redirect) => (redirect?.childrenForFieldName("destination").length ?? 0) > 1)
-  )
-    output.misread = true
-  const heredocs = options.posix ? legacyHeredocs(output, root, source, options, extent) : { ranges: [], reads: [] }
-  const text = (node: Node) =>
-    cut(node.parent?.type === "redirected_statement" ? node.parent : node, heredocs.ranges).trim()
-  const scripts: Script[] = []
-  const reads = [...heredocs.reads]
-  for (const node of root.descendantsOfType(options.posix ? LEGACY_STATEMENTS : ["command"])) {
-    if (!node) continue
-    if (node.type !== "command") {
-      if (node.type === "variable_assignment" && LEGACY_ASSIGNMENT_OWNERS.has(node.parent?.type ?? "")) continue
-      const words = joined(
-        node.type === "variable_assignment"
-          ? [node]
-          : node.type === "variable_assignments"
-            ? node.namedChildren
-            : node.children,
-        source,
-        heredocs.ranges,
-      )
-      variables(output, text(node), words, node.type === "declaration_command" || node.type === "unset_command")
-      continue
-    }
-    const command = parts(node)
-    const tokens = command.map((part) => part.text)
-    if (tokens.length === 0) continue
-    const name = options.powershell ? tokens[0].toLowerCase() : tokens[0]
-    if (CWD.has(name)) {
-      output.result.directories.push(...directoryArgs(command, options.powershell, options.cwd, options.shell))
-      continue
-    }
-    const save = `${prefix(tokens).join(" ")} *`
-    if (!options.posix) {
-      if (options.powershell)
-        powershellCommand(output, { text: text(node), words: powershellWords(node, source) }, save, options)
-      else output.command(text(node), save)
-      continue
-    }
-    const words = legacyWords(node, source, heredocs.ranges)
-    const assignments = node.children
-      .filter((child): child is Node => child?.type === "variable_assignment")
-      .map((child) => cut(child, heredocs.ranges))
-    // The grammar reads assignments with a redirect as a command with an empty name.
-    if (!words[0] && assignments.length) {
-      variables(output, text(node), assignments, false)
-      continue
-    }
-    const found = expand(output, text(node), save, words, options.dialect, assignments)
-    scripts.push(...found.scripts)
-    powershellScripts(output, found.powershell, options)
-    const downstream = legacyDownstream(node)
-    if (downstream.length)
-      reads.push(...piped(found, () => downstream.map((item) => unwrapNode(item, source, options)), options))
-  }
-  return [...emit(output, reads, options), ...scripts]
-}
-
-// What the heredocs and here-strings of a tree hold: the heredoc bodies, with their closing delimiter, that are only
-// data and are left out of the text rules see, and what their readers do with each. A heredoc Tree-sitter ends
-// elsewhere than bash does, which a tree with a parse error may hold, marks the scan misread.
-function legacyHeredocs(output: Collector, root: Node, source: string, options: Options, extent: Extent) {
-  const ranges: Range[] = []
-  const reads: Read[] = []
-  const redirects = root
-    .descendantsOfType(["heredoc_redirect", "herestring_redirect"])
-    .filter((node): node is Node => Boolean(node))
-  // A heredoc in a tree with a parse error may sit in an ERROR node of its own.
-  if (root.hasError && root.descendantsOfType(["heredoc_redirect", "heredoc_start", "heredoc_body"]).length)
-    output.misread = true
-  for (const redirect of redirects) {
-    const found = legacyReaders(redirect)
-    const readers = found.nodes.map((node) => unwrapNode(node, source, options))
-    if (redirect.type === "herestring_redirect") {
-      const word = redirect.namedChildren.find((item): item is Node => Boolean(item))
-      if (word)
-        reads.push(read({ text: `${ShellUnwrap.literal(word.text)}\n`, readers, targets: [], later: [] }, options))
-      continue
-    }
-    const child = (type: string) => redirect.children.find((item) => item?.type === type) ?? undefined
-    if (legacyMisread(redirect, source, extent)) output.misread = true
-    const body = child("heredoc_body")
-    if (!body) continue
-    const reading = new Set(found.nodes.map((node) => node.id))
-    const later = root
-      .descendantsOfType("command")
-      .filter((node): node is Node => node !== null && node.startIndex > redirect.startIndex && !reading.has(node.id))
-      .map((node) => unwrapNode(node, source, options))
-    const start = child("heredoc_start")
-    const end = child("heredoc_end")
-    // The body its reader gets: the lines between the heredoc's and the closing delimiter's, without their leading
-    // tabs for `<<-`.
-    const lines = source.slice(
-      source.lastIndexOf("\n", body.startIndex - 1) + 1,
-      end ? source.lastIndexOf("\n", end.startIndex - 1) + 1 : body.endIndex,
-    )
-    const text = source.startsWith("<<-", redirect.startIndex) ? lines.replace(/^\t+/gm, "") : lines
-    const result = read({ text, readers, targets: legacyTargets(redirect), later }, options)
-    reads.push(result)
-    // A quote or backslash in the delimiter, apart from a line continuation, quotes it.
-    if (root.hasError || !start || !end || !/['"\\]/.test(start.text.replaceAll("\\\n", ""))) continue
-    if (found.substituted || !result.data) continue
-    ranges.push({ start: body.startIndex, end: end.endIndex })
-  }
-  return { ranges, reads }
-}
-
-function unwrapNode(node: Node, source: string, options: Options) {
-  return ShellUnwrap.unwrap(legacyWords(node, source, []), options.dialect)
-}
-
-// Whether Tree-sitter reads a heredoc's delimiter word, its quoting or the end of its body otherwise than bash does:
-// it keeps the quotes of a partly quoted delimiter (`E"O"F`), drops backslashes inside quotes, expands a body whose
-// delimiter a backslash quotes (`E\OF`) and ends a body at a line that only begins with the delimiter.
-function legacyMisread(redirect: Node, source: string, extent: Extent) {
-  const child = (type: string) => redirect.children.find((item) => item?.type === type) ?? undefined
-  const start = child("heredoc_start")
-  const body = child("heredoc_body")
-  const end = child("heredoc_end")
-  if (!start || !end) return true
-  const tabs = source.startsWith("<<-", redirect.startIndex)
-  const first = body?.startIndex ?? end.startIndex
-  const line = source.lastIndexOf("\n", first - 1) + 1
-  if (!/^\t*$/.test(source.slice(line, first)) || (!tabs && line !== first)) return true
-  const bash = extent(source, redirect.startIndex + (tabs ? 3 : 2), tabs, line)
-  if (!bash || bash.word !== start.endIndex || bash.end !== end.endIndex) return true
-  // Tree-sitter reads expansions in a body it does not quote; one bash expands, holding `$` or a backquote, has some.
-  const expanded = body?.namedChildren.some((item) => item?.type !== "heredoc_content") ?? false
-  return bash.quoted ? expanded : !expanded && /[$`]/.test(body?.text ?? "")
-}
-
-// The files the statement a heredoc is redirected to writes its output to, as their words read when static.
-function legacyTargets(redirect: Node) {
-  const statement = redirect.parent
-  if (!statement) return []
-  // The grammar puts redirects after a heredoc inside its redirect.
-  const redirects = [
-    ...statement.children,
-    ...(statement.childForFieldName("body")?.childrenForFieldName("redirect") ?? []),
-    ...statement.children
-      .filter((item): item is Node => item?.type === "heredoc_redirect")
-      .flatMap((item) => item.childrenForFieldName("redirect")),
-  ].filter((item): item is Node => item?.type === "file_redirect")
-  return redirects.flatMap((item) => {
-    const operator = item.children.find((child) => child !== null && !child.isNamed)?.text ?? ""
-    const destination = item.childForFieldName("destination")
-    if (!/^(?:>|>>|>\||&>|&>>|>&)$/.test(operator) || !destination || ShellUnwrap.dynamic(destination.text)) return []
-    return [ShellUnwrap.literal(destination.text)]
-  })
-}
-
-// The commands that read a heredoc or here-string: every command of the statement it is redirected to, including the
-// process substitutions its other redirects write to, and those after it in its pipelines; the grammar puts the
-// pipeline after a heredoc inside its redirect. Once its output is substituted into a word, every command of the
-// top-level statement holding that word counts, since where the word ends up is not followed.
-function legacyReaders(redirect: Node) {
-  const statement = redirect.parent
-  if (!statement) return { nodes: [], substituted: false }
-  // The grammar also puts the rest of an and-or list after a heredoc inside its redirect; that list does not read it.
-  const after = new Set(
-    statement
-      .descendantsOfType("heredoc_redirect")
-      .flatMap((item) => item?.childrenForFieldName("right") ?? [])
-      .filter((item): item is Node => Boolean(item))
-      .flatMap((item) => [item, ...commands(item)])
-      .map((item) => item.id),
-  )
-  const nodes = commands(statement).filter((item) => !after.has(item.id))
-  let substituted = false
-  for (let node = statement; node.parent; node = node.parent) {
-    const parent = node.parent
-    const after = node.endIndex
-    if (parent.type === "pipeline")
-      nodes.push(
-        ...parent.children.filter((item): item is Node => item !== null && item.startIndex >= after).flatMap(commands),
-      )
-    if (parent.type === "command_substitution" || parent.type === "process_substitution") substituted = true
-    if (substituted && parent.parent?.type === "program") nodes.push(...commands(parent))
-  }
-  return { nodes, substituted }
-}
-
-// The commands in the later stages of the pipelines around a command, which its output reaches.
-function legacyDownstream(node: Node) {
-  const later: Node[] = []
-  for (let item = node; item.parent; item = item.parent) {
-    const after = item.endIndex
-    if (item.parent.type === "pipeline")
-      later.push(
-        ...item.parent.children
-          .filter((child): child is Node => child !== null && child.startIndex >= after)
-          .flatMap(commands),
-      )
-  }
-  return later
-}
-
-function commands(node: Node) {
-  return node.descendantsOfType("command").filter((item): item is Node => Boolean(item))
-}
-
-// The words a command runs with, as written: its name and arguments, without assignments, redirects and the RANGES
-// in them. Bash removes line continuations before it reads words, which Tree-sitter does not: it can split one shell
-// word into several nodes (`$"…"`, a word continued on the next line), which are joined back here, and it reads the
-// descriptor of a redirect whose operator starts the next line (`2\` then `>out`) as an argument, which is left out.
-// Tree-sitter also leaves a lone `-` before a heredoc (`python3 - <<'EOF'`) out of every node; it is put back.
-function legacyWords(node: Node, source: string, ranges: readonly Range[]) {
-  const name = node.childForFieldName("name")
-  if (!name) return []
-  const nodes = [name, ...node.childrenForFieldName("argument").filter((item): item is Node => Boolean(item))]
-  const words = wordRanges(nodes, source).filter((word, index) => {
-    if (index === 0 || !/^(?:\d+|\{[A-Za-z_][A-Za-z0-9_]*\})$/.test(source.slice(word.start, word.end))) return true
-    CONTINUED_REDIRECT_RE.lastIndex = word.end
-    return !CONTINUED_REDIRECT_RE.test(source)
-  })
-  const redirect = node.nextSibling
-  if (node.parent?.type === "redirected_statement" && redirect?.type === "heredoc_redirect") {
-    const dash = /^[ \t]+-(?=[ \t]+$)/.exec(source.slice(node.endIndex, redirect.startIndex))
-    if (dash) words.push({ start: node.endIndex + dash[0].length - 1, end: node.endIndex + dash[0].length })
-  }
-  return words.map((word) => without(source.slice(word.start, word.end), word.start, ranges))
-}
-
-// The words NODES make in SOURCE, without the RANGES in them: nodes with nothing but line continuations between
-// them are one word, which Tree-sitter splits.
-function joined(nodes: readonly (Node | null)[], source: string, ranges: readonly Range[]) {
-  return wordRanges(
-    nodes.filter((item): item is Node => Boolean(item)),
-    source,
-  ).map((word) => without(source.slice(word.start, word.end), word.start, ranges))
-}
-
-function wordRanges(nodes: readonly Node[], source: string) {
-  return nodes.reduce<Range[]>((words, item) => {
-    const last = words.at(-1)
-    if (last && /^(?:\\\n)*$/.test(source.slice(last.end, item.startIndex))) last.end = item.endIndex
-    else words.push({ start: item.startIndex, end: item.endIndex })
-    return words
-  }, [])
-}
-
-function cut(node: Node, ranges: readonly Range[]) {
-  return without(node.text, node.startIndex, ranges)
-}
 
 type Range = { start: number; end: number }
 
@@ -562,54 +246,6 @@ function without(text: string, start: number, ranges: readonly Range[]) {
   }
   return state.text + text.slice(state.at - start)
 }
-
-export const scanPortable = Effect.fnUntraced(function* (command: string, shell: string, cwd: string) {
-  const { ShellScan } = yield* portableScanner
-  const powershell = ShellSelect.ps(shell)
-  // The commands of a script, for what it does with what it reads.
-  const commands = (script: Script) => {
-    const nested = ShellScan.statements(script.text, script.dialect)
-    if (nested.kind === "opaque") return
-    return nested.commands
-      .filter((item) => !item.declaration && !item.assignment)
-      .map((item) => ShellUnwrap.unwrap(portableWords(item), script.dialect))
-  }
-  // The commands of a script handed to PowerShell, as those of a PowerShell command are read.
-  const powershellCommands = (text: string) => {
-    const nested = ShellScan.scanPowerShell(text)
-    if (nested.kind === "opaque") return
-    return nested.commands
-      .filter((item) => !item.declaration && !item.assignment && !foreachBlock(item))
-      .map((item) => ({ text: item.resource, words: portableWords(item) }))
-  }
-  const options: Options = {
-    powershell,
-    posix: posix(shell),
-    cwd,
-    shell,
-    dialect: dialect(shell),
-    commands,
-    powershellCommands,
-  }
-  const result = powershell
-    ? statementsOf(ShellScan.scanPowerShell(command))
-    : ShellScan.statements(command, options.dialect)
-  if (result.kind === "opaque")
-    return yield* Effect.fail(new Error(`Portable shell scanner cannot analyze command: ${result.reason}`))
-
-  const output = collector()
-  const scripts = portableCommands(output, result, options)
-  // A script is read in the dialect of the shell that runs it, and refused as the command would be when it cannot be.
-  follow(output, scripts, (script) => {
-    const nested = ShellScan.statements(script.text, script.dialect)
-    if (nested.kind === "opaque") {
-      output.fail(`Portable shell scanner cannot analyze command: ${nested.reason} in a script it runs`)
-      return []
-    }
-    return portableCommands(output, nested, { ...options, powershell: false, posix: true, dialect: script.dialect })
-  })
-  return yield* finish(output)
-})
 
 type Portable = Extract<ShellScan.Statements, { kind: "scanned" }>
 type Command = Portable["commands"][number]
@@ -637,6 +273,13 @@ function portableCommands(output: Collector, scanned: Portable, options: Options
   const heredocs = options.posix ? portableHeredocs(scanned, options) : { spans: [], reads: [] }
   const scripts: Script[] = []
   const reads = [...heredocs.reads]
+  // Statements of assignments, by where they start: one with redirects is also reported as a redirect statement.
+  const assigned = new Set(
+    scanned.commands.flatMap((item) => {
+      const place = item.assignment ? scanned.places.get(item) : undefined
+      return place ? [`${place.text}:${place.start}`] : []
+    }),
+  )
   for (const item of scanned.commands) {
     // The data-only heredoc bodies in the text the command was read from are left out of its text and words.
     const place = scanned.places.get(item)
@@ -646,43 +289,64 @@ function portableCommands(output: Collector, scanned: Portable, options: Options
     const resource = kept === item.resource ? kept : kept.trim()
     const cutWords = (words: readonly string[]) =>
       place ? words.map((word, index) => without(word, place.words[index], spans)) : words
+    // A statement of redirects alone runs no command; its text is checked, saved up to its first redirect. With
+    // assignments, it is checked as the assignment statement it is, its redirects in its text.
+    if (item.redirectPrefixEnd !== undefined) {
+      if (place && assigned.has(`${place.text}:${place.start}`)) continue
+      const head = item.resource.slice(0, item.redirectPrefixEnd)
+      const next = item.resource[item.redirectPrefixEnd]
+      const separator = next === "\t" || next === "\n" ? next : " "
+      output.command(resource, `${head}${separator}*`)
+      continue
+    }
     // Declarations and assignments are checked as written, which the substitutions within them are as well.
     if (item.declaration || item.assignment) {
-      if (options.posix) variables(output, resource, cutWords(portableWords(item)), Boolean(item.declaration))
+      if (options.posix)
+        variables(
+          output,
+          resource,
+          cutWords(portableWords(item)),
+          Boolean(item.declaration),
+          redirects(item, place, spans),
+        )
       continue
     }
     const words = portableWords(item)
     if (powershell && foreachBlock(item)) continue
-    const name = powershell ? words[0]?.toLowerCase() : words[0]
-    if (CWD.has(name)) {
-      output.result.directories.push(
-        ...directoryArgs(
-          powershell
-            ? words.flatMap((raw, index): Part[] => {
-                const text =
-                  !raw.includes("`$") && /['"`]/.test(raw) ? (item.words[index] ?? raw) : raw.replaceAll("`$", "\0")
-                if (!/^-[A-Za-z_?][\w?-]*(?::|$)/.test(raw)) return [{ type: "word", text }]
-                const colon = text.indexOf(":")
-                if (colon >= 0)
-                  return colon + 1 < text.length
-                    ? [
-                        { type: "command_parameter", text: text.slice(0, colon) },
-                        { type: "word", text: text.slice(colon + 1) },
-                      ]
-                    : [{ type: "command_parameter", text: text.slice(0, colon) }]
-                return [{ type: "command_parameter", text }]
-              })
-            : item.rawWords.map((text, index) => ({
-                type: "word",
-                // Only literal quoting resolves to a static directory.
-                text: text.startsWith("$'") || (!/[$`~\\]/.test(text) && /['"]/.test(text)) ? item.words[index] : text,
-              })),
-          powershell,
-          cwd,
-          shell,
-        ),
-      )
-      continue
+    // Words before the first redirect, as PowerShell reads a directory change.
+    const leading = item.redirectWordCount === undefined ? words : words.slice(0, item.redirectWordCount)
+    const parts = powershell
+      ? leading.flatMap((raw, index): Part[] => {
+          const text =
+            !raw.includes("`$") && /['"`]/.test(raw) ? (item.words[index] ?? raw) : raw.replaceAll("`$", "\0")
+          if (!/^-[A-Za-z_?][\w?-]*(?::|$)/.test(raw)) return [{ type: "word", text, raw }]
+          const colon = text.indexOf(":")
+          if (colon >= 0) {
+            const rawColon = raw.indexOf(":")
+            return colon + 1 < text.length
+              ? [
+                  { type: "command_parameter", text: text.slice(0, colon), raw: raw.slice(0, rawColon) },
+                  { type: "word", text: text.slice(colon + 1), raw: rawColon >= 0 ? raw.slice(rawColon + 1) : raw },
+                ]
+              : [{ type: "command_parameter", text: text.slice(0, colon), raw }]
+          }
+          return [{ type: "command_parameter", text, raw }]
+        })
+      : item.rawWords.map((raw, index): Part => {
+          const word = item.words[index] ?? raw
+          return {
+            type: "word",
+            text: isStaticBashWord(raw) ? word.replaceAll("$", "\0") : "$",
+            raw,
+            unquotedTilde: raw.startsWith("~"),
+          }
+        })
+    const directoryCommand = unwrapDirectoryCommand(powershell ? leading : item.rawWords, parts, powershell)
+    if (directoryCommand) {
+      const resolved = directoryArgs(directoryCommand, powershell, cwd, shell)
+      output.result.directories.push(...resolved.directories)
+      // A directory change whose target is known is checked as a directory; any other is checked as a command too.
+      if (directoryCommand === parts && resolved.complete) continue
     }
     const selected = prefix(words.slice(0, PREFIX_LENGTH))
     const conventional = `${selected.join(" ")} *`
@@ -691,21 +355,32 @@ function portableCommands(output: Collector, scanned: Portable, options: Options
     const save =
       !powershell || end === undefined || Wildcard.match(item.resource, conventional)
         ? conventional
-        : (() => {
-            const boundary =
-              item.wordEnds?.find(
-                (value) => value >= end && (value >= item.resource.length || /\s/.test(item.resource[value])),
-              ) ?? end
-            const separator = /^\s+(?:`(?:\r\n|\r|\n)\s*)?/.exec(item.resource.slice(boundary))?.[0]
-            return `${item.resource.slice(0, boundary)}${separator ?? " "}*`
-          })()
+        : item.resource[end] === "("
+          ? `${item.resource.slice(0, end)}(*`
+          : (() => {
+              const boundary =
+                item.wordEnds?.find(
+                  (value) => value >= end && (value >= item.resource.length || /\s/.test(item.resource[value])),
+                ) ?? end
+              const separator = /^\s+(?:`(?:\r\n|\r|\n)\s*)?/.exec(item.resource.slice(boundary))?.[0]
+              return `${item.resource.slice(0, boundary)}${separator ?? " "}*`
+            })()
     if (!options.posix) {
       if (powershell) powershellCommand(output, { text: resource, words }, save, options)
       else output.command(resource, save)
       continue
     }
     const assignments = place?.assignments.map((item) => without(item.raw, item.start, spans)) ?? []
-    const found = expand(output, resource, save, cutWords(words), options.dialect, assignments)
+    const found = expand(
+      output,
+      resource,
+      save,
+      cutWords(words),
+      options.dialect,
+      assignments,
+      false,
+      redirects(item, place, spans),
+    )
     scripts.push(...found.scripts)
     powershellScripts(output, found.powershell, options)
     const downstream = scanned.downstream.get(item)
@@ -715,7 +390,7 @@ function portableCommands(output: Collector, scanned: Portable, options: Options
           found,
           () =>
             downstream
-              .filter((next) => !next.declaration && !next.assignment)
+              .filter((next) => !next.declaration && !next.assignment && next.redirectPrefixEnd === undefined)
               .map((next) => ShellUnwrap.unwrap(portableWords(next), options.dialect)),
           options,
         ),
@@ -738,7 +413,7 @@ function portableHeredocs(scanned: Portable, options: Options) {
   const reads: Read[] = []
   const commands = (items: readonly Command[]) =>
     items
-      .filter((item) => !item.declaration && !item.assignment)
+      .filter((item) => !item.declaration && !item.assignment && item.redirectPrefixEnd === undefined)
       .map((item) => ShellUnwrap.unwrap(portableWords(item), options.dialect))
   for (const heredoc of scanned.heredocs) {
     const later = scanned.commands.filter((item) => {
@@ -936,13 +611,14 @@ function expand(
   dialect: ShellUnwrap.Dialect,
   assignments: readonly string[] = [],
   once = false,
+  redirected = "",
 ) {
   // The legacy grammar gives a statement of assignments with a redirect an empty command name.
   const found = ShellUnwrap.unwrap(words[0] ? words : [], dialect)
   if (found.truncated) output.fail("Shell command runs too many nested commands to check")
   const [head, ...rest] = found.views
   const save = head ? saved(head) : fallback
-  const alternates = head ? ShellUnwrap.spellings(head) : []
+  const alternates = head ? withRedirects(ShellUnwrap.spellings(head), redirected) : []
   if (once) output.extra(resource, save, alternates)
   else output.command(resource, save, alternates)
   for (const word of [...assignments, ...found.assignments])
@@ -999,19 +675,67 @@ function saved(view: ShellUnwrap.View) {
   return head.some((word) => /[*?]/.test(word)) ? undefined : `${head.join(" ")} *`
 }
 
-// Emits a statement that sets or clears variables, RESOURCE as written from WORDS: one resource for each variable,
-// saved as that variable alone (`export NAME=*`, `NAME=*`, `unset NAME`), so approving one never covers another. A
-// statement of one variable is that resource as written, and one of none is saved exactly; one of several is listed
-// as written as well when its text holds more than its words, such as a redirect.
-function variables(output: Collector, resource: string, words: readonly string[], declaration: boolean) {
+// Emits a statement that sets or clears variables, RESOURCE as written from WORDS, with the REDIRECTED files: one
+// resource for each variable, saved as that variable alone (`export NAME=*`, `unset NAME`) or, for a plain
+// assignment, as that assignment (`NAME=value`), so approving one never covers another. A statement of one variable
+// is that resource as written, and one of none is saved exactly; one of several is listed as written as well when its
+// text holds more than its words, such as a redirect.
+function variables(
+  output: Collector,
+  resource: string,
+  words: readonly string[],
+  declaration: boolean,
+  redirected = "",
+) {
   const statements = declaration
     ? ShellUnwrap.declarations(words)
     : words.map((word) => ({ words: [word], save: ShellUnwrap.assignment(word) }))
-  if (statements.length === 0) return output.command(resource, exact(resource), spelled(words))
-  if (statements.length === 1) return output.command(resource, statements[0].save, spelled(statements[0].words))
+  if (statements.length === 0)
+    return output.command(resource, exact(resource), withRedirects(spelled(words), redirected))
+  if (statements.length === 1) {
+    // An assignment's approval covers it with the files it is redirected to, not with others.
+    const save =
+      declaration || !redirected
+        ? statements[0].save
+        : statements[0].save && exact(`${statements[0].save} ${redirected}`)
+    return output.command(resource, save, withRedirects(spelled(statements[0].words), redirected))
+  }
   if (!bare(resource, words)) output.command(resource, exact(resource))
   for (const statement of statements)
     output.command(statement.words.join(" "), statement.save, spelled(statement.words))
+}
+
+// The redirects of ITEM as written, in order: the text of its resource outside its words and the assignments
+// prefixed to it, without the data-only heredoc bodies of SPANS; empty when its place is unknown.
+function redirects(item: Command, place: ShellScan.Place | undefined, spans: readonly ShellScan.Span[]) {
+  if (!place) return ""
+  const covered = [
+    ...item.rawWords.map((raw, index) => ({ start: place.words[index], end: place.words[index] + raw.length })),
+    ...place.assignments.map((assignment) => ({
+      start: assignment.start,
+      end: assignment.start + assignment.raw.length,
+    })),
+  ]
+    .filter((range) => range.start !== undefined && !Number.isNaN(range.end))
+    .sort((a, b) => a.start - b.start)
+  const end = place.start + item.resource.length
+  const texts: string[] = []
+  let at = place.start
+  for (const range of [...covered, { start: end, end }]) {
+    if (range.start > at)
+      texts.push(without(item.resource.slice(at - place.start, range.start - place.start), at, spans))
+    at = Math.max(at, range.end)
+  }
+  return texts
+    .map((text) => text.replace(/\\\n/g, " ").trim())
+    .filter((text) => text.length > 0)
+    .join(" ")
+}
+
+// SPELLINGS of a command with the redirects it is written with, so a spelling never stands for the command without
+// the files it reads or writes: an approval of `cat` does not cover `cat > file`.
+function withRedirects(spellings: readonly string[], redirected: string) {
+  return redirected ? spellings.map((spelling) => `${spelling} ${redirected}`) : [...spellings]
 }
 
 // The spellings of WORDS: as written, and unquoted when every one is static.
@@ -1050,85 +774,279 @@ function follow(output: Collector, scripts: readonly Script[], visit: (script: S
   }
 }
 
-function parts(node: Node) {
-  return Array.from({ length: node.childCount }).flatMap((_, index): Part[] => {
-    const child = node.child(index)
-    if (!child) return []
-    if (child.type === "command_elements")
-      return Array.from({ length: child.childCount }).flatMap((_, itemIndex): Part[] => {
-        const item = child.child(itemIndex)
-        if (!item || item.type === "command_argument_sep" || item.type === "redirection") return []
-        return [{ type: item.type, text: item.text }]
-      })
-    if (!["command_name", "command_name_expr", "word", "string", "raw_string", "concatenation"].includes(child.type))
-      return []
-    return [{ type: child.type, text: child.text }]
-  })
+function unwrapDirectoryCommand(rawWords: string[], parts: Part[], powershell: boolean) {
+  const head = powershell ? rawWords[0]?.toLowerCase() : rawWords[0]
+  if (CWD.has(head ?? "")) return parts
+  if (powershell) return
+  let index = 0
+  while (rawWords[index] === "builtin" || rawWords[index] === "command") {
+    const wrapper = rawWords[index]
+    index++
+    while (rawWords[index]?.startsWith("-")) {
+      const flag = rawWords[index]
+      index++
+      if (flag === "--") break
+      if (wrapper === "command" && /^-[p]*[vV]/.test(flag)) return
+    }
+  }
+  return index > 0 && CWD.has(rawWords[index] ?? "") ? parts.slice(index) : undefined
 }
 
-// The words of a PowerShell command NODE parsed from SOURCE, as the portable scanner reads them: quotes kept, and a
-// parameter given its value after a colon (`-Recurse:$false`) as one word, which the grammar parses apart.
-function powershellWords(node: Node, source: string) {
-  const items = Array.from({ length: node.childCount }).flatMap((_, index): Node[] => {
-    const child = node.child(index)
-    if (!child) return []
-    if (child.type === "command_elements")
-      return Array.from({ length: child.childCount }).flatMap((_, itemIndex): Node[] => {
-        const item = child.child(itemIndex)
-        return item && item.type !== "command_argument_sep" && item.type !== "redirection" ? [item] : []
-      })
-    return child.type === "command_name" || child.type === "command_name_expr" ? [child] : []
-  })
-  const words: string[] = []
-  for (let index = 0; index < items.length; index++) {
-    const item = items[index]
-    const next = items[index + 1]
-    if (item.type === "command_parameter" && next && source.slice(item.endIndex, next.startIndex) === ":") {
-      words.push(source.slice(item.startIndex, next.endIndex))
+function isStaticBashWord(raw: string) {
+  let quote: "'" | '"' | "$'" | undefined
+  let segmentStarted = false
+  let segmentLeadingDot = false
+  let segmentGlob = false
+  let hasAnsiEscape = false
+  let hasUnquotedGlob = false
+  const braces: boolean[] = []
+  const recordChar = (char: string, unquotedGlob = false) => {
+    if (unquotedGlob) hasUnquotedGlob = true
+    if (hasAnsiEscape && hasUnquotedGlob) return false
+    if (char === "/") {
+      segmentStarted = false
+      segmentLeadingDot = false
+      segmentGlob = false
+      return true
+    }
+    if (!segmentStarted) {
+      segmentStarted = true
+      segmentLeadingDot = char === "."
+    }
+    if (unquotedGlob) segmentGlob = true
+    return !(segmentLeadingDot && segmentGlob)
+  }
+
+  for (let index = 0; index < raw.length; index++) {
+    const char = raw[index]
+    const next = raw[index + 1] ?? ""
+    if (quote === "'") {
+      if (char === "'") {
+        quote = undefined
+        continue
+      }
+      if (!recordChar(char)) return false
+      continue
+    }
+    if (quote === "$'") {
+      if (char === "\\") {
+        hasAnsiEscape = true
+        if (hasUnquotedGlob) return false
+        index++
+        continue
+      }
+      if (char === "'") {
+        quote = undefined
+        continue
+      }
+      if (!recordChar(char)) return false
+      continue
+    }
+    if (quote === '"') {
+      if (char === "\\" && '$`"\\\n'.includes(next)) {
+        index++
+        if (next !== "\n" && !recordChar(next)) return false
+        continue
+      }
+      if (char === '"') {
+        quote = undefined
+        continue
+      }
+      if (char === "`" || (char === "$" && (/[A-Za-z_0-9@*#?$!({[-]/.test(next) || raw.startsWith("\\\n", index + 1))))
+        return false
+      if (!recordChar(char)) return false
+      continue
+    }
+    if (char === "\\") {
+      index++
+      if (next !== "\n" && !recordChar(next)) return false
+      continue
+    }
+    if (char === "'") {
+      quote = "'"
+      continue
+    }
+    if (char === '"') {
+      quote = '"'
+      continue
+    }
+    if (char === "$" && next === "'") {
+      quote = "$'"
       index++
       continue
     }
-    words.push(item.text)
+    if (char === "$" && next === '"') {
+      quote = '"'
+      index++
+      continue
+    }
+    if (
+      char === "`" ||
+      ((char === "<" || char === ">" || char === "=") && next === "(") ||
+      (char === "$" && (/[A-Za-z_0-9@*#?$!({[-]/.test(next) || raw.startsWith("\\\n", index + 1)))
+    )
+      return false
+    if (char === "{") {
+      braces.push(false)
+      if (!recordChar(char)) return false
+      continue
+    }
+    if (braces.length > 0 && (char === "," || (char === "." && next === "."))) {
+      braces[braces.length - 1] = true
+    }
+    if (char === "}" && braces.length > 0) {
+      if (braces.pop()) return false
+      if (!recordChar(char)) return false
+      continue
+    }
+    if (!recordChar(char, char === "*" || char === "?" || char === "[")) return false
   }
-  return words
+  return quote === undefined
+}
+
+function hasPowerShellDotWildcard(raw: string) {
+  let quote: "'" | '"' | undefined
+  let segmentStarted = false
+  let segmentLeadingDot = false
+  let segmentGlob = false
+  let hasQuoteEscape = false
+  let hasUnquotedGlob = false
+  const recordChar = (char: string, unquotedGlob = false) => {
+    if (unquotedGlob) hasUnquotedGlob = true
+    if (hasQuoteEscape && hasUnquotedGlob) return true
+    if (char === "/" || char === "\\") {
+      segmentStarted = false
+      segmentLeadingDot = false
+      segmentGlob = false
+      return false
+    }
+    if (!segmentStarted) {
+      segmentStarted = true
+      segmentLeadingDot = char === "."
+    }
+    if (unquotedGlob) segmentGlob = true
+    return segmentLeadingDot && segmentGlob
+  }
+
+  for (let index = 0; index < raw.length; index++) {
+    const char = raw[index]
+    const next = raw[index + 1] ?? ""
+    if (quote === "'") {
+      if (char === "'" && next === "'") {
+        index++
+        if (recordChar("'")) return true
+        continue
+      }
+      if (char === "'") {
+        quote = undefined
+        continue
+      }
+      if (recordChar(char)) return true
+      continue
+    }
+    if (quote === '"') {
+      if (char === "`") {
+        hasQuoteEscape = true
+        if (hasUnquotedGlob) return true
+        index++
+        continue
+      }
+      if (char === '"' && next === '"') {
+        index++
+        if (recordChar('"')) return true
+        continue
+      }
+      if (char === '"') {
+        quote = undefined
+        continue
+      }
+      if (recordChar(char)) return true
+      continue
+    }
+    if (char === "`") {
+      index++
+      if (recordChar(next)) return true
+      continue
+    }
+    if (char === "'" || char === '"') {
+      quote = char
+      continue
+    }
+    if (recordChar(char, char === "*" || char === "?" || char === "[")) return true
+  }
+  return false
 }
 
 function directoryArgs(command: Part[], powershell: boolean, cwd: string, shell: string) {
-  if (!powershell)
-    return command
-      .slice(1)
-      .filter((part) => !part.text.startsWith("-"))
-      .map((part) => directoryArgument(part.text, powershell, cwd, shell))
-      .filter((part) => part !== undefined)
+  const head = command[0]?.text.toLowerCase() ?? ""
+  if (head === "popd" || head === "pop-location") return { directories: [], complete: false }
+
+  if (!powershell) {
+    let endOfOptions = false
+    const operands = command.slice(1).filter((part) => {
+      if (endOfOptions) return true
+      if (part.text === "--") {
+        endOfOptions = true
+        return false
+      }
+      if (part.text === "-") return true
+      return !part.text.startsWith("-")
+    })
+    if (operands.length === 0) return { directories: [], complete: false }
+    const resolved = operands.map((part) =>
+      part.text === "-" ? undefined : directoryArgument(part.text, false, cwd, shell, part.unquotedTilde),
+    )
+    const directories = resolved.filter((item): item is string => item !== undefined)
+    return { directories, complete: directories.length === operands.length }
+  }
 
   const directories: string[] = []
-  let path = false
+  let pathFlag = false
+  let literalFlag = false
   let endOfParameters = false
+  let sawOperand = false
+  let complete = true
   for (const part of command.slice(1)) {
     if (!endOfParameters && part.text === "--") {
       endOfParameters = true
       continue
     }
-    if (path) {
-      const value = directoryArgument(part.text, powershell, cwd, shell)
+    if (pathFlag) {
+      sawOperand = true
+      const value =
+        !literalFlag && (hasPowerShellDotWildcard(part.raw) || part.text === "-" || part.text === "+")
+          ? undefined
+          : directoryArgument(part.text, true, cwd, shell)
       if (value) directories.push(value)
-      path = false
+      if (!value) complete = false
+      pathFlag = false
+      literalFlag = false
       continue
     }
     if (!endOfParameters && part.type === "command_parameter") {
-      path = POWERSHELL_PATH_FLAG_RE.test(part.text)
+      if (POWERSHELL_STACK_FLAG_RE.test(part.text)) {
+        complete = false
+        return { directories, complete }
+      }
+      literalFlag = POWERSHELL_LITERAL_FLAG_RE.test(part.text)
+      pathFlag = literalFlag || /^-p(?:ath|at|a)?:?$/i.test(part.text)
       continue
     }
-    const value = directoryArgument(part.text, powershell, cwd, shell)
+    sawOperand = true
+    const value =
+      hasPowerShellDotWildcard(part.raw) || (!endOfParameters && (part.raw === "-" || part.raw === "+"))
+        ? undefined
+        : directoryArgument(part.text, true, cwd, shell)
     if (value) directories.push(value)
+    if (!value) complete = false
   }
-  return directories
+  return { directories, complete: sawOperand && complete }
 }
 
-function directoryArgument(value: string, powershell: boolean, cwd: string, shell: string) {
+function directoryArgument(value: string, powershell: boolean, cwd: string, shell: string, unquotedTilde = false) {
+  if (!powershell) return expandKnownDirectory(value, false, cwd, unquotedTilde)
   const quote = value[0]
   const text = (quote === '"' || quote === "'") && value.at(-1) === quote ? value.slice(1, -1) : value
-  if (!powershell) return expandKnownDirectory(text)
 
   // PowerShell exposes environment variables through $env:NAME and provides these
   // automatic directory variables. Expand only values we can determine without executing code.
@@ -1142,18 +1060,64 @@ function directoryArgument(value: string, powershell: boolean, cwd: string, shel
         if (key === "PWD") return cwd
         return path.dirname(shell)
       }),
+    true,
+    cwd,
   )
 }
 
-function expandKnownDirectory(value: string) {
+function expandKnownDirectory(value: string, powershell: boolean, cwd: string, unquotedTilde = false) {
   // Unknown shell expressions cannot be resolved safely during permission analysis.
-  if (value.includes("$") || value.includes("`") || value.startsWith("(")) return
+  if (value.includes("$") || value.includes("`") || (powershell && value.startsWith("("))) return
   const resolved = value.replaceAll("\0", "$")
   if (resolved === "~") return os.homedir()
   if (resolved.startsWith("~/") || (process.platform === "win32" && resolved.startsWith("~\\"))) {
     return path.join(os.homedir(), resolved.slice(2))
   }
+  if (unquotedTilde && process.platform !== "win32") {
+    if (resolved === "~+") return cwd
+    if (resolved.startsWith("~+/")) return path.join(cwd, resolved.slice(3))
+    if (/^~(?:[-+](?:\d+)?|\d+)(?=$|\/)/.test(resolved)) return
+    const userMatch = /^~([A-Za-z_][A-Za-z0-9._-]*)(?=$|\/)/.exec(resolved)
+    if (userMatch) {
+      const user = userMatch[1]
+      const home = resolveUserHome(user)
+      if (!home) return
+      return path.join(home, resolved.slice(user.length + 1))
+    }
+  }
   return resolved
+}
+
+let cachedPasswdHomes: ReadonlyMap<string, string> | undefined
+
+function passwdHomes() {
+  if (cachedPasswdHomes) return cachedPasswdHomes
+  const content = Result.try(() => fs.readFileSync("/etc/passwd", "utf8"))
+  const entries = Result.isSuccess(content)
+    ? content.success.split("\n").flatMap((line): Array<[string, string]> => {
+        if (!line || line.startsWith("#")) return []
+        const fields = line.split(":")
+        const name = fields[0]
+        const home = fields[5]
+        return name && home ? [[name, home]] : []
+      })
+    : []
+  cachedPasswdHomes = new Map(entries)
+  return cachedPasswdHomes
+}
+
+function resolveUserHome(user: string) {
+  const current = Result.try(() => os.userInfo())
+  if (Result.isSuccess(current) && current.success.username === user && current.success.homedir) {
+    return current.success.homedir
+  }
+  const fromPasswd = passwdHomes().get(user)
+  if (fromPasswd) return fromPasswd
+  if (process.platform === "darwin") {
+    const candidate = path.join("/Users", user)
+    const exists = Result.try(() => fs.statSync(candidate).isDirectory())
+    if (Result.isSuccess(exists) && exists.success) return candidate
+  }
 }
 
 function environment(key: string) {
@@ -1168,26 +1132,4 @@ function prefix(tokens: string[]) {
     if (arity !== undefined) return tokens.slice(0, arity)
   }
   return tokens.slice(0, 1)
-}
-
-function resolve(asset: string) {
-  if (asset.startsWith("file://")) return fileURLToPath(asset)
-  if (path.isAbsolute(asset)) return asset
-  return fileURLToPath(new URL(asset, import.meta.url))
-}
-
-const load = lazy(initialize)
-
-async function initialize() {
-  const { Parser, Language } = await import("web-tree-sitter")
-  await Parser.init({ locateFile: () => resolve(shellParserWasm.runtime) })
-  const [bashLanguage, psLanguage] = await Promise.all([
-    Language.load(resolve(shellParserWasm.bash)),
-    Language.load(resolve(shellParserWasm.powershell)),
-  ])
-  const bash = new Parser()
-  bash.setLanguage(bashLanguage)
-  const ps = new Parser()
-  ps.setLanguage(psLanguage)
-  return { bash, ps }
 }

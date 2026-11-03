@@ -1,5 +1,5 @@
 import { describe, expect } from "bun:test"
-import { LanguageModel, LLMRequest, Message, SystemPart } from "@opencode/ai/effect"
+import { LanguageModel, Message, SystemPart } from "@opencode/ai/effect"
 import { AnthropicMessages, OpenAIChat } from "@opencode/ai/protocols"
 import {
   AmazonBedrock,
@@ -10,7 +10,7 @@ import {
   MiniMax,
   VercelAIGateway,
 } from "@opencode/ai/providers"
-import { compileRequest } from "@opencode/ai/route/client"
+import { compileRequest } from "@opencode/ai/testing"
 import { Agent } from "@opencode/schema/agent"
 import { Money } from "@opencode/schema/money"
 import { Session } from "@opencode/schema/session"
@@ -124,12 +124,12 @@ describe("SessionModelRequest prompt cache TTL", () => {
     it.effect(`requests a one-hour cache from ${name}`, () =>
       Effect.gen(function* () {
         const prepared = yield* prepare(model)
-        expect(prepared.request.cache).toMatchObject({ ttlSeconds: 3600 })
+        expect(prepared.request.cache).toMatchObject({ ttl: "1h" })
         const compiled = yield* compileRequest(prepared.request)
         const markers = cacheControls(compiled.body)
         // Tools, both system parts and the conversation tail, as the default placement chooses.
         expect(markers).toEqual(Array.from({ length: 4 }, () => ({ type: "ephemeral", ttl: "1h" })))
-        const auto = yield* compileRequest(LLMRequest.update(prepared.request, { cache: undefined }))
+        const auto = yield* compileRequest({ ...prepared.request, cache: undefined })
         expect(JSON.stringify(compiled.body).replaceAll(',"ttl":"1h"', "")).toBe(JSON.stringify(auto.body))
       }),
     )

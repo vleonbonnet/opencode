@@ -22,8 +22,8 @@ export type Continuation = { readonly step: number }
 
 export type DrainResult = Data.TaggedEnum<{
   Complete: {}
-  Moved: { readonly continuation?: Continuation }
-  Reloaded: { readonly force: boolean; readonly continuation?: Continuation }
+  Moved: { readonly continuation?: Continuation; readonly stepped?: true }
+  Reloaded: { readonly force: boolean; readonly continuation?: Continuation; readonly stepped?: true }
 }>
 export const DrainResult = Data.taggedEnum<DrainResult>()
 
@@ -42,6 +42,8 @@ export interface Interface {
      * that releases its claim instead of resuming the turn at the next server start.
      */
     readonly reportDeclined?: () => Effect.Effect<void>
+    /** The previous drain ran a step before handing off, so reaching idle still runs the idle hook. */
+    readonly stepped?: boolean
   }) => Effect.Effect<DrainResult, RunError>
 }
 

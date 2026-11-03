@@ -4,36 +4,30 @@ import { ShellParse } from "@opencode/core/shell/parse"
 import { ShellUnwrap } from "@opencode/core/shell/unwrap"
 import { Wildcard } from "@opencode/core/util/wildcard"
 
-// The scan of COMMAND by the legacy scanner, then the portable one: the result, or the error a refused command fails
-// with, which then does not run.
+// The scan of COMMAND, as a list of one: the result, or the error a refused command fails with, which then does not
+// run.
 async function scans(command: string, shell = "/bin/bash") {
-  return Promise.all(
-    [false, true].map(async (portable) => {
-      const exit = await Effect.runPromiseExit(ShellParse.scan(command, shell, "/workspace", { portable }))
-      if (exit._tag === "Success") return exit.value
-      const failure = exit.cause.reasons.find((reason) => reason._tag === "Fail")
-      if (!failure || failure._tag !== "Fail") throw new Error(`${command}: scan died`)
-      return failure.error as Error
-    }),
-  )
+  const exit = await Effect.runPromiseExit(ShellParse.scan(command, shell, "/workspace"))
+  if (exit._tag === "Success") return [exit.value]
+  const failure = exit.cause.reasons.find((reason) => reason._tag === "Fail")
+  if (!failure || failure._tag !== "Fail") throw new Error(`${command}: scan died`)
+  return [failure.error as Error]
 }
 
-// Every text the rules are checked against for COMMAND in each scanner: each command's resource and its alternate
-// spellings, or undefined when the scanner refuses the command. Scanners that both read it must agree.
+// Every text the rules are checked against for COMMAND, as a list of one: each command's resource and its alternate
+// spellings, or undefined when the scanner refuses the command.
 async function seen(command: string, shell = "/bin/bash") {
-  const results = (await scans(command, shell)).map((result) =>
+  return (await scans(command, shell)).map((result) =>
     result instanceof Error
       ? undefined
       : result.commands.flatMap((item) => [item.resource, ...(item.alternates ?? [])]),
   )
-  if (results[0] && results[1]) expect(results[1], command).toEqual(results[0])
-  return results
 }
 
-// Whether RULE sees COMMAND in both scanners: each refuses it or checks a spelling the rule matches.
+// Whether RULE sees COMMAND: the scan refuses it or checks a spelling the rule matches.
 async function matched(command: string, rule: string, shell = "/bin/bash") {
   const results = await seen(command, shell)
-  expect(results.some(Boolean), `${command}: refused by both scanners`).toBe(true)
+  expect(results.some(Boolean), `${command}: refused`).toBe(true)
   return results.every((texts) => !texts || texts.some((text) => Wildcard.match(text, rule)))
 }
 
@@ -189,21 +183,20 @@ describe("ShellParse refuses scripts it cannot read", () => {
     "sh <<'EOF'\nkubectl delete pod x\na[$i]=1\nEOF",
     "ssh host 'kubectl delete pod x; alias a=b'",
   ])("%s", async (command) => {
-    expect(await matched(command, "kubectl delete *")).toBe(true)
+    // A script the scanner cannot read is refused whole, so none of its commands runs unchecked.
+    const [result] = await scans(command)
+    expect(result instanceof Error ? result.message : result).toContain("Portable shell scanner cannot analyze command")
   })
 
-  test("refuses a script nested past the depth it follows, in both scanners", async () => {
+  test("refuses a script nested past the depth it follows", async () => {
     for (const result of await scans(nested(5, "kubectl get pods")))
       expect(result instanceof Error ? result.message : result).toContain("nests scripts")
     for (const result of await scans(nested(4, "kubectl get pods"))) expect(result).not.toBeInstanceOf(Error)
   })
 
   test("refuses a script whose directory change it cannot read", async () => {
-    const [legacy, portable] = await scans("bash -c 'cd /outside; alias a=b'")
-    expect(legacy instanceof Error ? undefined : legacy.directories).toEqual(["/outside"])
-    expect(portable instanceof Error ? portable.message : portable).toContain(
-      "Portable shell scanner cannot analyze command",
-    )
+    const [result] = await scans("bash -c 'cd /outside; alias a=b'")
+    expect(result instanceof Error ? result.message : result).toContain("Portable shell scanner cannot analyze command")
   })
 
   test.each([
@@ -213,23 +206,22 @@ describe("ShellParse refuses scripts it cannot read", () => {
     ["sh -c 'a[$i]=1; kubectl delete pod x'", true],
     ["dash -c 'a[$i]=1; kubectl delete pod x'", true],
   ] as const)("reads a script in the dialect of the shell that runs it: %s", async (command, refused) => {
-    const [, portable] = await scans(command)
-    expect(portable instanceof Error).toBe(refused)
-    expect(await matched(command, "kubectl delete *")).toBe(true)
+    const [result] = await scans(command)
+    expect(result instanceof Error).toBe(refused)
+    if (!refused) expect(await matched(command, "kubectl delete *")).toBe(true)
   })
 })
 
-// The patterns an "always" reply to COMMAND saves; both scanners must save the same ones.
+// The patterns an "always" reply to COMMAND saves.
 async function saves(command: string, shell = "/bin/bash") {
   const results = (await scans(command, shell)).map((result) =>
     result instanceof Error ? result : result.commands.flatMap((item) => (item.save === undefined ? [] : [item.save])),
   )
-  expect(results[1], command).toEqual(results[0])
   if (results[0] instanceof Error) throw results[0]
   return results[0]
 }
 
-// Whether PATTERNS, saved as approvals, allow COMMAND in both scanners: each of its commands has a spelling one of
+// Whether PATTERNS, saved as approvals, allow COMMAND: each of its commands has a spelling one of
 // them matches.
 async function allows(patterns: readonly string[], command: string, shell = "/bin/bash") {
   return (await scans(command, shell)).every(
@@ -305,10 +297,9 @@ describe("ShellParse heredoc delimiters read as bash reads them", () => {
     `cat <<'EOF' > notes\nEOF \nkubectl delete pod x\nEOF`,
     `cat <<'E\\OF' > notes\nEOF\nkubectl delete pod x\nE\\OF`,
     `cat <<'A' <<'B' > notes\nB\nA\nkubectl delete pod x\nB`,
-  ])("leaves out data the legacy parse misreads as commands: %s", async (command) => {
-    const [legacy, portable] = await seen(command)
-    expect(legacy).toEqual(portable)
-    expect(portable?.some((text) => text.includes("kubectl delete"))).toBe(false)
+  ])("leaves out data a looser heredoc reading would take for commands: %s", async (command) => {
+    const [texts] = await seen(command)
+    expect(texts?.some((text) => text.includes("kubectl delete"))).toBe(false)
   })
 })
 
@@ -363,9 +354,8 @@ describe("ShellParse heredoc and here-string readers", () => {
     "python3 script.py <<'EOF'\nkanopy-oidc\nEOF",
     "cat > run.sh <<'EOF'\nkanopy-oidc\nEOF\nbash other.sh",
   ])("leaves data out: %s", async (command) => {
-    const [legacy, portable] = await seen(command)
-    expect(legacy?.some((text) => text.includes("kanopy-oidc"))).toBe(false)
-    expect(portable?.some((text) => text.includes("kanopy-oidc"))).toBe(false)
+    const [texts] = await seen(command)
+    expect(texts?.some((text) => text.includes("kanopy-oidc"))).toBe(false)
   })
 })
 
@@ -404,10 +394,10 @@ describe("ShellParse rules see the words after a redirect", () => {
 // The rules denying a recursive Remove-Item, whatever spelling runs it.
 const REMOVE_RECURSE = ["Remove-Item -Recurse *", "Remove-Item * -Recurse *"]
 
-// Whether a rule of RULES sees COMMAND in both scanners, as `matched` does for one rule.
+// Whether a rule of RULES sees COMMAND, as `matched` does for one rule.
 async function matchedAny(command: string, rules: readonly string[], shell = "/bin/bash") {
   const results = await seen(command, shell)
-  expect(results.some(Boolean), `${command}: refused by both scanners`).toBe(true)
+  expect(results.some(Boolean), `${command}: refused`).toBe(true)
   return results.every((texts) => !texts || texts.some((text) => rules.some((rule) => Wildcard.match(text, rule))))
 }
 
@@ -469,11 +459,11 @@ describe("ShellParse rules see the cmdlet a PowerShell command runs, with its pa
   })
 
   test("keeps each PowerShell command as written for the rules", async () => {
-    const [legacy] = await seen("rm -r x; Remove-Item y", "pwsh")
-    expect(legacy).toEqual(["rm -r x", "Remove-Item -Recurse x", "Remove-Item y"])
+    const [texts] = await seen("rm -r x; Remove-Item y", "pwsh")
+    expect(texts).toEqual(["rm -r x", "Remove-Item -Recurse x", "Remove-Item y"])
   })
 
-  test("refuses PowerShell scripts nested past the depth it follows, in both scanners", async () => {
+  test("refuses PowerShell scripts nested past the depth it follows", async () => {
     const levels = (count: number) =>
       Array.from({ length: count }).reduce<string>(
         (script) => `pwsh -EncodedCommand ${encoded(script)}`,

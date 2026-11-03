@@ -1548,9 +1548,11 @@ export function declarations(words: readonly string[]) {
   return rest.slice(at).map((operand) => ({ words: [...head, operand], save: variable([...head, operand]) }))
 }
 
-// The approval saving the variable an assignment sets: `NAME=*`.
+// The approval saving an assignment: the assignment itself, unquoted when static. `NAME=*` would also match every
+// command run with NAME set (`NAME=value rm -rf /`), so the value is kept; none when a wildcard would match more.
 export function assignment(word: string) {
-  return variable([word])
+  const text = dynamic(word) ? word : literal(word)
+  return /[*?]/.test(text) ? undefined : text
 }
 
 // The approval saving the variable the last of WORDS sets or clears, after a declaration's keyword and options: the

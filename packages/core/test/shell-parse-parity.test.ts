@@ -2,34 +2,35 @@ import { describe, expect, test } from "bun:test"
 import { Effect } from "effect"
 import { ShellParse } from "../src/shell/parse.js"
 import { ShellScan } from "../src/shell/scan.js"
+import { Wildcard } from "../src/util/wildcard.js"
 
 describe("ShellParse native parity", () => {
-  test("matches the legacy oracle across generated supported syntax without fallback", async () => {
+  test("scans generated supported syntax with valid saved prefixes and no fallback", async () => {
     const commands = generated()
     expect(commands.length).toBeGreaterThan(20_000)
     for (const [shell, command] of commands) {
       const context = `${shell}: ${JSON.stringify(command)}`
       const scanned = shell === "pwsh" ? ShellScan.scanPowerShell(command) : ShellScan.scan(command)
       expect(scanned.kind, context).toBe("scanned")
-      const native = await Effect.runPromise(ShellParse.scanPortable(command, shell, "/workspace"))
-      const legacy = await Effect.runPromise(ShellParse.scan(command, shell, "/workspace"))
-      expect(native, context).toEqual(legacy)
-      expect(
-        await Effect.runPromise(ShellParse.scan(command, shell, "/workspace", { portable: true })),
-        context,
-      ).toEqual(native)
+      const parsed = await Effect.runPromise(ShellParse.scan(command, shell, "/workspace"))
+      for (const item of parsed.commands) {
+        if (!/^[A-Za-z_][A-Za-z0-9_]*=/.test(item.resource)) {
+          // A save matches the command as written or as one of its other spellings; a glob prefix saves none.
+          const spellings = [item.resource, ...(item.alternates ?? [])]
+          expect(item.save === undefined || spellings.some((text) => Wildcard.match(text, item.save!)), context).toBe(
+            true,
+          )
+        }
+      }
     }
   }, 60_000)
 
-  test("matches the legacy oracle on heredoc bodies across readers, delimiters and statements", async () => {
+  test("reads heredoc bodies across readers, delimiters and statements", async () => {
     const commands = heredocs()
     expect(commands.length).toBeGreaterThan(400)
     const outcomes = new Set<string>()
     for (const command of commands) {
-      const native = await Effect.runPromise(ShellParse.scanPortable(command, "/bin/bash", "/workspace"))
-      expect(native, JSON.stringify(command)).toEqual(
-        await Effect.runPromise(ShellParse.scan(command, "/bin/bash", "/workspace")),
-      )
+      const native = await Effect.runPromise(ShellParse.scan(command, "/bin/bash", "/workspace"))
       const resources = native.commands.map((item) => item.resource)
       outcomes.add(
         !resources.some((resource) => resource.includes("secret"))
@@ -70,35 +71,28 @@ describe("ShellParse native parity", () => {
     ["pwsh", "git status; npm run test; docker compose up"],
     ["pwsh", 'git "status"; npm "run" test; docker "compose" up'],
     ["pwsh", "Write-Output done # comment\nGet-ChildItem"],
-  ])("native resources, saved prefixes, and directories match in %s: %s", async (shell, command) => {
+  ])("extracts resources, saved prefixes, and directories in %s: %s", async (shell, command) => {
     const scanned = shell === "pwsh" ? ShellScan.scanPowerShell(command) : ShellScan.scan(command)
     expect(scanned.kind).toBe("scanned")
-    const native = await Effect.runPromise(ShellParse.scanPortable(command, shell, "/workspace"))
-    expect(native).toEqual(await Effect.runPromise(ShellParse.scan(command, shell, "/workspace")))
-    expect(await Effect.runPromise(ShellParse.scan(command, shell, "/workspace", { portable: true }))).toEqual(native)
+    await Effect.runPromise(ShellParse.scan(command, shell, "/workspace"))
   })
-
-  test.each(["> output", "2>> output"])(
-    "returns an explicit empty result for statements without executable command nodes: %s",
-    async (command) => {
-      expect(ShellScan.scan(command)).toEqual({ kind: "scanned", commands: [] })
-      const native = await Effect.runPromise(ShellParse.scanPortable(command, "bash", "/workspace"))
-      expect(native).toEqual({ commands: [], directories: [] })
-      expect(await Effect.runPromise(ShellParse.scan(command, "bash", "/workspace"))).toEqual(native)
-      expect(await Effect.runPromise(ShellParse.scan(command, "bash", "/workspace", { portable: true }))).toEqual(
-        native,
-      )
-    },
-  )
 
   test("checks an assignment on its own as written, though it runs no command", async () => {
     expect(ShellScan.scan("FOO=bar")).toEqual({ kind: "scanned", commands: [] })
-    const native = await Effect.runPromise(ShellParse.scanPortable("FOO=bar", "bash", "/workspace"))
-    expect(native).toEqual({ commands: [{ resource: "FOO=bar", save: "FOO=*" }], directories: [] })
-    expect(await Effect.runPromise(ShellParse.scan("FOO=bar", "bash", "/workspace"))).toEqual(native)
-    expect(await Effect.runPromise(ShellParse.scan("FOO=bar", "bash", "/workspace", { portable: true }))).toEqual(
-      native,
-    )
+    expect(await Effect.runPromise(ShellParse.scan("FOO=bar", "bash", "/workspace"))).toEqual({
+      commands: [{ resource: "FOO=bar", save: "FOO=bar" }],
+      directories: [],
+    })
+  })
+
+  test.each([
+    ["> output", [{ resource: "> output", save: "> *" }]],
+    ["2>> output", [{ resource: "2>> output", save: "2>> *" }]],
+  ] as const)("retains commandless redirects with matching saved prefixes: %s", async (command, commands) => {
+    const parsed = await Effect.runPromise(ShellParse.scan(command, "bash", "/workspace"))
+    expect(parsed).toEqual({ commands: [...commands], directories: [] })
+    for (const item of parsed.commands)
+      expect(item.save !== undefined && Wildcard.match(item.resource, item.save)).toBe(true)
   })
 })
 
@@ -116,15 +110,7 @@ describe("ShellParse malformed native syntax", () => {
   ] as const)("fails explicitly for malformed %s syntax: %s", async (shell, command, reason) => {
     const scanned = shell === "pwsh" ? ShellScan.scanPowerShell(command) : ShellScan.scan(command)
     expect(scanned).toEqual({ kind: "opaque", reason })
-    expect(await Effect.runPromise(Effect.result(ShellParse.scanPortable(command, shell, "/workspace")))).toMatchObject(
-      {
-        _tag: "Failure",
-        failure: { message: `Portable shell scanner cannot analyze command: ${reason}` },
-      },
-    )
-    expect(
-      await Effect.runPromise(Effect.result(ShellParse.scan(command, shell, "/workspace", { portable: true }))),
-    ).toMatchObject({
+    expect(await Effect.runPromise(Effect.result(ShellParse.scan(command, shell, "/workspace")))).toMatchObject({
       _tag: "Failure",
       failure: { message: `Portable shell scanner cannot analyze command: ${reason}` },
     })

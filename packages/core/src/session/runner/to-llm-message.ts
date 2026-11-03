@@ -21,7 +21,6 @@ const media = (file: FileAttachment): ContentPart => ({
   type: "media",
   media: Media.base64(file.data, file.mime),
   filename: file.name,
-  metadata: file.description === undefined ? undefined : { description: file.description },
 })
 
 const attachmentLocation = (file: FileAttachment) => {
@@ -45,13 +44,6 @@ const textAttachment = (file: FileAttachment): ContentPart => ({
   ]
     .filter((line): line is string => line !== undefined)
     .join("\n")}`,
-  metadata: {
-    attachment: {
-      source: file.source,
-      name: file.name,
-      description: file.description,
-    },
-  },
 })
 
 const directoryAttachment = (file: FileAttachment): ContentPart => ({
@@ -64,13 +56,6 @@ const directoryAttachment = (file: FileAttachment): ContentPart => ({
   ]
     .filter((line): line is string => line !== undefined)
     .join("\n")}`,
-  metadata: {
-    attachment: {
-      source: file.source,
-      name: file.name,
-      description: file.description,
-    },
-  },
 })
 
 const attachmentContent = (file: FileAttachment): ContentPart[] => {
@@ -205,8 +190,9 @@ const assistant = (
         },
       ]
     // Let the destination adapter handle readable reasoning after a model/provider switch.
-    if (item.type === "reasoning")
-      return reuseProviderMetadata && !reasoningInterrupted
+    if (item.type === "reasoning") {
+      if (message.error !== undefined || reasoningInterrupted) return []
+      return reuseProviderMetadata
         ? [
             {
               type: "reasoning",
@@ -215,8 +201,9 @@ const assistant = (
             },
           ]
         : item.text.length > 0
-          ? [{ type: message.error === undefined && !reasoningInterrupted ? "reasoning" : "text", text: item.text }]
+          ? [{ type: "reasoning", text: item.text }]
           : []
+    }
     // Call-side metadata is model-scoped proof of generation (Gemini thought
     // signatures, OpenAI encrypted reasoning): only the producing model may
     // replay it.
@@ -247,10 +234,7 @@ const assistant = (
     .filter((message) => message !== undefined)
     .map(Message.tool)
   if (meaningful.length === 0) return results
-  return [
-    Message.make({ id: message.id, role: "assistant", content: meaningful, metadata: message.metadata }),
-    ...results,
-  ]
+  return [Message.make({ id: message.id, role: "assistant", content: meaningful }), ...results]
 }
 
 const EFFORT_VARIANTS = new Set<string>(ReasoningEfforts)
@@ -289,7 +273,6 @@ function toLLMMessage(
           id: message.id,
           role: "user",
           content: `The working directory has been changed to ${message.location.directory}.`,
-          metadata: message.metadata,
         }),
       ]
     case "user":
@@ -304,16 +287,12 @@ function toLLMMessage(
           id: message.id,
           role: "user",
           content,
-          metadata: {
-            ...message.metadata,
-            ...(message.agents?.length ? { agents: message.agents } : {}),
-          },
         }),
       ]
     case "synthetic":
       return [Message.make({ id: message.id, role: "user", content: message.text })]
     case "skill":
-      return [Message.make({ id: message.id, role: "user", content: message.text, metadata: message.metadata })]
+      return [Message.make({ id: message.id, role: "user", content: message.text })]
     case "system":
       return [Message.system(message.text)]
     case "shell":
@@ -324,7 +303,6 @@ function toLLMMessage(
           id: message.id,
           role: "user",
           content: `The following shell command was executed by the user:\n\nCommand:\n${message.command}\n\nOutput:\n${message.output?.output ?? ""}`,
-          metadata: message.metadata,
         }),
       ]
     case "assistant":
@@ -346,7 +324,6 @@ function toLLMMessage(
             ...(kept ? ["", `<recent-context>\n${kept}\n</recent-context>`] : []),
             "</conversation-checkpoint>",
           ].join("\n"),
-          metadata: message.metadata,
         }),
       ]
     }

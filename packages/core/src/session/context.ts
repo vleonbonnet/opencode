@@ -37,7 +37,7 @@ export interface Loaded {
   readonly session: SessionSchema.Info
   readonly agent: Agent.Selection & { readonly info: Agent.Info }
   readonly model: SessionRunnerModel.Resolved
-  readonly initial: string
+  readonly initial: ReadonlyArray<Instructions.Rendered>
   readonly messages: ReadonlyArray<SessionMessage.Info>
   readonly tools: Tool.Snapshot
   /** Reasoning that requests leave out or replay as text: the Session's dropped-thinking markers. */

@@ -86,6 +86,7 @@ export const layer = Layer.effect(
       force: boolean,
       continuation?: SessionRunner.Continuation,
       promotable: SessionInbox.Promotable = "input",
+      stepped = false,
     ): Effect.fn.Return<void, SessionRunner.RunError> {
       const session = yield* store.get(sessionID)
       if (!session) return yield* Effect.die(new Error(`Session not found: ${sessionID}`))
@@ -95,6 +96,7 @@ export const layer = Layer.effect(
           force,
           continuation,
           promotable,
+          stepped,
           // A declined tool call stops the turn deliberately, so the settle must not read it as an
           // unowned teardown: that reason is what keeps the claim and resumes after a restart.
           reportDeclined: () => coordinator.stopReason(sessionID, "user"),
@@ -109,8 +111,8 @@ export const layer = Layer.effect(
       )
       return yield* SessionRunner.DrainResult.$match(result, {
         Complete: () => Effect.void,
-        Moved: (result) => drain(sessionID, false, result.continuation, promotable),
-        Reloaded: (result) => drain(sessionID, result.force, result.continuation, promotable),
+        Moved: (result) => drain(sessionID, false, result.continuation, promotable, result.stepped),
+        Reloaded: (result) => drain(sessionID, result.force, result.continuation, promotable, result.stepped),
       })
     })
     const coordinator = yield* SessionRunCoordinator.make<SessionSchema.ID, SessionRunner.RunError, InterruptReason>({

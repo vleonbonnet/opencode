@@ -3,7 +3,6 @@ import { Effect } from "effect"
 import os from "os"
 import path from "path"
 import { ShellParse } from "@opencode/core/shell/parse"
-import { shellParserWasm } from "../src/shell/parser-wasm.workerd"
 
 describe("ShellParse", () => {
   test("splits bash commands and derives reusable prefixes", async () => {
@@ -19,22 +18,8 @@ describe("ShellParse", () => {
     })
   })
 
-  test("defaults to portable scanning when parser wasm assets are empty", async () => {
-    const result = await Effect.runPromise(
-      ShellParse.scan("git status && npm run test -- --watch", "/bin/bash", "/workspace", {
-        wasm: shellParserWasm,
-      }),
-    )
-    expect(result).toEqual({
-      commands: [
-        { resource: "git status", save: "git status *" },
-        { resource: "npm run test -- --watch", save: "npm run test *" },
-      ],
-      directories: [],
-    })
-    const malformed = await Effect.runPromiseExit(
-      ShellParse.scan('echo "', "/bin/bash", "/workspace", { wasm: shellParserWasm }),
-    )
+  test("rejects malformed syntax with an explicit scanner error", async () => {
+    const malformed = await Effect.runPromiseExit(ShellParse.scan('echo "', "/bin/bash", "/workspace"))
     expect(malformed).toMatchObject({
       _tag: "Failure",
       cause: {
@@ -48,7 +33,7 @@ describe("ShellParse", () => {
     })
   })
 
-  test("portable scanning preserves supported command resources and directories", async () => {
+  test("preserves command resources and directories across compound forms", async () => {
     const commands = [
       "git status && npm run test -- --watch",
       "echo $(curl evil | sed s/x/y/)",
@@ -62,35 +47,28 @@ describe("ShellParse", () => {
     ]
 
     for (const command of commands) {
-      const legacy = await Effect.runPromise(ShellParse.scan(command, "/bin/bash", "/workspace"))
-      const portable = await Effect.runPromise(ShellParse.scan(command, "/bin/bash", "/workspace", { portable: true }))
-      expect(portable, command).toEqual(legacy)
-      expect(await Effect.runPromise(ShellParse.scanPortable(command, "/bin/bash", "/workspace"))).toEqual(portable)
+      const scanned = await Effect.runPromise(ShellParse.scan(command, "/bin/bash", "/workspace"))
+      expect(scanned.commands.length).toBeGreaterThan(0)
     }
   })
 
-  test("portable scanning handles heredocs with the legacy permission resource", async () => {
+  test("handles heredocs with the command permission resource", async () => {
     const command = "cat <<'EOF'\nstatic body\nEOF"
-    const legacy = await Effect.runPromise(ShellParse.scan(command, "/bin/bash", "/workspace"))
-    expect(legacy.commands).toEqual([{ resource: "cat <<'EOF'", save: "cat *", alternates: ["cat"] }])
-    expect(await Effect.runPromise(ShellParse.scan(command, "/bin/bash", "/workspace", { portable: true }))).toEqual(
-      legacy,
-    )
+    const scanned = await Effect.runPromise(ShellParse.scan(command, "/bin/bash", "/workspace"))
+    // A quoted heredoc body only its reader reads is data, and is left out of the command's text.
+    expect(scanned.commands).toEqual([{ resource: "cat <<'EOF'", save: "cat *" }])
   })
 
   test.each(['c"\\d" relative', "'cd' /tmp", "c''d /tmp", "c\\\nd /tmp"])(
-    "portable scanning keeps source-shaped command heads under shell authorization: %s",
+    "keeps source-shaped command heads under shell authorization: %s",
     async (command) => {
-      const portable = await Effect.runPromise(ShellParse.scan(command, "/bin/bash", "/workspace", { portable: true }))
+      const scanned = await Effect.runPromise(ShellParse.scan(command, "/bin/bash", "/workspace"))
       // Bash runs `c"\d"` as the program `c\d`, which is checked as an alternate spelling, and under its bare name
       // after the backslash a Windows path would separate.
-      expect(spellings(portable)).toEqual(
+      expect(spellings(scanned)).toEqual(
         command.startsWith('c"') ? [command, "c\\d relative", "d relative"] : [command, "cd /tmp"],
       )
-      expect(portable.directories).toEqual([])
-      const legacy = await Effect.runPromise(ShellParse.scan(command, "/bin/bash", "/workspace"))
-      expect(spellings(legacy)).toEqual(spellings(portable))
-      expect(legacy.directories).toEqual([])
+      expect(scanned.directories).toEqual([])
     },
   )
 
@@ -98,9 +76,9 @@ describe("ShellParse", () => {
     "checks %s declarations as written without hiding nested commands",
     async (name) => {
       for (const command of [`${name} X`, `${name} "$(printf X)"; git status`]) {
-        const legacy = await Effect.runPromise(ShellParse.scan(command, "/bin/bash", "/workspace"))
+        const scanned = await Effect.runPromise(ShellParse.scan(command, "/bin/bash", "/workspace"))
         // A variable set without a value is saved exactly, and one named at run time as written.
-        expect(legacy.commands).toEqual(
+        expect(scanned.commands).toEqual(
           command.includes("$(")
             ? [
                 { resource: `${name} "$(printf X)"`, save: `${name} "$(printf X)"` },
@@ -109,18 +87,13 @@ describe("ShellParse", () => {
               ]
             : [{ resource: command, save: command }],
         )
-        expect(
-          await Effect.runPromise(ShellParse.scan(command, "/bin/bash", "/workspace", { portable: true })),
-        ).toEqual(legacy)
       }
 
       for (const command of [`"${name}" X`, `FOO=bar ${name} X`, `command ${name} X`, `>${name}.txt ${name} X`]) {
-        const legacy = await Effect.runPromise(ShellParse.scan(command, "/bin/bash", "/workspace"))
-        expect(spellings(legacy)).toContain(`${name} X`)
-        expect(legacy.commands[0].resource).toBe(command)
-        expect(
-          await Effect.runPromise(ShellParse.scan(command, "/bin/bash", "/workspace", { portable: true })),
-        ).toEqual(legacy)
+        const scanned = await Effect.runPromise(ShellParse.scan(command, "/bin/bash", "/workspace"))
+        // A spelling keeps the redirects its command is written with.
+        expect(spellings(scanned)).toContain(command.startsWith(">") ? `${name} X >${name}.txt` : `${name} X`)
+        expect(scanned.commands[0].resource).toBe(command)
       }
     },
   )
@@ -135,13 +108,10 @@ describe("ShellParse", () => {
       directories: ["/outside"],
     }
     expect(await Effect.runPromise(ShellParse.scan(command, "/bin/bash", "/workspace"))).toEqual(expected)
-    expect(await Effect.runPromise(ShellParse.scan(command, "/bin/bash", "/workspace", { portable: true }))).toEqual(
-      expected,
-    )
   })
 
   test("does not treat PowerShell commands as Bash declarations", async () => {
-    expect(await Effect.runPromise(ShellParse.scanPortable("export X; unset X", "pwsh", "/workspace"))).toEqual({
+    expect(await Effect.runPromise(ShellParse.scan("export X; unset X", "pwsh", "/workspace"))).toEqual({
       commands: [
         { resource: "export X", save: "export *" },
         { resource: "unset X", save: "unset *" },
@@ -174,6 +144,102 @@ describe("ShellParse", () => {
     })
   })
 
+  test("extracts static directory targets across escapes, end-of-options, literal dollars, and precommands", async () => {
+    const escaped = await Effect.runPromise(
+      ShellParse.scan(
+        "cd .\\./outside && cd escaped\\ space && cd '../$literal' && cd \"../\\$literal2\" && cd before\\\nafter",
+        "/bin/bash",
+        "/workspace",
+      ),
+    )
+    expect(escaped.directories).toEqual(["../outside", "escaped space", "../$literal", "../$literal2", "beforeafter"])
+
+    const dashArgs = await Effect.runPromise(
+      ShellParse.scan("cd -P /first && cd -- -/../../../etc && cd -", "/bin/bash", "/workspace"),
+    )
+    expect(dashArgs.directories).toEqual(["/first", "-/../../../etc"])
+
+    const wrapped = await Effect.runPromise(
+      ShellParse.scan("command cd /outside; builtin cd /elsewhere; command -v cd", "/bin/bash", "/workspace"),
+    )
+    expect(wrapped).toEqual({
+      commands: [
+        { resource: "command cd /outside", save: "command *" },
+        { resource: "builtin cd /elsewhere", save: "builtin *" },
+        { resource: "command -v cd", save: "command *" },
+      ],
+      directories: ["/outside", "/elsewhere"],
+    })
+
+    if (process.platform !== "win32") {
+      const rootHome = await Effect.runPromise(
+        ShellParse.scan("cd ~root/secret && cd '~root'", "/bin/bash", "/workspace"),
+      )
+      expect(rootHome.directories).toEqual([
+        process.platform === "darwin" ? "/var/root/secret" : "/root/secret",
+        "~root",
+      ])
+
+      const tildeForms = await Effect.runPromise(
+        ShellParse.scan(
+          "cd ~+/../outside && cd ~- && cd ~+1 && cd ~0 && cd ~__opencode_nonexistent_user__",
+          "/bin/bash",
+          "/workspace",
+        ),
+      )
+      expect(tildeForms.directories).toEqual(["/outside"])
+      expect(tildeForms.commands).toEqual([
+        { resource: "cd ~-", save: "cd *" },
+        { resource: "cd ~+1", save: "cd *" },
+        { resource: "cd ~0", save: "cd *" },
+        { resource: "cd ~__opencode_nonexistent_user__", save: "cd *" },
+      ])
+
+      const dynamicCd = await Effect.runPromise(
+        ShellParse.scan("cd {..,x} && cd .[.] && cd .? && cd $'\\x2e'[.] && cd '.[.]'", "/bin/bash", "/workspace"),
+      )
+      expect(dynamicCd.directories).toEqual([".[.]"])
+      expect(dynamicCd.commands).toEqual([
+        { resource: "cd {..,x}", save: "cd *" },
+        { resource: "cd .[.]", save: "cd *" },
+        { resource: "cd .?", save: "cd *" },
+        // ANSI-C quoting is also checked as the word it decodes to.
+        { resource: "cd $'\\x2e'[.]", save: "cd *", alternates: ["cd .[.]"] },
+      ])
+
+      const nobodyHome = await Effect.runPromise(ShellParse.scan("cd ~nobody", "/bin/bash", "/workspace"))
+      expect(nobodyHome.directories).toHaveLength(1)
+      expect(nobodyHome.directories[0]).not.toBe(
+        path.join(process.platform === "darwin" ? "/Users" : "/home", "nobody"),
+      )
+    }
+  })
+
+  test("retains commandless redirects, redirected declarations, and PowerShell method calls as permission resources", async () => {
+    const redirects = await Effect.runPromise(
+      ShellParse.scan(">> ~/.zshrc <<< 'x'; export -p > ~/.bashrc", "/bin/zsh", "/workspace"),
+    )
+    expect(redirects).toEqual({
+      commands: [
+        { resource: ">> ~/.zshrc <<< 'x'", save: ">> *" },
+        { resource: "export -p > ~/.bashrc", save: "export *" },
+      ],
+      directories: [],
+    })
+
+    const methods = await Effect.runPromise(
+      ShellParse.scan('[IO.File]::Delete("C:\\victim"); $proc.Kill(); "x" >> ~/.bashrc', "pwsh", "C:\\workspace"),
+    )
+    expect(methods).toEqual({
+      commands: [
+        { resource: '[IO.File]::Delete("C:\\victim")', save: "[IO.File]::Delete(*" },
+        { resource: "$proc.Kill()", save: "$proc.Kill(*" },
+        { resource: '"x" >> ~/.bashrc', save: '"x" *' },
+      ],
+      directories: [],
+    })
+  })
+
   test("extracts PowerShell directory parameters", async () => {
     const result = await Effect.runPromise(
       ShellParse.scan("Set-Location -LiteralPath '..\\outside'; Get-ChildItem", "pwsh", "C:\\workspace"),
@@ -195,13 +261,8 @@ describe("ShellParse", () => {
   })
 })
 
-// Both scanners must agree; returns the legacy result.
 async function scanned(command: string, shell = "/bin/bash") {
-  const legacy = await Effect.runPromise(ShellParse.scan(command, shell, "/workspace"))
-  expect(await Effect.runPromise(ShellParse.scan(command, shell, "/workspace", { portable: true })), command).toEqual(
-    legacy,
-  )
-  return legacy
+  return Effect.runPromise(ShellParse.scan(command, shell, "/workspace"))
 }
 
 // Every spelling the rules are checked against: each command's resource together with its alternate spellings.
@@ -274,7 +335,7 @@ describe("ShellParse commands behind a prefix", () => {
   test("keeps the command as written first and spells each command once", async () => {
     const result = await scanned("env kubectl get pods 2>&1")
     expect(result.commands).toEqual([
-      { resource: "env kubectl get pods 2>&1", save: "env *", alternates: ["env kubectl get pods"] },
+      { resource: "env kubectl get pods 2>&1", save: "env *" },
       { resource: "kubectl get pods", save: "kubectl get *" },
     ])
   })
@@ -302,17 +363,15 @@ describe("ShellParse commands behind a prefix", () => {
     const resources = async (command: string) => (await scanned(command)).commands.map((item) => item.resource)
     expect(await resources(nest(2))).toContain("kubectl get pods")
     expect(await resources(nest(4))).toContain("kubectl get pods")
-    for (const portable of [false, true])
-      expect(
-        await Effect.runPromise(Effect.result(ShellParse.scan(nest(5), "/bin/bash", "/workspace", { portable }))),
-      ).toMatchObject({ _tag: "Failure", failure: { message: "Shell command nests scripts more than 4 levels deep" } })
+    expect(await Effect.runPromise(Effect.result(ShellParse.scan(nest(5), "/bin/bash", "/workspace")))).toMatchObject({
+      _tag: "Failure",
+      failure: { message: "Shell command nests scripts more than 4 levels deep" },
+    })
   })
 
   test("refuses a script the portable scanner cannot analyze, as it refuses the command", async () => {
     const command = "bash -c 'echo \"unterminated'"
-    expect(
-      await Effect.runPromise(Effect.result(ShellParse.scan(command, "/bin/bash", "/workspace", { portable: true }))),
-    ).toMatchObject({
+    expect(await Effect.runPromise(Effect.result(ShellParse.scan(command, "/bin/bash", "/workspace")))).toMatchObject({
       _tag: "Failure",
       failure: { message: "Portable shell scanner cannot analyze command: unterminated-quote in a script it runs" },
     })
@@ -336,13 +395,13 @@ describe("ShellParse statements that set or clear variables", () => {
       name: "an assignment statement before a command",
       command: "KUBECONFIG=x; kubectl get pods",
       resources: ["KUBECONFIG=x"],
-      save: ["KUBECONFIG=*"],
+      save: ["KUBECONFIG=x"],
     },
     {
       name: "assignments grouped before a command, one variable each",
       command: "A=1 B=2; ls",
       resources: ["A=1", "B=2"],
-      save: ["A=*", "B=*"],
+      save: ["A=1", "B=2"],
     },
     {
       name: "a declaration of several variables, one each",
@@ -354,13 +413,13 @@ describe("ShellParse statements that set or clear variables", () => {
       name: "assignments with a redirect, as written and one variable each",
       command: "A=1 B=2 > log",
       resources: ["A=1 B=2 > log", "A=1", "B=2"],
-      save: ["A=1 B=2 > log", "A=*", "B=*"],
+      save: ["A=1 B=2 > log", "A=1", "B=2"],
     },
     {
       name: "an appending assignment",
       command: "PATH+=:/opt/bin; ls",
       resources: ["PATH+=:/opt/bin"],
-      save: ["PATH+=*"],
+      save: ["PATH+=:/opt/bin"],
     },
     {
       name: "an unset before a command",
@@ -375,7 +434,7 @@ describe("ShellParse statements that set or clear variables", () => {
     },
     { name: "a declaration in a compound statement", command: "if true; then local K=x; fi", resources: ["local K=x"] },
     { name: "a declaration with a redirect", command: "export X=1 > log", resources: ["export X=1 > log"] },
-    { name: "an assignment in a substitution", command: "echo $(X=1)", resources: ["X=1"], save: ["X=*"] },
+    { name: "an assignment in a substitution", command: "echo $(X=1)", resources: ["X=1"], save: ["X=1"] },
   ])("checks $name", async ({ command, resources, save }) => {
     const result = await scanned(command)
     for (const resource of resources) expect(result.commands.map((item) => item.resource)).toContain(resource)
@@ -385,7 +444,7 @@ describe("ShellParse statements that set or clear variables", () => {
   test("checks an assignment prefixed to a command with that command, and on its own", async () => {
     expect((await scanned("FOO=1 ls")).commands).toEqual([
       { resource: "FOO=1 ls", save: "ls *", alternates: ["ls"] },
-      { resource: "FOO=1", save: "FOO=*" },
+      { resource: "FOO=1", save: "FOO=1" },
     ])
   })
 
@@ -396,10 +455,10 @@ describe("ShellParse statements that set or clear variables", () => {
   })
 
   test("leaves cmd.exe statements to the commands they run", async () => {
-    for (const portable of [false, true])
-      expect(
-        await Effect.runPromise(ShellParse.scan("export X=1; Y=2; unset X", "cmd", "/workspace", { portable })),
-      ).toEqual({ commands: [], directories: [] })
+    expect(await Effect.runPromise(ShellParse.scan("export X=1; Y=2; unset X", "cmd", "/workspace"))).toEqual({
+      commands: [],
+      directories: [],
+    })
   })
 })
 
@@ -409,13 +468,13 @@ describe("ShellParse heredoc bodies", () => {
       // The interpreter runs the body, which is checked whole, as text.
       name: "a quoted heredoc an interpreter reads",
       command: "python3 - <<'EOF'\nprint('kanopy-oidc')\nEOF\ntail -3 f",
-      resources: ["python3 -", "print('kanopy-oidc')\n", "tail -3 f"],
+      resources: ["print('kanopy-oidc')\n", "tail -3 f"],
       body: true,
     },
     {
       name: "a quoted heredoc a script reads as data",
       command: "python3 script.py <<'EOF'\nkanopy-oidc\nEOF",
-      resources: ["python3 script.py <<'EOF'", "python3 script.py"],
+      resources: ["python3 script.py <<'EOF'"],
       body: false,
     },
     { name: "a double-quoted delimiter", command: 'cat > f <<"EOF"\nkanopy-oidc\nEOF', body: false },
@@ -454,7 +513,7 @@ describe("ShellParse heredoc bodies", () => {
     {
       name: "a heredoc written to a file nothing runs",
       command: "cat <<'EOF' > f && bash g\nkanopy-oidc\nEOF",
-      resources: ["cat <<'EOF' > f && bash g", "bash g"],
+      resources: ["cat <<'EOF' > f", "bash g"],
       body: false,
     },
     {
@@ -519,7 +578,7 @@ describe("ShellParse heredoc bodies", () => {
   test("parses the body a shell reads as a script, checking each of its commands", async () => {
     expect(await scanned("bash <<'EOF'\nexport KUBECONFIG=x\nsudo rm -rf build\nEOF")).toEqual({
       commands: [
-        { resource: "bash <<'EOF'\nexport KUBECONFIG=x\nsudo rm -rf build\nEOF", save: "bash *", alternates: ["bash"] },
+        { resource: "bash <<'EOF'\nexport KUBECONFIG=x\nsudo rm -rf build\nEOF", save: "bash *" },
         { resource: "export KUBECONFIG=x", save: "export KUBECONFIG=*" },
         { resource: "sudo rm -rf build", save: "sudo *", alternates: ["sudo rm -r -f build"] },
         { resource: "rm -rf build", save: "rm *", alternates: ["rm -r -f build"] },
@@ -530,9 +589,7 @@ describe("ShellParse heredoc bodies", () => {
 
   test("refuses a body a shell reads when the portable scanner cannot analyze it", async () => {
     const command = "bash <<'EOF'\necho \"unterminated\nEOF"
-    expect(
-      await Effect.runPromise(Effect.result(ShellParse.scan(command, "/bin/bash", "/workspace", { portable: true }))),
-    ).toMatchObject({
+    expect(await Effect.runPromise(Effect.result(ShellParse.scan(command, "/bin/bash", "/workspace")))).toMatchObject({
       _tag: "Failure",
       failure: { message: "Portable shell scanner cannot analyze command: unterminated-quote in a script it runs" },
     })

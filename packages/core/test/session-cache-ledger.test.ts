@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { LLM } from "@opencode/ai/effect"
+import { ai } from "@opencode/ai/effect"
 import { AnthropicMessages, OpenAIResponses } from "@opencode/ai/protocols"
 import { Auth } from "@opencode/ai/route"
 import { CacheLedger } from "@opencode/core/session/cache/ledger"
@@ -1493,7 +1493,7 @@ describe("CacheModel.checksThinking", () => {
 })
 
 describe("CacheWire", () => {
-  const llmRequest = LLM.request({
+  const llmRequest = ai.request({
     model: AnthropicMessages.route
       .with({ endpoint: { baseURL: "https://api.anthropic.test/v1" }, auth: Auth.header("x-api-key", "key-a") })
       .model({ id: "claude-opus-5-5" }),
@@ -1561,7 +1561,7 @@ describe("CacheWire", () => {
   })
 
   test("a WebSocket dry run captures the HTTP-equivalent request and never opens the socket", async () => {
-    const responses = LLM.request({
+    const responses = ai.request({
       model: OpenAIResponses.route
         .with({ endpoint: { baseURL: "https://api.openai.test/v1" }, auth: Auth.bearer("secret") })
         .model({ id: "gpt-5.5" }),

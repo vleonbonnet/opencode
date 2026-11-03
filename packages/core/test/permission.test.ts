@@ -157,6 +157,30 @@ describe("Permission", () => {
     }),
   )
 
+  it.effect("checks for a deny without asking", () =>
+    Effect.gen(function* () {
+      yield* setup([])
+      const service = yield* Permission.Service
+      yield* service.assertNotDenied(assertion())
+      expect(yield* service.list()).toEqual([])
+      yield* setRules([{ action: "read", resource: "*", effect: "deny" }])
+      expect(yield* service.assertNotDenied(assertion()).pipe(Effect.flip)).toBeInstanceOf(Permission.BlockedError)
+    }),
+  )
+
+  it.effect("reports whether a request is already allowed without asking", () =>
+    Effect.gen(function* () {
+      yield* setup([])
+      const service = yield* Permission.Service
+      expect(yield* service.allows(assertion())).toBe(false)
+      expect(yield* service.list()).toEqual([])
+      yield* setRules([{ action: "read", resource: "*", effect: "allow" }])
+      expect(yield* service.allows(assertion())).toBe(true)
+      yield* setRules([{ action: "read", resource: "*", effect: "deny" }])
+      expect(yield* service.allows(assertion())).toBe(false)
+    }),
+  )
+
   test("matches Windows rule resources against slash-normalized file access resources", () => {
     const rules: Permission.Ruleset = [
       { action: "external_directory", resource: "C:\\Users\\x\\proj\\*", effect: "allow" },
@@ -522,9 +546,9 @@ describe("Permission", () => {
 
 describe("shell command spellings", () => {
   // Asks for COMMAND as the shell tool does: each command's resource, with its other spellings beside it.
-  const ask = (command: string, portable: boolean, id = "per_test") =>
+  const ask = (command: string, id = "per_test") =>
     Effect.gen(function* () {
-      const parsed = yield* ShellParse.scan(command, "bash", "/project", { portable })
+      const parsed = yield* ShellParse.scan(command, "bash", "/project")
       const service = yield* Permission.Service
       const input = {
         ...assertion({ id: Permission.ID.create(id), action: "shell" }),
@@ -543,83 +567,79 @@ describe("shell command spellings", () => {
     effect,
   })
 
-  for (const portable of [false, true]) {
-    const scanner = portable ? "native" : "legacy"
+  it.live("decides a command by the latest rule matching any of its spellings", () =>
+    Effect.gen(function* () {
+      yield* setup([
+        rule("*", "ask"),
+        rule("ls -la *", "allow"),
+        rule("tar -xzf *", "allow"),
+        rule("kubectl get *", "allow"),
+        rule("kubectl * get *", "allow"),
+      ])
+      expect((yield* ask("ls -la src")).effect).toBe("allow")
+      expect((yield* ask("tar -xzf a.tgz")).effect).toBe("allow")
+      expect((yield* ask(`kubectl "get" pods`)).effect).toBe("allow")
+      expect((yield* ask(`kubectl -n x 'get' pods`)).effect).toBe("allow")
+      expect((yield* ask(`kubectl "delete" pod x`)).effect).toBe("ask")
+      // Another file may run under a bare name, so its directory keeps the command asking.
+      expect((yield* ask("./kubectl get pods")).effect).toBe("ask")
+    }),
+  )
 
-    it.live(`${scanner}: decides a command by the latest rule matching any of its spellings`, () =>
-      Effect.gen(function* () {
-        yield* setup([
-          rule("*", "ask"),
-          rule("ls -la *", "allow"),
-          rule("tar -xzf *", "allow"),
-          rule("kubectl get *", "allow"),
-          rule("kubectl * get *", "allow"),
-        ])
-        expect((yield* ask("ls -la src", portable)).effect).toBe("allow")
-        expect((yield* ask("tar -xzf a.tgz", portable)).effect).toBe("allow")
-        expect((yield* ask(`kubectl "get" pods`, portable)).effect).toBe("allow")
-        expect((yield* ask(`kubectl -n x 'get' pods`, portable)).effect).toBe("allow")
-        expect((yield* ask(`kubectl "delete" pod x`, portable)).effect).toBe("ask")
-        // Another file may run under a bare name, so its directory keeps the command asking.
-        expect((yield* ask("./kubectl get pods", portable)).effect).toBe("ask")
-      }),
-    )
+  it.live("denies a command when a deny rule matches any of its spellings", () =>
+    Effect.gen(function* () {
+      yield* setup([
+        rule("*", "allow"),
+        rule("rm -r *", "deny"),
+        rule("rm * -r *", "deny"),
+        rule("rm -R *", "deny"),
+        rule("rm * -R *", "deny"),
+        rule("rm --r*", "deny"),
+        rule("rm * --r*", "deny"),
+      ])
+      for (const command of ["rm -fr build", `rm "-rf" build`, "/bin/rm -rf build", "sudo X=1 rm -rf build"])
+        expect((yield* ask(command)).effect, command).toBe("deny")
+      expect((yield* ask("rm -f build")).effect).toBe("allow")
+      expect((yield* ask("rm -- -rf")).effect).toBe("allow")
+    }),
+  )
 
-    it.live(`${scanner}: denies a command when a deny rule matches any of its spellings`, () =>
-      Effect.gen(function* () {
-        yield* setup([
-          rule("*", "allow"),
-          rule("rm -r *", "deny"),
-          rule("rm * -r *", "deny"),
-          rule("rm -R *", "deny"),
-          rule("rm * -R *", "deny"),
-          rule("rm --r*", "deny"),
-          rule("rm * --r*", "deny"),
-        ])
-        for (const command of ["rm -fr build", `rm "-rf" build`, "/bin/rm -rf build", "sudo X=1 rm -rf build"])
-          expect((yield* ask(command, portable)).effect, command).toBe("deny")
-        expect((yield* ask("rm -f build", portable)).effect).toBe("allow")
-        expect((yield* ask("rm -- -rf", portable)).effect).toBe("allow")
-      }),
-    )
+  it.live("names the spelling and the rule that asks", () =>
+    Effect.gen(function* () {
+      yield* setup([
+        rule("*", "allow"),
+        rule("kubectl *", "ask"),
+        rule("kubectl get *", "allow"),
+        rule("kubectl delete *", "ask"),
+      ])
+      const { effect, request } = yield* ask(`kubectl "delete" pod x`)
+      expect(effect).toBe("ask")
+      expect(request?.reasons).toEqual([
+        {
+          resource: `kubectl "delete" pod x`,
+          spelling: "kubectl delete pod x",
+          rule: rule("kubectl delete *", "ask"),
+        },
+      ])
+    }),
+  )
 
-    it.live(`${scanner}: names the spelling and the rule that asks`, () =>
-      Effect.gen(function* () {
-        yield* setup([
-          rule("*", "allow"),
-          rule("kubectl *", "ask"),
-          rule("kubectl get *", "allow"),
-          rule("kubectl delete *", "ask"),
-        ])
-        const { effect, request } = yield* ask(`kubectl "delete" pod x`, portable)
-        expect(effect).toBe("ask")
-        expect(request?.reasons).toEqual([
-          {
-            resource: `kubectl "delete" pod x`,
-            spelling: "kubectl delete pod x",
-            rule: rule("kubectl delete *", "ask"),
-          },
-        ])
-      }),
-    )
-
-    it.live(`${scanner}: an approval saved for one spelling does not allow another command`, () =>
-      Effect.gen(function* () {
-        yield* setup([rule("*", "ask")])
-        const service = yield* Permission.Service
-        const parsed = yield* ShellParse.scan(`"kubectl" get pods`, "bash", "/project", { portable })
-        const result = yield* service.ask({
-          ...assertion({ action: "shell" }),
-          resources: parsed.commands.map((item) => item.resource),
-          alternates: parsed.commands.map((item) => item.alternates ?? []),
-          save: parsed.commands.flatMap((item) => (item.save === undefined ? [] : [item.save])),
-        })
-        yield* service.reply({ requestID: result.id, reply: "always" })
-        expect((yield* ask(`"kubectl" get pods -A`, portable, "per_again")).effect).toBe("allow")
-        expect((yield* ask(`"kubectl" delete pod x`, portable, "per_other")).effect).toBe("ask")
-      }),
-    )
-  }
+  it.live("an approval saved for one spelling does not allow another command", () =>
+    Effect.gen(function* () {
+      yield* setup([rule("*", "ask")])
+      const service = yield* Permission.Service
+      const parsed = yield* ShellParse.scan(`"kubectl" get pods`, "bash", "/project")
+      const result = yield* service.ask({
+        ...assertion({ action: "shell" }),
+        resources: parsed.commands.map((item) => item.resource),
+        alternates: parsed.commands.map((item) => item.alternates ?? []),
+        save: parsed.commands.flatMap((item) => (item.save === undefined ? [] : [item.save])),
+      })
+      yield* service.reply({ requestID: result.id, reply: "always" })
+      expect((yield* ask(`"kubectl" get pods -A`, "per_again")).effect).toBe("allow")
+      expect((yield* ask(`"kubectl" delete pod x`, "per_other")).effect).toBe("ask")
+    }),
+  )
 
   it.effect("re-evaluates the reasons of a pending request after an always reply", () =>
     Effect.gen(function* () {
@@ -749,9 +769,9 @@ describe("shell scanner permission impact", () => {
       command: "printf ok && git status > output",
       approved: ["printf *", "git status *"],
       exact: ["printf ok", "git status"],
-      denied: "git status",
+      denied: "git status *",
       savedEffect: ["allow", "allow"],
-      exactEffect: ["allow", "allow"],
+      exactEffect: ["allow", "ask"],
       deniedEffect: ["deny", "deny"],
     },
     {
@@ -760,9 +780,9 @@ describe("shell scanner permission impact", () => {
       command: "printf ok | cat < input > output",
       approved: ["printf *", "cat *"],
       exact: ["printf ok", "cat"],
-      denied: "cat",
+      denied: "cat *",
       savedEffect: ["allow", "allow"],
-      exactEffect: ["allow", "allow"],
+      exactEffect: ["allow", "ask"],
       deniedEffect: ["deny", "deny"],
     },
     {
@@ -772,10 +792,10 @@ describe("shell scanner permission impact", () => {
       command: "FOO=bar > output; printf done",
       approved: ["printf *"],
       exact: ["printf done"],
-      denied: "FOO=bar > output; printf done",
+      denied: "FOO=bar > output",
       savedEffect: ["ask", "ask"],
       exactEffect: ["ask", "ask"],
-      deniedEffect: ["deny", "allow"],
+      deniedEffect: ["deny", "deny"],
     },
     {
       name: "assignment redirect with an approved command substitution",
@@ -832,6 +852,39 @@ describe("shell scanner permission impact", () => {
       exactEffect: ["allow", "ask"],
       deniedEffect: ["deny", "allow"],
     },
+    {
+      name: "trailing redirect after list operator",
+      shell: "bash",
+      command: "true && cat > secret",
+      approved: ["true *", "cat *"],
+      exact: ["true", "cat"],
+      denied: "* > secret*",
+      savedEffect: ["allow", "allow"],
+      exactEffect: ["allow", "ask"],
+      deniedEffect: ["allow", "deny"],
+    },
+    {
+      name: "commandless redirect write",
+      shell: "zsh",
+      command: ">> ~/.zshrc <<< 'x'",
+      approved: [">> *"],
+      exact: [">> ~/.zshrc <<< 'x'"],
+      denied: ">> *",
+      savedEffect: ["allow", "allow"],
+      exactEffect: ["allow", "allow"],
+      deniedEffect: ["deny", "deny"],
+    },
+    {
+      name: "PowerShell .NET method invocation",
+      shell: "pwsh",
+      command: '[IO.File]::Delete("C:\\victim")',
+      approved: ["[IO.File]::Delete(*"],
+      exact: ['[IO.File]::Delete("C:\\victim")'],
+      denied: "*Delete(*",
+      savedEffect: ["allow", "allow"],
+      exactEffect: ["allow", "allow"],
+      deniedEffect: ["deny", "deny"],
+    },
   ] as const) {
     for (const scenario of [
       { name: "no approval", saved: [], rules: [], expected: ["ask", "ask"] },
@@ -863,15 +916,16 @@ describe("shell scanner permission impact", () => {
           yield* saved.add({ projectID: Project.ID.global, action: "shell", resources: scenario.saved })
           const service = yield* Permission.Service
 
-          for (const [index, portable] of [false, true].entries()) {
-            const parsed = yield* ShellParse.scan(fixture.command, fixture.shell, "/project", { portable })
-            expect(parsed.commands.length).toBeGreaterThan(0)
-            expect(parsed.directories).toEqual([])
-            const result = yield* service.ask(assertion({ action: "shell", ...shellRequest(parsed) }))
-            expect(result.effect, portable ? "native" : "legacy").toBe(scenario.expected[index])
-            const pending = yield* service.list()
-            expect(pending).toHaveLength(result.effect === "ask" ? 1 : 0)
-            if (result.effect !== "ask") continue
+          const parsed = yield* ShellParse.scan(fixture.command, fixture.shell, "/project")
+          expect(parsed.commands.length).toBeGreaterThan(0)
+          expect(parsed.directories).toEqual([])
+          const result = yield* service.ask(
+            assertion({ action: "shell", ...shellRequest(parsed) }),
+          )
+          expect(result.effect).toBe(scenario.expected[1])
+          const pending = yield* service.list()
+          expect(pending).toHaveLength(result.effect === "ask" ? 1 : 0)
+          if (result.effect === "ask") {
             expect(pending[0]?.resources).toEqual(shellRequest(parsed).resources)
             expect(pending[0]?.save).toEqual(shellRequest(parsed).save)
             yield* service.reply({ requestID: result.id, reply: "once" })
@@ -944,17 +998,32 @@ describe("shell scanner permission impact", () => {
       name: "assignment redirect prefix",
       shell: "bash",
       command: "FOO=bar > output; printf done",
-      // Both scanners read the assignment and save its variable.
+      // The assignment is read as one, with its redirect in its text, and saved with it.
       grants: [
-        ["FOO=*", "printf *"],
-        ["FOO=*", "printf *"],
+        ["printf *"],
+        ["FOO=bar > output", "printf *"],
       ],
       repeat: [
         ["allow", "allow"],
         ["allow", "allow"],
       ],
-      next: "printf next",
-      nextEffect: ["allow", "allow"],
+      next: "FOO=bar rm -rf /",
+      nextEffect: ["ask", "ask"],
+    },
+    {
+      name: "PowerShell method prefix",
+      shell: "pwsh",
+      command: '[IO.File]::Delete("C:\\first")',
+      grants: [
+        ["[IO.File]::Delete(*"],
+        ["[IO.File]::Delete(*"],
+      ],
+      repeat: [
+        ["allow", "allow"],
+        ["allow", "allow"],
+      ],
+      next: '[IO.File]::WriteAllText("C:\\first", "x")',
+      nextEffect: ["ask", "ask"],
     },
     {
       name: "PowerShell tab prefix",
@@ -969,35 +1038,33 @@ describe("shell scanner permission impact", () => {
       nextEffect: ["ask", "ask"],
     },
   ] as const) {
-    for (const [origin, portable] of [false, true].entries()) {
-      it.live(`${fixture.name}: always allow from ${portable ? "native" : "legacy"}, then use either parser`, () =>
-        Effect.gen(function* () {
-          yield* setup()
-          const service = yield* Permission.Service
-          const saved = yield* PermissionSaved.Service
-          const parsed = yield* ShellParse.scan(fixture.command, fixture.shell, "/project", { portable })
-          const first = yield* service.ask(assertion({ action: "shell", ...shellRequest(parsed) }))
-          expect(first.effect).toBe("ask")
-          expect(yield* service.list()).toHaveLength(1)
-          yield* service.reply({ requestID: first.id, reply: "always" })
-          expect(yield* service.list()).toEqual([])
-          expect((yield* saved.list({ projectID: Project.ID.global })).map((rule) => rule.resource).sort()).toEqual(
-            [...fixture.grants[portable ? 1 : 0]].sort(),
-          )
+    it.live(`${fixture.name}: always allow covers repeat execution and narrows prefix scope`, () =>
+      Effect.gen(function* () {
+        yield* setup()
+        const service = yield* Permission.Service
+        const saved = yield* PermissionSaved.Service
+        const parsed = yield* ShellParse.scan(fixture.command, fixture.shell, "/project")
+        const first = yield* service.ask(
+          assertion({ action: "shell", ...shellRequest(parsed) }),
+        )
+        expect(first.effect).toBe("ask")
+        expect(yield* service.list()).toHaveLength(1)
+        yield* service.reply({ requestID: first.id, reply: "always" })
+        expect(yield* service.list()).toEqual([])
+        expect((yield* saved.list({ projectID: Project.ID.global })).map((rule) => rule.resource).sort()).toEqual(
+          [...fixture.grants[1]].sort(),
+        )
 
-          for (const [index, target] of [false, true].entries()) {
-            for (const command of [fixture.command, fixture.next]) {
-              const parsed = yield* ShellParse.scan(command, fixture.shell, "/project", { portable: target })
-              const result = yield* service.ask(assertion({ action: "shell", ...shellRequest(parsed) }))
-              expect(result.effect, `${target ? "native" : "legacy"}: ${command}`).toBe(
-                command === fixture.next ? fixture.nextEffect[origin] : fixture.repeat[origin]?.[index],
-              )
-              if (result.effect === "ask") yield* service.reply({ requestID: result.id, reply: "once" })
-              expect(yield* service.list()).toEqual([])
-            }
-          }
-        }),
-      )
-    }
+        for (const command of [fixture.command, fixture.next]) {
+          const parsed = yield* ShellParse.scan(command, fixture.shell, "/project")
+          const result = yield* service.ask(
+            assertion({ action: "shell", ...shellRequest(parsed) }),
+          )
+          expect(result.effect, command).toBe(command === fixture.next ? fixture.nextEffect[1] : fixture.repeat[1]?.[1])
+          if (result.effect === "ask") yield* service.reply({ requestID: result.id, reply: "once" })
+          expect(yield* service.list()).toEqual([])
+        }
+      }),
+    )
   }
 })
