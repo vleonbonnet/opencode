@@ -170,6 +170,31 @@ export const SessionHandler = HttpApiBuilder.group(Api, "server.session", (handl
         }),
       )
       .handle(
+        "session.search",
+        Effect.fn(function* (ctx) {
+          return yield* session
+            .search({
+              query: ctx.query.q,
+              archived: ctx.query.archived,
+              project: ctx.query.project,
+              directory: ctx.query.directory,
+              parentID: ctx.query.parentID,
+              limit: ctx.query.limit,
+              cursor: ctx.query.cursor,
+            })
+            .pipe(
+              Effect.catchTag(
+                "SessionSearch.InvalidCursorError",
+                (error) => new InvalidCursorError({ message: error.message }),
+              ),
+              Effect.catchTag(
+                "SessionSearch.InvalidQueryError",
+                (error) => new InvalidRequestError({ message: error.message, field: "q" }),
+              ),
+            )
+        }),
+      )
+      .handle(
         "session.get",
         Effect.fn(function* (ctx) {
           return {

@@ -92,6 +92,8 @@ import type {
   ExperimentalSessionExportInput,
   ExperimentalSessionExportOutput,
   ExperimentalSessionCacheOutput,
+  ExperimentalSessionSearchInput,
+  ExperimentalSessionSearchOutput,
   ExperimentalSessionPreflightInput,
   ExperimentalSessionPreflightOutput,
   ExperimentalSessionThinkingInput,
@@ -1111,6 +1113,26 @@ export function make(options: ClientOptions) {
             },
             requestOptions,
           ).then((value) => value.data),
+        search: (input: ExperimentalSessionSearchInput, requestOptions?: RequestOptions) =>
+          request<ExperimentalSessionSearchOutput>(
+            {
+              method: "GET",
+              path: `/api/experimental/session/search`,
+              query: {
+                q: input["q"],
+                limit: input["limit"],
+                archived: input["archived"],
+                parentID: input["parentID"],
+                directory: input["directory"],
+                project: input["project"],
+                cursor: input["cursor"],
+              },
+              successStatus: 200,
+              declaredStatuses: [400, 401],
+              empty: false,
+            },
+            requestOptions,
+          ),
         preflight: (input: ExperimentalSessionPreflightInput, requestOptions?: RequestOptions) =>
           request<{ readonly data: ExperimentalSessionPreflightOutput }>(
             {
@@ -2726,6 +2748,8 @@ export function make(options: ClientOptions) {
       export: client.experimental.session.export,
       /** @deprecated Use `client.experimental.session.cache`. Removed in the next minor. */
       cache: client.experimental.session.cache,
+      /** @deprecated Use `client.experimental.session.search`. Removed in the next minor. */
+      search: client.experimental.session.search,
       /** @deprecated Use `client.experimental.session.preflight`. Removed in the next minor. */
       preflight: client.experimental.session.preflight,
       /** @deprecated Use `client.experimental.session.thinking`. Removed in the next minor. */

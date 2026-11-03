@@ -18,6 +18,7 @@ import type { FileDiff } from "@opencode/schema/file-diff"
 import type { Form } from "@opencode/schema/form"
 import type { DateTime } from "effect"
 import type { Money } from "@opencode/schema/money"
+import type { SessionSearch } from "@opencode/schema/session-search"
 import type { Skill } from "@opencode/schema/skill"
 import type { InstructionEntry } from "@opencode/schema/instruction-entry"
 import type { Schema } from "effect"
@@ -455,6 +456,9 @@ export interface SessionApi<E = never> {
   /** @deprecated Use `client.experimental.session.cache`. Removed in the next minor. */
   readonly cache: ExperimentalSessionCacheOperation<E>
 
+  /** @deprecated Use `client.experimental.session.search`. Removed in the next minor. */
+  readonly search: ExperimentalSessionSearchOperation<E>
+
   /** @deprecated Use `client.experimental.session.preflight`. Removed in the next minor. */
   readonly preflight: ExperimentalSessionPreflightOperation<E>
 
@@ -574,6 +578,20 @@ export type ExperimentalSessionExportOperation<E = never> = (
 
 export type ExperimentalSessionCacheOutput = { readonly [x: Session.ID]: SessionCache.Expiry }
 export type ExperimentalSessionCacheOperation<E = never> = () => Effect.Effect<ExperimentalSessionCacheOutput, E>
+
+export type ExperimentalSessionSearchInput = {
+  readonly q: string
+  readonly limit?: number | undefined
+  readonly archived?: boolean | undefined
+  readonly parentID?: Session.ID | null | undefined
+  readonly directory?: AbsolutePath | undefined
+  readonly project?: Project.ID | undefined
+  readonly cursor?: SessionSearch.Cursor | undefined
+}
+export type ExperimentalSessionSearchOutput = SessionSearch.Response
+export type ExperimentalSessionSearchOperation<E = never> = (
+  input: ExperimentalSessionSearchInput,
+) => Effect.Effect<ExperimentalSessionSearchOutput, E>
 
 export type ExperimentalSessionPreflightInput = {
   readonly sessionID: Session.ID
@@ -1470,6 +1488,7 @@ export interface ExperimentalSessionApi<E = never> {
   readonly import: ExperimentalSessionImportOperation<E>
   readonly export: ExperimentalSessionExportOperation<E>
   readonly cache: ExperimentalSessionCacheOperation<E>
+  readonly search: ExperimentalSessionSearchOperation<E>
   readonly preflight: ExperimentalSessionPreflightOperation<E>
   readonly thinking: ExperimentalSessionThinkingOperation<E>
   readonly skill: ExperimentalSessionSkillOperation<E>
@@ -2866,6 +2885,15 @@ export type SessionCacheOutput = ExperimentalSessionCacheOutput
 
 /** @deprecated Use `ExperimentalSessionCacheOperation`. Removed in the next minor. */
 export type SessionCacheOperation<E = never> = ExperimentalSessionCacheOperation<E>
+
+/** @deprecated Use `ExperimentalSessionSearchInput`. Removed in the next minor. */
+export type SessionSearchInput = ExperimentalSessionSearchInput
+
+/** @deprecated Use `ExperimentalSessionSearchOutput`. Removed in the next minor. */
+export type SessionSearchOutput = ExperimentalSessionSearchOutput
+
+/** @deprecated Use `ExperimentalSessionSearchOperation`. Removed in the next minor. */
+export type SessionSearchOperation<E = never> = ExperimentalSessionSearchOperation<E>
 
 /** @deprecated Use `ExperimentalSessionPreflightInput`. Removed in the next minor. */
 export type SessionPreflightInput = ExperimentalSessionPreflightInput

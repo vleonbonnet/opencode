@@ -98,6 +98,8 @@ import type {
   ExperimentalSessionExportInput,
   ExperimentalSessionExportOutput,
   ExperimentalSessionCacheOutput,
+  ExperimentalSessionSearchInput,
+  ExperimentalSessionSearchOutput,
   ExperimentalSessionPreflightInput,
   ExperimentalSessionPreflightOutput,
   ExperimentalSessionThinkingInput,
@@ -840,6 +842,22 @@ const EndpointExperimentalSessionCache = (raw: RawClient["server.session"]) => (
     ),
   )
 
+const EndpointExperimentalSessionSearch =
+  (raw: RawClient["server.session"]) => (input: ExperimentalSessionSearchInput) =>
+    preserveEffect<ExperimentalSessionSearchOutput>()(
+      raw["session.search"]({
+        query: {
+          q: input["q"],
+          limit: input["limit"],
+          archived: input["archived"],
+          parentID: input["parentID"],
+          directory: input["directory"],
+          project: input["project"],
+          cursor: input["cursor"],
+        },
+      }).pipe(Effect.mapError(mapClientError)),
+    )
+
 const EndpointExperimentalSessionPreflight =
   (raw: RawClient["server.session"]) => (input: ExperimentalSessionPreflightInput) =>
     preserveEffect<ExperimentalSessionPreflightOutput>()(
@@ -924,6 +942,7 @@ const adaptGroupExperimentalSession = (raw: RawClient["server.session"]) => ({
   import: EndpointExperimentalSessionImport(raw),
   export: EndpointExperimentalSessionExport(raw),
   cache: EndpointExperimentalSessionCache(raw),
+  search: EndpointExperimentalSessionSearch(raw),
   preflight: EndpointExperimentalSessionPreflight(raw),
   thinking: EndpointExperimentalSessionThinking(raw),
   skill: EndpointExperimentalSessionSkill(raw),
@@ -2041,6 +2060,8 @@ const adaptClient = (raw: RawClient) => {
       export: client.experimental.session.export,
       /** @deprecated Use `client.experimental.session.cache`. Removed in the next minor. */
       cache: client.experimental.session.cache,
+      /** @deprecated Use `client.experimental.session.search`. Removed in the next minor. */
+      search: client.experimental.session.search,
       /** @deprecated Use `client.experimental.session.preflight`. Removed in the next minor. */
       preflight: client.experimental.session.preflight,
       /** @deprecated Use `client.experimental.session.thinking`. Removed in the next minor. */

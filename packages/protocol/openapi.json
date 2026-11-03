@@ -1530,6 +1530,130 @@
         "summary": "List prompt-cache expiries"
       }
     },
+    "/api/experimental/session/search": {
+      "get": {
+        "tags": ["session"],
+        "operationId": "experimental.session.search",
+        "parameters": [
+          {
+            "name": "q",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 512,
+              "description": "The words to find. Whitespace separates words, double quotes group a phrase, and a word ending in * matches as a prefix (at least two characters before it). Every term must match; nothing else is query syntax."
+            },
+            "required": true
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                }
+              ],
+              "description": "Maximum number of matches to return, at most 100. Defaults to 20."
+            },
+            "required": false
+          },
+          {
+            "name": "archived",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "enum": ["true", "false"]
+            },
+            "required": false
+          },
+          {
+            "name": "parentID",
+            "in": "query",
+            "schema": {
+              "anyOf": [
+                {
+                  "$ref": "#/components/schemas/Session.ID"
+                },
+                {
+                  "type": "string",
+                  "enum": ["null"]
+                }
+              ],
+              "description": "Filter by parent session. Use null to return only root sessions."
+            },
+            "required": false
+          },
+          {
+            "name": "directory",
+            "in": "query",
+            "schema": {
+              "$ref": "#/components/schemas/AbsolutePath"
+            },
+            "required": false
+          },
+          {
+            "name": "project",
+            "in": "query",
+            "schema": {
+              "$ref": "#/components/schemas/Project.ID"
+            },
+            "required": false
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "schema": {
+              "$ref": "#/components/schemas/SessionSearchCursor"
+            },
+            "required": false
+          }
+        ],
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "SessionSearchResponse",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionSearchResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "InvalidCursorError | InvalidRequestError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/InvalidCursorErrorEncoded"
+                    },
+                    {
+                      "$ref": "#/components/schemas/InvalidRequestErrorEncoded"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "UnauthorizedError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UnauthorizedErrorEncoded"
+                }
+              }
+            }
+          }
+        },
+        "description": "Full-text search over user prompts and the visible text of assistant messages (not tool calls, tool output or reasoning) across sessions. Each match names its session and message, with a one-line snippet of at most 320 characters whose matches are located by character offsets. Matches are ranked by relevance (BM25), newer first among equal ranks; use cursor.next for the following page. Filters narrow the sessions searched as session.list's do. Messages written before the index existed are indexed in the background after the server starts: until index.complete, results come only from the messages indexed so far, and index.processed of index.total says how far it is.",
+        "summary": "Search session messages"
+      }
+    },
     "/api/session/{sessionID}": {
       "get": {
         "tags": ["session"],
@@ -24764,6 +24888,124 @@
           }
         },
         "required": ["data"],
+        "additionalProperties": false
+      },
+      "SessionSearch.Index": {
+        "type": "object",
+        "properties": {
+          "complete": {
+            "type": "boolean"
+          },
+          "processed": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991
+          },
+          "total": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991
+          }
+        },
+        "required": ["complete"],
+        "additionalProperties": false
+      },
+      "SessionSearch.Match": {
+        "type": "object",
+        "properties": {
+          "sessionID": {
+            "$ref": "#/components/schemas/Session.ID"
+          },
+          "title": {
+            "type": "string"
+          },
+          "messageID": {
+            "$ref": "#/components/schemas/Session.Message.ID"
+          },
+          "role": {
+            "$ref": "#/components/schemas/SessionSearch.Role"
+          },
+          "time": {
+            "type": "object",
+            "properties": {
+              "created": {
+                "type": "number"
+              }
+            },
+            "required": ["created"],
+            "additionalProperties": false
+          },
+          "snippet": {
+            "$ref": "#/components/schemas/SessionSearch.Snippet"
+          }
+        },
+        "required": ["sessionID", "messageID", "role", "time", "snippet"],
+        "additionalProperties": false
+      },
+      "SessionSearch.Range": {
+        "type": "object",
+        "properties": {
+          "start": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991
+          },
+          "end": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991
+          }
+        },
+        "required": ["start", "end"],
+        "additionalProperties": false
+      },
+      "SessionSearch.Role": {
+        "type": "string",
+        "enum": ["user", "assistant"]
+      },
+      "SessionSearch.Snippet": {
+        "type": "object",
+        "properties": {
+          "text": {
+            "type": "string"
+          },
+          "matches": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SessionSearch.Range"
+            }
+          }
+        },
+        "required": ["text", "matches"],
+        "additionalProperties": false
+      },
+      "SessionSearchCursor": {
+        "type": "string",
+        "description": "Opaque pagination cursor returned as cursor.next in the previous response for the same query."
+      },
+      "SessionSearchResponse": {
+        "type": "object",
+        "properties": {
+          "data": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SessionSearch.Match"
+            }
+          },
+          "cursor": {
+            "type": "object",
+            "properties": {
+              "next": {
+                "$ref": "#/components/schemas/SessionSearchCursor"
+              }
+            },
+            "additionalProperties": false
+          },
+          "index": {
+            "$ref": "#/components/schemas/SessionSearch.Index"
+          }
+        },
+        "required": ["data", "cursor", "index"],
         "additionalProperties": false
       },
       "SessionStats.Activity": {

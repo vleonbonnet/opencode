@@ -37,6 +37,7 @@ import { EventLog } from "@opencode/schema/event-log"
 import { FileDiff } from "@opencode/schema/file-diff"
 import { Form } from "@opencode/schema/form"
 import { SessionCache } from "@opencode/schema/session-cache"
+import { SessionSearch } from "@opencode/schema/session-search"
 import { PublicSessionMessage } from "./message.js"
 
 const SessionActive = Schema.Struct({
@@ -117,6 +118,24 @@ export const SessionsQuery = Schema.Struct({
   ...Session.ListFilter.fields,
   cursor: Session.ListCursor.pipe(Schema.optional),
 }).annotate({ identifier: "SessionsQuery" })
+
+export const SessionSearchQuery = Schema.Struct({
+  q: Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(SessionSearch.MAX_QUERY_LENGTH)).annotate({
+    description:
+      "The words to find. Whitespace separates words, double quotes group a phrase, and a word ending in * matches as a prefix (at least two characters before it). Every term must match; nothing else is query syntax.",
+  }),
+  limit: Schema.NumberFromString.pipe(
+    Schema.decodeTo(PositiveInt.check(Schema.isLessThanOrEqualTo(SessionSearch.MAX_LIMIT))),
+    Schema.optional,
+  ).annotate({
+    description: `Maximum number of matches to return, at most ${SessionSearch.MAX_LIMIT}. Defaults to ${SessionSearch.DEFAULT_LIMIT}.`,
+  }),
+  archived: Session.ListFilter.fields.archived,
+  parentID: Session.ListFilter.fields.parentID,
+  directory: Session.ListFilter.fields.directory,
+  project: Session.ListFilter.fields.project,
+  cursor: SessionSearch.Cursor.pipe(Schema.optional),
+}).annotate({ identifier: "SessionSearchQuery" })
 
 export const makeSessionGroup = <I extends HttpApiMiddleware.AnyId, S, FormI extends HttpApiMiddleware.AnyId, FormS>(
   sessionLocationMiddleware: Context.Key<I, S>,
@@ -240,6 +259,19 @@ export const makeSessionGroup = <I extends HttpApiMiddleware.AnyId, S, FormI ext
           summary: "List prompt-cache expiries",
           description:
             "The provider prompt-cache entry holding each session's own conversation, while it is within its retention window as the cache ledger knows it: the entry at the tip of the session's last request (its last cache breakpoint, or for formats that cache every prefix automatically its full prompt), which a next turn extending that request reuses for the whole conversation. Shorter prefixes such as the system prompt and tools, which other sessions share and keep warm, do not count: once the tip expired the session is absent, even if its next turn would still reuse such a prefix. expires is when the entry leaves the window and ttl the window's length (both in milliseconds; expires is epoch time), tokens the prompt tokens the entry covers, promptTokens those of the session's last request (tokens / promptTokens is the cached share). session.cache.updated carries a session's new value each time a confirmed provider response changes it: each step of the session, and any request (a keep-alive generation, a fork reading its parent's tip) that refreshed or evicted the session's tip entry. Nothing is published when an entry expires in time. A preflight reports what a given next turn reuses, shared prefixes included.",
+        }),
+      ),
+    )
+    .add(
+      HttpApiEndpoint.get("session.search", "/api/experimental/session/search", {
+        query: SessionSearchQuery,
+        success: SessionSearch.Response,
+        error: [InvalidCursorError, InvalidRequestError],
+      }).annotateMerge(
+        OpenApi.annotations({
+          identifier: "experimental.session.search",
+          summary: "Search session messages",
+          description: `Full-text search over user prompts and the visible text of assistant messages (not tool calls, tool output or reasoning) across sessions. Each match names its session and message, with a one-line snippet of at most ${SessionSearch.MAX_SNIPPET_LENGTH} characters whose matches are located by character offsets. Matches are ranked by relevance (BM25), newer first among equal ranks; use cursor.next for the following page. Filters narrow the sessions searched as session.list's do. Messages written before the index existed are indexed in the background after the server starts: until index.complete, results come only from the messages indexed so far, and index.processed of index.total says how far it is.`,
         }),
       ),
     )

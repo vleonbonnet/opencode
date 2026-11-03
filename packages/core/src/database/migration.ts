@@ -14,6 +14,11 @@ type Transaction = Parameters<Parameters<Database["transaction"]>[0]>[0]
 export type Migration = {
   id: string
   foreignKeys?: boolean
+  /**
+   * Also run on a fresh database, after the generated schema: for objects the Drizzle schema cannot declare
+   * (virtual tables, views, triggers), which the generated schema leaves out. It must accept an empty database.
+   */
+  bootstrap?: boolean
   up: (tx: Transaction) => Effect.Effect<void, unknown, Global.Service>
 }
 
@@ -34,6 +39,9 @@ export function apply(db: Database) {
     yield* db.transaction((tx) =>
       Effect.gen(function* () {
         yield* schema.up(tx)
+        yield* Effect.forEach(migrations, (migration) => (migration.bootstrap ? migration.up(tx) : Effect.void), {
+          discard: true,
+        })
         yield* tx.run(
           sql`CREATE TABLE ${sql.identifier("migration")} (id TEXT PRIMARY KEY, time_completed INTEGER NOT NULL)`,
         )

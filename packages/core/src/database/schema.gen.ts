@@ -159,6 +159,25 @@ const schema: Omit<DatabaseMigration.Migration, "id"> = {
         );
       `)
       yield* tx.run(`
+        CREATE TABLE \`session_search_backfill\` (
+          \`id\` integer PRIMARY KEY,
+          \`cursor\` text NOT NULL,
+          \`processed\` integer NOT NULL,
+          \`total\` integer NOT NULL,
+          \`time_started\` integer NOT NULL
+        );
+      `)
+      yield* tx.run(`
+        CREATE TABLE \`session_search\` (
+          \`id\` integer PRIMARY KEY,
+          \`message_id\` text NOT NULL,
+          \`session_id\` text NOT NULL,
+          \`role\` text NOT NULL,
+          \`time_created\` integer NOT NULL,
+          \`text\` text NOT NULL
+        );
+      `)
+      yield* tx.run(`
         CREATE TABLE \`blob_ref\` (
           \`session_id\` text NOT NULL,
           \`message_id\` text NOT NULL,
@@ -321,6 +340,7 @@ const schema: Omit<DatabaseMigration.Migration, "id"> = {
       yield* tx.run(
         `CREATE INDEX \`schedule_due_idx\` ON \`schedule\` (\`next_due_at\`) WHERE "schedule"."status" = 'active' and "schedule"."next_due_at" is not null;`,
       )
+      yield* tx.run(`CREATE UNIQUE INDEX \`session_search_message_idx\` ON \`session_search\` (\`message_id\`);`)
       yield* tx.run(`CREATE INDEX \`blob_ref_hash_idx\` ON \`blob_ref\` (\`hash\`);`)
       yield* tx.run(`CREATE INDEX \`blob_ref_session_seq_idx\` ON \`blob_ref\` (\`session_id\`,\`seq\`);`)
       yield* tx.run(

@@ -49,6 +49,7 @@ import { SessionInbox } from "./session/inbox.js"
 import { InstructionState } from "./session/instruction-state.js"
 import { SessionGenerate } from "./session/generate.js"
 import { SessionCache } from "./session/cache/service.js"
+import { SessionSearchService } from "./session/search/service.js"
 import { SessionPreflight } from "./session/cache/preflight.js"
 import { SessionCommand } from "./session/command.js"
 import {
@@ -235,6 +236,8 @@ export interface Interface {
   readonly thinking: (sessionID: SessionSchema.ID) => Effect.Effect<ReadonlyArray<SessionCache.Dropped>, NotFoundError>
   /** The prompt-cache entry of each Session's own conversation (its last request's tip), for each one still live. */
   readonly cache: SessionCache.Interface["expiries"]
+  /** The user prompts and assistant messages matching a full-text query, across Sessions. */
+  readonly search: SessionSearchService.Interface["search"]
   /** Generates text from current Session context without admitting input or mutating history. */
   readonly generate: (input: {
     sessionID: SessionSchema.ID
@@ -307,6 +310,7 @@ const layer = Layer.effect(
     const environments = yield* SessionEnvironment.Service
     const locations = yield* LocationServiceMap.Service
     const cache = yield* SessionCache.Service
+    const searchIndex = yield* SessionSearchService.Service
     const fsUtil = yield* FSUtil.Service
     const sessions = yield* Session.make()
     const mediaBlob = (session: SessionSchema.Info) => SessionBlob.enabledFor(instances, session)
@@ -535,6 +539,7 @@ const layer = Layer.effect(
         return yield* cache.dropped(sessionID)
       }),
       cache: cache.expiries,
+      search: searchIndex.search,
       command: Effect.fn("Session.command")(function* (input) {
         const session = yield* result.get(input.sessionID)
         return yield* SessionCommand.execute({ ...input, session }).pipe(
@@ -608,5 +613,6 @@ export const node: LayerNode.Provider<Service, never, typeof Node.tags.values.gl
     FSUtil.node,
     App.node,
     SessionCache.node,
+    SessionSearchService.node,
   ],
 })

@@ -156,6 +156,14 @@ export type SessionStatsActivity = { date: string; steps: number }
 
 export type SessionCacheExpiry = { expires: number; ttl: number; tokens: number; promptTokens: number }
 
+export type SessionSearchRole = "user" | "assistant"
+
+export type SessionSearchRange = { start: number; end: number }
+
+export type SessionSearchCursor = string
+
+export type SessionSearchIndex = { complete: boolean; processed?: number; total?: number }
+
 export type SessionCachePreflightStatus = "hit" | "partial" | "miss" | "unknown"
 
 export type SessionCacheDivergence = {
@@ -699,6 +707,8 @@ export type SessionStatsTools =
 
 export type SessionCacheResponse = { data: { [x: SessionID]: SessionCacheExpiry } }
 
+export type SessionSearchSnippet = { text: string; matches: Array<SessionSearchRange> }
+
 export type SessionCacheStaleThinking = {
   count: number
   reason: string
@@ -1160,6 +1170,15 @@ export type FormState =
   | { status: "pending" }
   | { status: "answered"; answer: FormAnswer }
   | { status: "cancelled"; message?: string }
+
+export type SessionSearchMatch = {
+  sessionID: SessionID
+  title?: string
+  messageID: SessionMessageID
+  role: SessionSearchRole
+  time: { created: number }
+  snippet: SessionSearchSnippet
+}
 
 export type SessionCachePreflightReport = {
   status: SessionCachePreflightStatus
@@ -2662,6 +2681,12 @@ export type SessionMessageAssistantTool = {
 
 export type FormFields = [FormField, ...Array<FormField>]
 
+export type SessionSearchResponse = {
+  data: Array<SessionSearchMatch>
+  cursor: { next?: SessionSearchCursor }
+  index: SessionSearchIndex
+}
+
 export type SessionPreflightResponse = { data: SessionCachePreflightReport }
 
 export type SessionInboxItem =
@@ -3923,6 +3948,18 @@ export type ExperimentalSessionExportOutput = { data: SessionTransferData }["dat
 
 export type ExperimentalSessionCacheOutput = SessionCacheResponse["data"]
 
+export type ExperimentalSessionSearchInput = {
+  readonly q: string
+  readonly limit?: number | undefined
+  readonly archived?: boolean | undefined
+  readonly parentID?: string | null | undefined
+  readonly directory?: string | undefined
+  readonly project?: string | undefined
+  readonly cursor?: string | undefined
+}
+
+export type ExperimentalSessionSearchOutput = SessionSearchResponse
+
 export type ExperimentalSessionPreflightInput = {
   readonly sessionID: string
   readonly text?: string | undefined
@@ -4957,6 +4994,12 @@ export type SessionExportOutput = ExperimentalSessionExportOutput
 
 /** @deprecated Use `ExperimentalSessionCacheOutput`. Removed in the next minor. */
 export type SessionCacheOutput = ExperimentalSessionCacheOutput
+
+/** @deprecated Use `ExperimentalSessionSearchInput`. Removed in the next minor. */
+export type SessionSearchInput = ExperimentalSessionSearchInput
+
+/** @deprecated Use `ExperimentalSessionSearchOutput`. Removed in the next minor. */
+export type SessionSearchOutput = ExperimentalSessionSearchOutput
 
 /** @deprecated Use `ExperimentalSessionPreflightInput`. Removed in the next minor. */
 export type SessionPreflightInput = ExperimentalSessionPreflightInput
