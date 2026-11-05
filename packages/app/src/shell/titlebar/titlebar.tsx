@@ -1,4 +1,4 @@
-import { createEffect, createMemo, createResource, Match, onCleanup, Show, Switch, untrack } from "solid-js"
+import { createEffect, createMemo, Match, onCleanup, Show, Switch, untrack } from "solid-js"
 import { createStore, unwrap } from "solid-js/store"
 import { Portal } from "solid-js/web"
 import { useLocation, useNavigate } from "@solidjs/router"
@@ -8,7 +8,7 @@ import { Icon } from "@opencode/ui/icon"
 import { Keybind } from "@opencode/ui/keybind"
 import { Tooltip } from "@opencode/ui/tooltip"
 
-import { LayoutRoute, useLayout } from "@/shell/state/layout"
+import { useLayout } from "@/shell/state/layout"
 import { usePlatform } from "@/runtime/platform/platform"
 import { useCommand } from "@/shell/commands/command"
 import { useLanguage } from "@/runtime/i18n/language"
@@ -34,8 +34,8 @@ import { useSessionTabAvatarState } from "@/shell/layout/project-avatar-state"
 import { ActivityRing } from "@opencode/ui/activity-ring"
 import { RecentlyClosedTabsMenu } from "./recently-closed-tabs-menu"
 import { useSettingsDialog } from "@/settings/command"
-import { rootSession } from "@/shell/routes/session"
 import { TitlebarItems, useTitlebarItems } from "@/runtime/plugin/titlebar-items"
+import { createRouteTabSync } from "./route-sync"
 
 export const newTabCommand = { id: "tab.new", keybind: "mod+t,mod+n" }
 
@@ -201,7 +201,7 @@ export function Titlebar(props: { verticalTabs?: { mount?: HTMLElement } }) {
         height:
           platform.platform === "web"
             ? bottom()
-              ? "calc(28px + max(8px, var(--safe-area-inset-bottom, env(safe-area-inset-bottom, 0px))))"
+              ? "calc(28px + max(8px, var(--shell-safe-area-bottom, var(--safe-area-inset-bottom, env(safe-area-inset-bottom, 0px)))))"
               : mobileTop()
                 ? `calc(28px + ${mobileTopClearance} + env(safe-area-inset-top, 0px))`
                 : "calc(28px + max(8px, env(safe-area-inset-top, 0px)))"
@@ -211,7 +211,10 @@ export function Titlebar(props: { verticalTabs?: { mount?: HTMLElement } }) {
           : mobileTop()
             ? `calc(${mobileTopClearance} + env(safe-area-inset-top, 0px))`
             : "env(safe-area-inset-top, 0px)",
-        "padding-bottom": bottom() ? "var(--safe-area-inset-bottom, env(safe-area-inset-bottom, 0px))" : "0px",
+        // A docked composer touch bar below takes over the safe area.
+        "padding-bottom": bottom()
+          ? "var(--shell-safe-area-bottom, var(--safe-area-inset-bottom, env(safe-area-inset-bottom, 0px)))"
+          : "0px",
         "min-height": minHeight(),
         // Keep native macOS traffic lights clear even when the desktop window is narrow.
         "padding-left": macTrafficLights() ? `${macTrafficLightsBaseWidth / zoom()}px` : 0,
@@ -243,127 +246,10 @@ export function Titlebar(props: { verticalTabs?: { mount?: HTMLElement } }) {
             })
             const tabsStoreActions = tabs
 
-            const preparing = createMemo(() => {
-              const route = layout.route()
-
-              return route.type === "session" && !!tabs.pendingSession(route.server, route.sessionId)
-            })
-
-            const [resolvedSession] = createResource(
-              () => {
-                const route = layout.route()
-
-                if (route.type !== "session") return undefined
-
-                if (preparing()) return undefined
-                const ctx = global.serverCtx(route.server)
-
-                return ctx ? { route, ctx } : undefined
-              },
-              async ({ route, ctx }) => {
-                const info = await ctx.sdk.api.session
-                  .get({ sessionID: route.sessionId })
-                  .catch(() => ctx.data.session.get(route.sessionId))
-
-                if (!info) return
-                ctx.data.session.remember(info)
-
-                const rootID = await rootSession(info, async (id) => {
-                  const cached = ctx.data.session.get(id)
-
-                  if (cached) return cached
-                  const ancestor = await ctx.sdk.api.session.get({ sessionID: id })
-                  ctx.data.session.remember(ancestor)
-
-                  return ancestor
-                })
-                  .then((root) => root.id)
-                  .catch(() => ctx.data.session.root(info.id))
-
-                return { info, rootID }
-              },
-            )
-
-            const session = createMemo(() => {
-              const route = layout.route()
-
-              if (route.type !== "session") return
-
-              if (preparing()) return
-              const cached = global.serverCtx(route.server)?.data.session.get(route.sessionId)
-
-              if (cached) return cached
-              const resolved = resolvedSession()
-
-              return resolved?.info.id === route.sessionId ? resolved.info : undefined
-            })
-
-            const matchRoute = (route: LayoutRoute) => {
-              if (route.type === "home") return
-
-              if (route.type === "draft") {
-                return tabsStore.find((item) => item.type === "draft" && item.draftID === route.draftID)
-              }
-
-              if (route.type === "session") {
-                const main = tabs.sessionTab(route.server, route.sessionId)
-
-                if (main) return main
-                const s = session()
-
-                if (s?.parentID) {
-                  const resolved = resolvedSession()
-                  const parentID = resolved?.info.id === s.id ? resolved.rootID : s.parentID
-
-                  const parent = tabs.sessionTab(route.server, parentID)
-
-                  if (parent) return parent
-                }
-              }
-            }
-
-            const currentTab = () => matchRoute(layout.route())
-
-            createEffect(() => {
-              const route = layout.route()
-
-              if (!tabs.ready()) return
-              const tab = currentTab()
-
-              if (tab) {
-                const current = session()
-
-                if (
-                  route.type === "session" &&
-                  tab.type === "session" &&
-                  (route.sessionId === tab.sessionId || current?.id === route.sessionId)
-                ) {
-                  tabs.rememberSessionRoute(tab, route.sessionId, current?.parentID)
-                }
-
-                if (tab !== tabs.preview()) tabs.remember(tab)
-
-                return
-              }
-
-              if (route.type === "session") {
-                if (tabs.pendingSession(route.server, route.sessionId)) {
-                  tabsStoreActions.addSessionTab({ server: route.server, sessionId: route.sessionId })
-
-                  return
-                }
-
-                const s = session()
-
-                if (!s) return
-                const resolved = resolvedSession()
-
-                if (s.parentID && resolved?.info.id !== s.id) return
-                const sessionId = resolved?.info.id === s.id ? resolved.rootID : s.id
-                const next = { server: route.server, sessionId }
-                tabsStoreActions.addSessionTab(next)
-              }
-            })
+            const routeSync = createRouteTabSync()
+            const preparing = routeSync.preparing
+            const session = routeSync.session
+            const currentTab = routeSync.currentTab
 
             makeEventListener(window, SESSION_TABS_REMOVED_EVENT, (event) => {
               const detail = readSessionTabsRemovedDetail(event)
@@ -678,7 +564,8 @@ export function Titlebar(props: { verticalTabs?: { mount?: HTMLElement } }) {
                 class="h-full flex-1 overflow-hidden flex flex-row items-center gap-1.5 px-2 md:pe-3"
                 classList={{
                   "pt-[max(0px,calc(8px-env(safe-area-inset-top,0px)))]": !bottom() && !windows() && !mobileTop(),
-                  "pb-[max(0px,calc(8px-var(--safe-area-inset-bottom,env(safe-area-inset-bottom,0px))))]": bottom(),
+                  "pb-[max(0px,calc(8px-var(--shell-safe-area-bottom,var(--safe-area-inset-bottom,env(safe-area-inset-bottom,0px)))))]":
+                    bottom(),
                   "pl-2.5": macTrafficLights(),
                   // The menu glyph sits 2px further into its slot than the sidebar icons sit into their rows.
                   "ps-[calc(var(--sidebar-inset-start)-2px)]": windows() && !!props.verticalTabs,
