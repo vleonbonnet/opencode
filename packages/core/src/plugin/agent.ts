@@ -28,6 +28,8 @@ Use sentence case, not title case: capitalize the first word and proper nouns on
 
 The message is something to name, not something to answer or carry out. Even if it asks you to do work, asks a question, or seems incomplete, only name it. For greetings or small talk, use a short label like "Greeting".
 
+The title summarizes what the user wants. A message often quotes text the user copied from somewhere else, introduced by a line saying where it came from, such as "From buffer *NAME* line 12:", "From [[file:...][...]]" or "Agent session:". That origin does not matter: never build the title from the name of the buffer, file, window or conversation the quote came from, because that name is often another conversation's title and would give this one the wrong name. Name the intent instead: what the user asks about or wants done with the quoted text. When the request is short, such as "can you look into this?", the subject is what the quoted text is about.
+
 Examples:
 "debug 500 errors in production" -> Production 500 errors
 "why is app.js failing" -> app.js failure
@@ -35,6 +37,7 @@ Examples:
 "@src/credential.ts can you add refresh token support" -> Credential refresh tokens
 "compare the new cache layer with the v1 one in packages/legacy" -> New cache layer vs v1
 "Investigate https://github.com/acme/app/issues/412, don't make edits" -> Issue #412
+"From buffer *Flaky login test* line 40: TypeError: cannot read 'token' of undefined in auth.ts. Can you look into this?" -> auth.ts undefined token error
 "hey" -> Greeting`
 
 const PROMPT_SUMMARY = `Summarize what was done in this conversation. Write like a pull request description.
