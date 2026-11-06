@@ -49,7 +49,7 @@ const sent = (model: LanguageModel, kind: "primary" | "compaction" | "generate" 
       messages: [Message.user("Think it through")],
     })
     const compiled = yield* compileRequest(prepared.request)
-    const http = mergeTransport(model.route.defaults, model.defaults, prepared.request).http
+    const http = mergeTransport(model.options, prepared.request).http
     return mergeJsonRecords(compiled.body as Record<string, unknown>, http?.body) ?? {}
   }).pipe(Effect.provideService(SessionModelTransport.Service, transport))
 
@@ -58,7 +58,7 @@ const converseThinking = (body: Record<string, unknown>) =>
   (body.additionalModelRequestFields as Record<string, unknown> | undefined)?.thinking
 
 const adaptive = (model: LanguageModel) =>
-  LanguageModel.update(model, { defaults: { providerOptions: { thinking: { type: "adaptive" } } } })
+  LanguageModel.update(model, { options: { providerOptions: { thinking: { type: "adaptive" } } } })
 
 describe("SessionModelRequest thinking display", () => {
   const messages = {
@@ -106,7 +106,7 @@ describe("SessionModelRequest thinking display", () => {
     Effect.gen(function* () {
       const claude = AnthropicMessages.route.model({ id: "claude-opus-4-7" })
       const thinking = (value: Record<string, unknown>) =>
-        LanguageModel.update(claude, { defaults: { providerOptions: { thinking: value } } })
+        LanguageModel.update(claude, { options: { providerOptions: { thinking: value } } })
 
       expect(thinkingOf(yield* sent(thinking({ type: "adaptive", display: "omitted" })))).toEqual({
         type: "adaptive",
@@ -128,7 +128,7 @@ describe("SessionModelRequest thinking display", () => {
     Effect.gen(function* () {
       const claude = AnthropicMessages.route.model({ id: "claude-opus-4-7" })
       const overlaid = LanguageModel.update(claude, {
-        defaults: {
+        options: {
           providerOptions: { thinking: { type: "enabled", budgetTokens: 4_000 } },
           http: { body: { thinking: { type: "adaptive" } } },
         },
@@ -148,7 +148,9 @@ describe("SessionModelRequest thinking display", () => {
       // Variants send Converse's adaptive thinking through the body.
       const body = (id: string, thinking: Record<string, unknown>) =>
         LanguageModel.update(bedrock.model(id), {
-          defaults: { http: { body: { additionalModelRequestFields: { thinking, output_config: { effort: "high" } } } } },
+          options: {
+            http: { body: { additionalModelRequestFields: { thinking, output_config: { effort: "high" } } } },
+          },
         })
 
       expect(converseThinking(yield* sent(body("anthropic.claude-sonnet-4-6", { type: "adaptive" })))).toEqual({
@@ -168,7 +170,7 @@ describe("SessionModelRequest thinking display", () => {
         converseThinking(yield* sent(body("anthropic.claude-opus-4-7", { type: "adaptive", display: "omitted" }))),
       ).toEqual({ type: "adaptive", display: "omitted" })
       const manual = LanguageModel.update(bedrock.model("anthropic.claude-sonnet-4-5"), {
-        defaults: { providerOptions: { thinking: { type: "enabled", budgetTokens: 4_000 } } },
+        options: { providerOptions: { thinking: { type: "enabled", budgetTokens: 4_000 } } },
       })
       expect(converseThinking(yield* sent(manual))).toEqual({ type: "enabled", budget_tokens: 4_000 })
       expect(converseThinking(yield* sent(bedrock.model("anthropic.claude-opus-4-8")))).toBeUndefined()

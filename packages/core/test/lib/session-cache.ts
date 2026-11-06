@@ -218,7 +218,7 @@ export const models = {
   chat: resolvedModel(chatRoute.model({ id: "gpt-chat" }), undefined, "key:chat-key"),
   other: resolvedModel(route.model({ id: "claude-mythos-5-1" })),
   deep: resolvedModel(
-    route.model({ id: MODEL_ID, defaults: { providerOptions: { thinking: { type: "enabled", budgetTokens: 4096 } } } }),
+    route.model({ id: MODEL_ID, options: { providerOptions: { thinking: { type: "enabled", budgetTokens: 4096 } } } }),
     "deep",
   ),
 }

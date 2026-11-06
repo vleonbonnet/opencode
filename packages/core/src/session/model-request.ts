@@ -326,12 +326,8 @@ const withBody = (request: LLMRequest, body: Record<string, unknown>) => ({
 export const summarizedThinking = (request: LLMRequest): LLMRequest => {
   const model = request.model
   if (!/claude/i.test(model.id)) return request
-  const options = mergeProviderOptions(
-    model.route.defaults.providerOptions,
-    model.defaults?.providerOptions,
-    request.providerOptions,
-  )
-  const body = mergeTransport(model.route.defaults, model.defaults, request).http?.body
+  const options = mergeProviderOptions(model.options?.providerOptions, request.providerOptions)
+  const body = mergeTransport(model.options, request).http?.body
   if (model.route.protocol === AnthropicMessages.protocol.id) {
     // The body overlays the thinking the options lower to, field by field.
     const overlaid = record(body?.thinking)
