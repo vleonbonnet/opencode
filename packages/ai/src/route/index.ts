@@ -2,8 +2,6 @@ export { Route, LLMClient, compileRequest, compileHttpRequest } from "./client.j
 export type {
   RouteLanguageModelInput,
   RouteRoutedLanguageModelInput,
-  RouteDefaults,
-  RouteDefaultsInput,
   AnyRoute,
   LLMClientService,
   StreamOptions,
