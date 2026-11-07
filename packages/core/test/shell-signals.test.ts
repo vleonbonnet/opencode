@@ -1,8 +1,9 @@
 import { describe, expect, test } from "bun:test"
-import { Effect, Option, Stream } from "effect"
+import { Deferred, Effect, Fiber, Option, Stream } from "effect"
+import { TestClock } from "effect/testing"
 import { ChildProcess } from "effect/process"
 import { CrossSpawnSpawner } from "@opencode/util/cross-spawn-spawner"
-import { ChildProcessSpawner } from "effect/process/ChildProcessSpawner"
+import { ChildProcessSpawner, make } from "effect/process/ChildProcessSpawner"
 import { LayerNode } from "@opencode/util/effect/layer-node"
 import { ShellSignals } from "../src/shell/signals"
 import { ShellSelect } from "../src/shell/select"
@@ -103,8 +104,9 @@ live("looks up names and command lines in the execution shell's PID namespace", 
           env: process.env,
           timeout: 0,
         },
-        spawner,
-      )
+        // Freeze the lookup deadline, but keep real process cleanup on the live clock.
+        make((command) => TestClock.withLive(spawner.spawn(command))),
+      ).pipe(Effect.provide(TestClock.layer()))
       expect(actions[0].targets[0].name).toMatch(/(?:ba|da|z)?sh(?:\.exe)?$/)
       expect(actions[0].targets[0].command).toContain("read -r release")
       expect(actions[0].targets[1]).toEqual({ target: "2147483647", kind: "pid" })
@@ -136,4 +138,27 @@ it.live("an unavailable process inspector leaves the request usable", () =>
       ])
     }),
   ),
+)
+
+it.effect("cancels a stalled inspector at its deadline and leaves the request usable", () =>
+  Effect.gen(function* () {
+    const started = yield* Deferred.make<void>()
+    const stopped = yield* Deferred.make<void>()
+    const spawner = make(() =>
+      Deferred.succeed(started, undefined).pipe(
+        Effect.andThen(Effect.never),
+        Effect.ensuring(Deferred.succeed(stopped, undefined)),
+      ),
+    )
+    const pending = yield* ShellSignals.inspect(
+      { command: "kill 123", shell: "/bin/sh", cwd: ".", env: {}, timeout: 0 },
+      spawner,
+    ).pipe(Effect.forkChild({ startImmediately: true }))
+    yield* Deferred.await(started)
+    yield* TestClock.adjust("2 seconds")
+    expect(yield* Fiber.join(pending)).toEqual([
+      { command: "kill 123", signal: "TERM", targets: [{ target: "123", kind: "pid" }] },
+    ])
+    expect(yield* Deferred.isDone(stopped)).toBe(true)
+  }),
 )
