@@ -17,6 +17,7 @@ import { Shell } from "../../shell.js"
 import { ShellParse } from "../../shell/parse.js"
 import { ShellSelect } from "../../shell/select.js"
 import { ShellResult } from "../../shell/result.js"
+import { ShellSignals } from "../../shell/signals.js"
 
 export const name = "shell"
 export const DEFAULT_TIMEOUT_MS = 2 * 60 * 1_000
@@ -142,6 +143,13 @@ export const Plugin = {
             ? { alternates: parsed.commands.map((command) => command.alternates ?? []) }
             : {}),
           save: parsed.commands.flatMap((command) => (command.save === undefined ? [] : [command.save])),
+          metadata: {
+            command: invocation.command,
+            cwd: invocation.cwd,
+            shell: invocation.shell,
+            timeout,
+            signals: yield* ShellSignals.inspect(invocation, environment.spawner),
+          },
           ...Permission.invocation(context),
         })
       // Approval can outlive the directory, so validate immediately before spawning.
