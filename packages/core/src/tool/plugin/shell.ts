@@ -17,7 +17,6 @@ import { Shell } from "../../shell.js"
 import { ShellParse } from "../../shell/parse.js"
 import { ShellSelect } from "../../shell/select.js"
 import { ShellResult } from "../../shell/result.js"
-import { ShellSignals } from "../../shell/signals.js"
 
 export const name = "shell"
 export const DEFAULT_TIMEOUT_MS = 2 * 60 * 1_000
@@ -148,7 +147,6 @@ export const Plugin = {
             cwd: invocation.cwd,
             shell: invocation.shell,
             timeout,
-            signals: yield* ShellSignals.inspect(invocation, environment.spawner),
           },
           ...Permission.invocation(context),
         })

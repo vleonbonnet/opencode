@@ -1065,7 +1065,6 @@ describe("ShellTool", () => {
                   cwd: realpathSync(tmp.path),
                   shell: expect.any(String),
                   timeout: ShellTool.DEFAULT_TIMEOUT_MS,
-                  signals: [],
                 },
               })
             }),
@@ -1073,35 +1072,6 @@ describe("ShellTool", () => {
         )
       }),
     { timeout: 15_000 },
-  )
-
-  it.live("includes signal targets in the permission before executing the command", () =>
-    withTempDir((tmp) => {
-      reset()
-      denyAction = "shell"
-      return withSession(tmp.path, (registry) =>
-        Effect.gen(function* () {
-          const selection = yield* ShellSelect.Service
-          yield* selection.transform((editor) =>
-            editor.configure(isWindows ? (ShellSelect.gitbash() ?? "sh") : "/bin/sh"),
-          )
-          const command = "kill -0 $$"
-          const result = yield* executeTool(registry, call({ command, timeout: 0 }))
-          expect(result.status).toBe("error")
-          expect(assertions).toHaveLength(1)
-          expect(assertions[0]).toMatchObject({
-            action: "shell",
-            resources: [command],
-            metadata: {
-              command,
-              cwd: realpathSync(tmp.path),
-              timeout: 0,
-              signals: [{ command, signal: "0", targets: [{ target: "$$", kind: "shell" }] }],
-            },
-          })
-        }),
-      )
-    }),
   )
 
   it.live(
