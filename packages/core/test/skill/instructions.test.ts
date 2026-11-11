@@ -3,9 +3,7 @@ import { describe, expect } from "bun:test"
 import { Effect, Layer } from "effect"
 import { Agent } from "@opencode/core/agent"
 import { AppNodeBuilder } from "@opencode/core/effect/app-node-builder"
-import type { Permission } from "@opencode/core/permission"
 import { AbsolutePath } from "@opencode/core/schema"
-import { SessionSchema } from "@opencode/core/session/schema"
 import { Skill } from "@opencode/core/skill"
 import { SkillInstructions } from "@opencode/core/skill/instructions"
 import { it } from "../lib/effect"
@@ -141,41 +139,6 @@ describe("SkillInstructions", () => {
         ].join("\n"),
       )
     }).pipe(Effect.provide(layer(() => skills)))
-  })
-
-  it.effect("lists a skill unless every ruleset of a shared exposure denies it", () => {
-    const plan = [{ action: "skill", resource: "denied", effect: "deny" as const }]
-    const build = [
-      { action: "skill", resource: "effect", effect: "deny" as const },
-      { action: "skill", resource: "denied", effect: "deny" as const },
-    ]
-    return Effect.gen(function* () {
-      const instructions = yield* SkillInstructions.Service
-      const shared = (yield* instructions.load([plan, build]).pipe(Effect.flatMap(readInitial))).text
-
-      // Listed because plan allows it, although build alone would hide it; hidden because both deny it.
-      expect(shared).toContain("<id>effect</id>")
-      expect(shared).not.toContain("<id>denied</id>")
-      expect((yield* instructions.load([build, plan]).pipe(Effect.flatMap(readInitial))).text).toBe(shared)
-      expect((yield* instructions.load([build]).pipe(Effect.flatMap(readInitial))).text).toBe("")
-    }).pipe(Effect.provide(layer(() => [denied, effect])))
-  })
-
-  it.effect("lists only skills that every delegation ceiling allows", () => {
-    const ceiling: Permission.Ceiling = {
-      delegator: { sessionID: SessionSchema.ID.make("ses_parent"), agent: Agent.ID.make("plan") },
-      rules: [
-        { action: "*", resource: "*", effect: "allow" },
-        { action: "skill", resource: "effect", effect: "deny" },
-      ],
-    }
-    return Effect.gen(function* () {
-      const instructions = yield* SkillInstructions.Service
-      const bounded = (yield* instructions.load([[]], [ceiling]).pipe(Effect.flatMap(readInitial))).text
-
-      expect(bounded).toContain("<id>denied</id>")
-      expect(bounded).not.toContain("<id>effect</id>")
-    }).pipe(Effect.provide(layer(() => [denied, effect])))
   })
 
   it.effect("omits instructions when the selected agent denies all skills", () => {

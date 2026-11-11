@@ -13,7 +13,7 @@ import { SessionTable } from "@opencode/core/session/sql"
 import { Clock, Duration, Effect, Schema, Stream } from "effect"
 import { TestClock } from "effect/testing"
 import type { Expiry } from "@opencode/schema/session-cache"
-import { testEffect } from "./lib/effect"
+import { testEffect } from "../lib/effect"
 import {
   chatTurn,
   confirmed,

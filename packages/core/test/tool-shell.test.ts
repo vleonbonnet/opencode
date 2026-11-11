@@ -50,6 +50,8 @@ import { permissionLayer } from "./lib/permission"
 import { Expected } from "./lib/session-message"
 import { toolIdentity, executeTool, registerToolPlugin, toolDefinitions } from "./lib/tool"
 
+import { forkTests } from "./fork/hosted/tool-shell"
+
 const sessionID = Session.ID.make("ses_shell_tool_test")
 const sessionModel = Model.Ref.make({ id: Model.ID.make("test"), providerID: Provider.ID.make("test") })
 const assertions: Permission.AssertInput[] = []
@@ -416,59 +418,6 @@ describe("ShellTool scanner permissions", () => {
       }),
     ))
 
-  test("a denial reaches the command behind runners and an option cluster", () =>
-    withScanner((registry, fixture) =>
-      Effect.gen(function* () {
-        const agents = yield* Agent.Service
-        yield* agents.transform((editor) =>
-          editor.update(toolIdentity.agent, (agent) => {
-            agent.permissions = [
-              { action: "shell", resource: "*", effect: "allow" },
-              { action: "shell", resource: "rm -r *", effect: "deny" },
-            ]
-          }),
-        )
-        const victim = path.join(fixture.active, "victim")
-        yield* Effect.promise(() => fs.mkdir(victim))
-        const result = yield* runPermissionCommand(registry, "env nice -n 5 rm -rf victim", victim, [])
-        expect(result.requests).toEqual([])
-        expect(result.exit).toMatchObject({
-          _tag: "Success",
-          value: { status: "error", error: { message: expect.stringContaining("Permission denied: shell") } },
-        })
-        expect(yield* Effect.promise(() => fs.stat(victim).then((stat) => stat.isDirectory()))).toBe(true)
-      }),
-    ))
-
-  test("a rule on heredoc text applies to bodies a shell runs, not to data", () =>
-    withScanner((registry, fixture) =>
-      Effect.gen(function* () {
-        const agents = yield* Agent.Service
-        yield* agents.transform((editor) =>
-          editor.update(toolIdentity.agent, (agent) => {
-            agent.permissions = [
-              { action: "shell", resource: "*", effect: "allow" },
-              { action: "shell", resource: "*kanopy-oidc*", effect: "deny" },
-            ]
-          }),
-        )
-        const notes = path.join(fixture.active, "notes")
-        const data = yield* runPermissionCommand(registry, "cat > notes <<'EOF'\nkanopy-oidc\nEOF", notes, [])
-        expect(data.requests).toEqual([])
-        expect(data.exit).toMatchObject({ _tag: "Success", value: { status: "completed", metadata: { exit: 0 } } })
-        expect(yield* Effect.promise(() => Bun.file(notes).text())).toBe("kanopy-oidc\n")
-
-        const marker = path.join(fixture.active, "marker")
-        const script = yield* runPermissionCommand(registry, "sh <<'EOF'\nprintf kanopy-oidc > marker\nEOF", marker, [])
-        expect(script.requests).toEqual([])
-        expect(script.exit).toMatchObject({
-          _tag: "Success",
-          value: { status: "error", error: { message: expect.stringContaining("Permission denied: shell") } },
-        })
-        expect(yield* Effect.promise(() => Bun.file(marker).exists())).toBe(false)
-      }),
-    ))
-
   test("external-directory rejection stops execution before a workspace marker is written", () =>
     withScanner((registry, fixture) =>
       Effect.gen(function* () {
@@ -613,11 +562,7 @@ describe("ShellTool conditional process substitution", () => {
             const command = '[[ -n <(printf reached > marker) ]]; wait "$!"'
             const result = yield* runPermissionCommand(registry, command, marker, [reply])
             expect(result.requests).toMatchObject([
-              {
-                action: "shell",
-                resources: ["printf reached > marker", 'wait "$!"'],
-                save: ["printf *", "wait *"],
-              },
+              { action: "shell", resources: ["printf reached > marker", 'wait "$!"'], save: ["printf *", "wait *"] },
             ])
             if (reply === "reject") {
               expect(Exit.isFailure(result.exit)).toBe(true)
@@ -1066,12 +1011,6 @@ describe("ShellTool", () => {
               expect(assertions[0]).toMatchObject({
                 resources: ["printf one", "printf two"],
                 save: ["printf *", "printf *"],
-                metadata: {
-                  command: "printf one && printf two",
-                  cwd: realpathSync(tmp.path),
-                  shell: expect.any(String),
-                  timeout: ShellTool.DEFAULT_TIMEOUT_MS,
-                },
               })
             }),
           ),
@@ -1800,3 +1739,5 @@ describe("ShellTool", () => {
     }),
   )
 })
+
+forkTests({ it, permissionIt, reset, assertions, call, withSession, withScanner, runPermissionCommand })

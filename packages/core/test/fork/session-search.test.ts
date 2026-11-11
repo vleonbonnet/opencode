@@ -25,8 +25,8 @@ import { SessionStore } from "@opencode/core/session/store"
 import { SessionStored } from "@opencode/core/session/stored"
 import { SessionSearch } from "@opencode/schema/session-search"
 import { LayerNode } from "@opencode/util/effect/layer-node"
-import { tmpdirScoped } from "./fixture/tmpdir"
-import { testEffect } from "./lib/effect"
+import { tmpdirScoped } from "../fixture/tmpdir"
+import { testEffect } from "../lib/effect"
 
 const it = testEffect(
   AppNodeBuilder.build(

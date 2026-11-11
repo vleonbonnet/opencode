@@ -28,17 +28,13 @@ describe("Bash redirect resource oracle", () => {
     ["printf ok && git status > output", ["printf ok", "git status > output"]],
     ["cat > output", ["cat > output"]],
     ["cat > output | cat", ["cat > output", "cat"]],
-    // A spelling keeps its command's redirects, after its words.
-    ["pwd | > output cat > tail", ["pwd", "> output cat > tail", "cat > output > tail"]],
-    // Bash takes one word as a redirect's target; `file` is cat's.
-    ["pwd && cat > output file", ["pwd", "cat > output file", "cat file > output"]],
+    ["pwd | > output cat > tail", ["pwd", "> output cat > tail"]],
+    ["pwd && cat > output file", ["pwd", "cat > output file"]],
     ["pwd; cat > output", ["pwd", "cat > output"]],
     ["pwd\ncat > output", ["pwd", "cat > output"]],
   ] as const)("keeps redirects visible across lists and pipelines: %s", async (source, resources) => {
     const parsed = await Effect.runPromise(ShellParse.scan(source, "/bin/bash", "/workspace"))
-    // The redirect-free spelling of a command is an alternate of the resource as written, not a separate resource.
-    const spellings = parsed.commands.flatMap((command) => [command.resource, ...(command.alternates ?? [])])
-    expect(spellings).toEqual([...resources])
+    expect(parsed.commands.map((command) => command.resource)).toEqual([...resources])
     await checkResources(source)
   })
 

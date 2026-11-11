@@ -14,8 +14,8 @@ import { SessionModelRequest } from "@opencode/core/session/model-request"
 import { SessionModelTransport } from "@opencode/core/session/model-transport"
 import { SessionRunnerModel } from "@opencode/core/session/runner/model"
 import { DateTime, Effect } from "effect"
-import { testEffect } from "./lib/effect"
-import { PluginTestLayer } from "./plugin/fixture"
+import { testEffect } from "../lib/effect"
+import { PluginTestLayer } from "../plugin/fixture"
 
 const it = testEffect(PluginTestLayer)
 

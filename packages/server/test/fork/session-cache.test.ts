@@ -2,9 +2,9 @@ import { expect } from "bun:test"
 import { Session } from "@opencode/schema/session"
 import { SessionCache } from "@opencode/schema/session-cache"
 import { Effect, Schema } from "effect"
-import { tmpdirScoped } from "../../core/test/fixture/tmpdir"
-import { it } from "../../core/test/lib/effect"
-import { ServerFetch } from "../src/fetch"
+import { tmpdirScoped } from "../../../core/test/fixture/tmpdir"
+import { it } from "../../../core/test/lib/effect"
+import { ServerFetch } from "../../src/fetch"
 
 const SessionResponse = Schema.Struct({ data: Schema.toEncoded(Session.Info) })
 const PreflightResponse = Schema.Struct({ data: SessionCache.PreflightReport })

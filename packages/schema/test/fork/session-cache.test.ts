@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test"
 import { Schema } from "effect"
-import { PromptMetadata, THINKING_LOSS } from "../src/session-cache.js"
+import { PromptMetadata, THINKING_LOSS } from "../../src/session-cache.js"
 
 describe("SessionCache.PromptMetadata", () => {
   const decode = Schema.decodeUnknownSync(PromptMetadata)

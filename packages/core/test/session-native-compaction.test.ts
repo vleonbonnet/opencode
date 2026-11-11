@@ -27,6 +27,8 @@ import { LayerNode } from "@opencode/util/effect/layer-node"
 import { DateTime, Deferred, Effect, Fiber, Schema } from "effect"
 import { testEffect } from "./lib/effect"
 
+import { forkTests } from "./fork/hosted/session-native-compaction"
+
 const decode = (checkpoint: { readonly native: { readonly messages: unknown } }) =>
   Schema.decodeUnknownSync(SessionHistory.NativeWindow)(checkpoint.native.messages)
 
@@ -221,8 +223,6 @@ const setup = Effect.fnUntraced(function* (options: { endpoint?: boolean } = {})
     expect(last.metadata?.recent).toBeUndefined()
     // Provider compaction has no summary, so the request usage is the only visible cost of the operation.
     expect(last.tokens).toMatchObject({ input: 20, output: 4 })
-    // An encrypted window has no locally measurable size, so the next request's prompt is left unestimated.
-    expect(last).not.toHaveProperty("context")
     return last
   })
   return {
@@ -425,3 +425,5 @@ test("retained user budget counts attachments and drops whole oldest messages", 
     SessionCompaction.recentUserMessages([user("x".repeat(63_000 * 4)), { ...newest, text: "new" }], model, 64_000),
   ).toHaveLength(1)
 })
+
+forkTests({ it, setup })

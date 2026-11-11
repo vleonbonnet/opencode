@@ -185,21 +185,14 @@ describe("ordinary Bash and Zsh syntax", () => {
 })
 
 describe("Bash shared heredoc delimiter grammar", () => {
-  test.each(['cat <<"E\\$OF"\nhello\nE$OF', '(cat <<"E\\$OF"\nhello\nE$OF\n)'])(
-    "preserves heredoc permission resources and saved prefixes: %s",
-    async (source) => {
-      const parsed = await Effect.runPromise(ShellParse.scan(source, "/bin/bash", "/workspace"))
-      expect(parsed.commands[0]?.save).toBe("cat *")
-    },
-  )
-
-  // Bash ends a body whose delimiter keeps a backslash at that delimiter, and the data is left out.
   test.each([
-    ['(cat <<"E\\OF"\nhello\nE\\OF\n)', 'cat <<"E\\OF"'],
-    ['(cat <<-"E\\OF"\n\thello\n\tE\\OF\n)', 'cat <<-"E\\OF"'],
-  ])("leaves out a data-only body: %s", async (source, resource) => {
-    const expected = { commands: [{ resource, save: "cat *" }], directories: [] }
-    expect(await Effect.runPromise(ShellParse.scan(source, "/bin/bash", "/workspace"))).toEqual(expected)
+    '(cat <<"E\\OF"\nhello\nE\\OF\n)',
+    'cat <<"E\\$OF"\nhello\nE$OF',
+    '(cat <<"E\\$OF"\nhello\nE$OF\n)',
+    '(cat <<-"E\\OF"\n\thello\n\tE\\OF\n)',
+  ])("preserves heredoc permission resources and saved prefixes: %s", async (source) => {
+    const parsed = await Effect.runPromise(ShellParse.scan(source, "/bin/bash", "/workspace"))
+    expect(parsed.commands[0]?.save).toBe("cat *")
   })
 
   test.each([

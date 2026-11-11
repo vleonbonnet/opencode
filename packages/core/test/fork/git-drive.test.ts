@@ -5,9 +5,9 @@ import { Effect } from "effect"
 import { LayerNode } from "@opencode/util/effect/layer-node"
 import { Git } from "@opencode/core/git"
 import { AbsolutePath } from "@opencode/core/schema"
-import { initRepo } from "./fixture/git"
-import { tmpdir } from "./fixture/tmpdir"
-import { testEffect } from "./lib/effect"
+import { initRepo } from "../fixture/git"
+import { tmpdir } from "../fixture/tmpdir"
+import { testEffect } from "../lib/effect"
 
 const it = testEffect(LayerNode.compile(Git.node))
 

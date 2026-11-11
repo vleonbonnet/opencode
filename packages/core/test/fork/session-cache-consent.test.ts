@@ -13,7 +13,7 @@ import { UNKNOWN_BINDING } from "@opencode/schema/session-cache"
 import { and, asc, eq } from "drizzle-orm"
 import { Duration, Effect, Exit, Fiber, Stream } from "effect"
 import { TestClock } from "effect/testing"
-import { testEffect } from "./lib/effect"
+import { testEffect } from "../lib/effect"
 import {
   chatTurn,
   confirmed,

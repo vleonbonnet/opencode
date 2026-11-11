@@ -2,8 +2,8 @@ import { expect } from "bun:test"
 import { Session } from "@opencode/schema/session"
 import { SessionSearch } from "@opencode/schema/session-search"
 import { Effect, Schema } from "effect"
-import { it } from "../../core/test/lib/effect"
-import { ServerFetch } from "../src/fetch"
+import { it } from "../../../core/test/lib/effect"
+import { ServerFetch } from "../../src/fetch"
 
 const SessionResponse = Schema.Struct({ data: Schema.toEncoded(Session.Info) })
 const SearchResponse = Schema.toEncoded(SessionSearch.Response)

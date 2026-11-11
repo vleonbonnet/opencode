@@ -70,18 +70,12 @@ const addPlugin = Effect.fn(function* (entries: Entry[]) {
   yield* ConfigPolicyPlugin.Plugin.effect(host).pipe(Effect.provide(Config.testLayer(entries)))
 })
 
-const evaluate = Effect.fn(function* (
-  action: string,
-  resources: string[],
-  effect: Permission.Effect = "allow",
-  alternates?: string[][],
-) {
+const evaluate = Effect.fn(function* (action: string, resources: string[], effect: Permission.Effect = "allow") {
   const hooks = yield* PluginHooks.Service
   const event = yield* hooks.trigger("permission", "evaluate", {
     sessionID: Session.ID.make("ses_policy"),
     action,
     resources,
-    ...(alternates ? { alternates } : {}),
     effect,
   })
   return { effect: event.effect, message: event.message }
@@ -97,16 +91,6 @@ describe("ConfigPolicyPlugin.Plugin", () => {
       expect((yield* evaluate("shell", ["git push origin main"])).effect).toBe("deny")
       expect((yield* evaluate("shell", ["ls"])).effect).toBe("deny")
       expect((yield* evaluate("edit", ["notes.md"])).effect).toBe("allow")
-    }),
-  )
-
-  it.effect("denies a resource when a tool.use policy denies any of its spellings", () =>
-    Effect.gen(function* () {
-      yield* addPlugin([document(tool("allow", "shell:*"), tool("deny", "shell:kubectl delete *"))])
-      expect((yield* evaluate("shell", [`kubectl "delete" pod x`])).effect).toBe("allow")
-      expect((yield* evaluate("shell", [`kubectl "delete" pod x`], "allow", [["kubectl delete pod x"]])).effect).toBe(
-        "deny",
-      )
     }),
   )
 

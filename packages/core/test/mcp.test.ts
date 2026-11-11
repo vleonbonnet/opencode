@@ -69,8 +69,6 @@ import { TestClock } from "effect/testing"
 import { ChildProcess, ChildProcessSpawner } from "effect/process"
 import { ExitCode, makeHandle, ProcessId } from "effect/process/ChildProcessSpawner"
 import { Image } from "@opencode/core/image"
-import { Agent } from "@opencode/core/agent"
-import { toSessionError } from "@opencode/core/session/to-session-error"
 import { Global } from "@opencode/util/global"
 import { isRecord } from "@opencode/util/record"
 import { CrossSpawnSpawner } from "@opencode/util/cross-spawn-spawner"
@@ -90,6 +88,8 @@ import {
   toolIdentity,
   waitForTool,
 } from "./lib/tool"
+
+import { forkTests } from "./fork/hosted/mcp"
 
 let assertion: Deferred.Deferred<Permission.AssertInput> | undefined
 let decision: Effect.Effect<void, Permission.Error> = Effect.void
@@ -2876,49 +2876,6 @@ it.effect("forwards the invoking session through direct and Code Mode MCP tools"
   }),
 )
 
-it.effect("lists MCP tools another selectable agent allows and refuses them to an agent that disables them", () =>
-  Effect.gen(function* () {
-    assertion = yield* Deferred.make<Permission.AssertInput>()
-    decision = Effect.void
-    invocations = []
-    const registry = yield* Tool.Service
-    const registration = yield* McpTool.Service
-    yield* registration.flush
-    const build: Permission.Ruleset = [{ action: "*", resource: "*", effect: "allow" }]
-    const plan: Permission.Ruleset = [
-      ...build,
-      { action: McpTool.name("direct", "lookup"), resource: "*", effect: "deny" },
-      { action: McpTool.name("demo", "search"), resource: "*", effect: "deny" },
-    ]
-    const planned = yield* registry.snapshot(plan, [plan, build])
-
-    // Alone, plan would leave both tools out; build's rules keep them listed for plan too.
-    expect((yield* registry.snapshot(plan)).definitions.map((tool) => tool.name)).not.toContain("direct_lookup")
-    expect(planned.definitions.map((tool) => tool.name)).toContain("direct_lookup")
-    expect(codeModeListings(planned.codeModeCatalog!).map((tool) => tool.path)).toContain("demo.search")
-
-    const asPlan = { sessionID: Session.ID.make("ses_mcp_plan"), ...toolIdentity, agent: Agent.ID.make("plan") }
-    const direct = yield* planned
-      .execute({ ...asPlan, call: { type: "tool-call", id: "call_plan_lookup", name: "direct_lookup", input: {} } })
-      .pipe(Effect.flip)
-    expect(toSessionError(direct)).toEqual({
-      type: "permission.rejected",
-      message: "The plan agent is not permitted to use direct_lookup.",
-    })
-    const script = yield* planned.execute({
-      ...asPlan,
-      call: {
-        type: "tool-call",
-        id: "call_plan_search",
-        name: "execute",
-        input: { code: "return await tools.demo.search({})" },
-      },
-    })
-    expect(JSON.stringify(script.content)).toContain("The plan agent is not permitted to use demo_search")
-    expect(invocations).toEqual([])
-  }),
-)
-
 it.effect("returns content-only MCP results through Code Mode", () =>
   Effect.gen(function* () {
     assertion = yield* Deferred.make<Permission.AssertInput>()
@@ -3979,4 +3936,14 @@ describe("MCP pool", () => {
       expect(server.state.toolLists).toBe(1)
     }),
   )
+})
+
+forkTests({
+  it,
+  reset: Effect.gen(function* () {
+    assertion = yield* Deferred.make<Permission.AssertInput>()
+    decision = Effect.void
+    invocations = []
+  }),
+  invocations: () => invocations,
 })

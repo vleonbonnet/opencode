@@ -11,7 +11,7 @@ import { SessionInboxTable, SessionMessageTable } from "@opencode/core/session/s
 import { eq } from "drizzle-orm"
 import { Clock, Duration, Effect } from "effect"
 import { TestClock } from "effect/testing"
-import { testEffect } from "./lib/effect"
+import { testEffect } from "../lib/effect"
 import {
   chatTurn,
   confirmed,
