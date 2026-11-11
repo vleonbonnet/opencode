@@ -27,17 +27,6 @@ export const DEFAULT_TIMEOUT_MS = 2 * 60 * 1_000
 
 const BACKGROUND_INSTRUCTION =
   "You will be notified automatically when the command finishes. The notification will include the command's output. Unless the user explicitly asks otherwise, DO NOT poll for completion, even if you need the final result to continue. Repeatedly sleeping and reading or searching the output file is polling, not useful work. You may read the current output if it lets you do useful work now, but do not repeatedly check it while waiting for the command to finish. Keep working on anything that does not depend on the result. If you have nothing else to do, end your response; you will be resumed automatically when the command finishes."
-// Retrying long work with a larger timeout only blocks longer; in the background it runs to completion and its
-// notification brings the result.
-const timeoutInstruction = (timeout: number, background: boolean) =>
-  [
-    `Command exceeded timeout of ${timeout} ms.`,
-    background
-      ? "If it needs more time, run it again with `background: true` and no timeout."
-      : "If it needs more time, run it again with `background: true`.",
-    "If it was waiting for interactive input, run it so that it does not prompt.",
-    "Do not retry with a larger timeout, and do not poll for completion.",
-  ].join(" ")
 const OS =
   process.platform === "darwin"
     ? "macOS"
@@ -282,7 +271,7 @@ export const Plugin = {
                 return {
                   ...output,
                   output: output.timeout
-                    ? `${output.output}\n\n${timeoutInstruction(finalTimeout, input.background === true)}`
+                    ? `${output.output}\n\nCommand exceeded timeout of ${finalTimeout} ms. Retry with a larger timeout if the command is expected to take longer.`
                     : output.output,
                   status: "completed" as const,
                 }
