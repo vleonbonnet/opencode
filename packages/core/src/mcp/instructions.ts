@@ -43,12 +43,12 @@ const update = Instructions.listUpdate<Summary>({
 })
 
 export interface Interface {
-  /**
-   * Lists server instructions whose tools the exposure lists; callers pass the merged agent and Session permissions of
-   * each agent sharing the request's exposure, and the Session's delegation ceilings, which bind all of them.
-   */
+  /** Lists server instructions reachable under the given ruleset; callers pass the merged agent and Session permissions. */
   readonly load: (
-    exposure: ReadonlyArray<Permission.Ruleset>,
+    permissions: Permission.Ruleset,
+    /** The merged permissions of every agent sharing the request's exposure; instructions any of them reaches are listed. */
+    exposure?: ReadonlyArray<Permission.Ruleset>,
+    /** The Session's delegation ceilings, which bind every ruleset of the exposure. */
     ceilings?: ReadonlyArray<Permission.Ceiling>,
   ) => Effect.Effect<Instructions.List>
 }
@@ -61,7 +61,7 @@ export const layer = Layer.effect(
     const mcp = yield* Mcp.Service
 
     return Service.of({
-      load: Effect.fn("McpInstructions.load")(function* (exposure, ceilings = []) {
+      load: Effect.fn("McpInstructions.load")(function* (permissions, exposure = [permissions], ceilings = []) {
         const source = (value: ReadonlyArray<Summary> | Instructions.Removed) =>
           Instructions.make<ReadonlyArray<Summary>>({
             key: Instructions.Key.make("core/mcp-guidance"),

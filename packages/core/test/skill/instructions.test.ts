@@ -53,7 +53,7 @@ describe("SkillInstructions", () => {
     let skills = [hidden, denied, manual, effect]
     return Effect.gen(function* () {
       const instructions = yield* SkillInstructions.Service
-      const initialized = yield* instructions.load([agent.permissions]).pipe(Effect.flatMap(readInitial))
+      const initialized = yield* instructions.load(agent.permissions).pipe(Effect.flatMap(readInitial))
 
       expect(initialized.text).toBe(
         [
@@ -74,7 +74,7 @@ describe("SkillInstructions", () => {
       skills = []
       expect(
         yield* instructions
-          .load([agent.permissions])
+          .load(agent.permissions)
           .pipe(Effect.flatMap((context) => readUpdate(context, initialized))),
       ).toMatchObject({ text: "Skill guidance is no longer available. Do not use any previously listed skill." })
     }).pipe(Effect.provide(layer(() => skills)))
@@ -92,11 +92,11 @@ describe("SkillInstructions", () => {
     let skills = [effect]
     return Effect.gen(function* () {
       const instructions = yield* SkillInstructions.Service
-      const initialized = yield* instructions.load([agent.permissions]).pipe(Effect.flatMap(readInitial))
+      const initialized = yield* instructions.load(agent.permissions).pipe(Effect.flatMap(readInitial))
 
       skills = [effect, debugging]
       const added = yield* instructions
-        .load([agent.permissions])
+        .load(agent.permissions)
         .pipe(Effect.flatMap((context) => readUpdate(context, initialized)))
       expect(added.text).toBe(
         [
@@ -111,7 +111,7 @@ describe("SkillInstructions", () => {
 
       skills = [debugging]
       const removed = yield* instructions
-        .load([agent.permissions])
+        .load(agent.permissions)
         .pipe(Effect.flatMap((context) => readUpdate(context, added)))
       expect(removed.text).toBe("The following skill IDs are no longer available and must not be used: effect.")
     }).pipe(Effect.provide(layer(() => skills)))
@@ -122,11 +122,11 @@ describe("SkillInstructions", () => {
     let skills = [effect]
     return Effect.gen(function* () {
       const instructions = yield* SkillInstructions.Service
-      const initialized = yield* instructions.load([agent.permissions]).pipe(Effect.flatMap(readInitial))
+      const initialized = yield* instructions.load(agent.permissions).pipe(Effect.flatMap(readInitial))
 
       skills = [Skill.Info.make({ ...effect, description: "Build applications with Effect v4" })]
       const changed = yield* instructions
-        .load([agent.permissions])
+        .load(agent.permissions)
         .pipe(Effect.flatMap((context) => readUpdate(context, initialized)))
       expect(changed.text).toBe(
         [
@@ -148,7 +148,7 @@ describe("SkillInstructions", () => {
     })
     return Effect.gen(function* () {
       const instructions = yield* SkillInstructions.Service
-      expect((yield* instructions.load([agent.permissions]).pipe(Effect.flatMap(readInitial))).text).toBe("")
+      expect((yield* instructions.load(agent.permissions).pipe(Effect.flatMap(readInitial))).text).toBe("")
     }).pipe(Effect.provide(layer(() => [effect])))
   })
 
@@ -162,7 +162,7 @@ describe("SkillInstructions", () => {
     })
     return Effect.gen(function* () {
       const instructions = yield* SkillInstructions.Service
-      expect((yield* instructions.load([agent.permissions]).pipe(Effect.flatMap(readInitial))).text).toBe("")
+      expect((yield* instructions.load(agent.permissions).pipe(Effect.flatMap(readInitial))).text).toBe("")
     }).pipe(Effect.provide(layer(() => [effect])))
   })
 
@@ -177,7 +177,7 @@ describe("SkillInstructions", () => {
     return Effect.gen(function* () {
       const instructions = yield* SkillInstructions.Service
       expect(
-        (yield* instructions.load([agent.permissions]).pipe(Effect.flatMap(readInitial))).text,
+        (yield* instructions.load(agent.permissions).pipe(Effect.flatMap(readInitial))).text,
       ).toContain("<name>Effect</name>")
     }).pipe(Effect.provide(layer(() => [effect])))
   })
@@ -193,7 +193,7 @@ describe("SkillInstructions", () => {
     })
     return Effect.gen(function* () {
       const instructions = yield* SkillInstructions.Service
-      expect((yield* instructions.load([agent.permissions]).pipe(Effect.flatMap(readInitial))).text).toBe("")
+      expect((yield* instructions.load(agent.permissions).pipe(Effect.flatMap(readInitial))).text).toBe("")
     }).pipe(Effect.provide(layer(() => [effect])))
   })
 })

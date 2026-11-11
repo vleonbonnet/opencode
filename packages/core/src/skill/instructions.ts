@@ -46,12 +46,12 @@ const update = Instructions.listUpdate<Summary>({
 })
 
 export interface Interface {
-  /**
-   * Lists skills that at least one exposure ruleset and every delegation ceiling do not deny; callers pass the merged
-   * agent and Session permissions of each agent sharing the request's exposure, and the Session's ceilings.
-   */
+  /** Lists skills the given ruleset does not deny; callers pass the merged agent and Session permissions. */
   readonly load: (
-    exposure: ReadonlyArray<Permission.Ruleset>,
+    permissions: Permission.Ruleset,
+    /** The merged permissions of every agent sharing the request's exposure; a skill any of them allows is listed. */
+    exposure?: ReadonlyArray<Permission.Ruleset>,
+    /** The Session's delegation ceilings, which bind every ruleset of the exposure. */
     ceilings?: ReadonlyArray<Permission.Ceiling>,
   ) => Effect.Effect<Instructions.List>
 }
@@ -64,7 +64,7 @@ const layer = Layer.effect(
     const skills = yield* Skill.Service
 
     return Service.of({
-      load: Effect.fn("SkillInstructions.load")(function* (exposure, ceilings = []) {
+      load: Effect.fn("SkillInstructions.load")(function* (permissions, exposure = [permissions], ceilings = []) {
         const listed = yield* skills.list()
         const shown = new Set(exposure.flatMap((permissions) => Skill.available(listed, permissions, ceilings)))
         const available = listed

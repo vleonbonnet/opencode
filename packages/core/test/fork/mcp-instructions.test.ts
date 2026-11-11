@@ -34,14 +34,12 @@ describe("McpInstructions", () => {
       const service = yield* McpInstructions.Service
       const plan = [{ action: McpTool.name("alpha", "write"), resource: "*", effect: "deny" as const }]
       const build = [{ action: McpTool.name("beta", "search"), resource: "*", effect: "deny" as const }]
-      const both = (yield* service.load([plan, build]).pipe(Effect.flatMap(readInitial))).text
+      const both = (yield* service.load(plan, [plan, build]).pipe(Effect.flatMap(readInitial))).text
 
       expect(both).toContain('<server name="alpha">')
       expect(both).toContain('<server name="beta">')
-      expect((yield* service.load([build, plan]).pipe(Effect.flatMap(readInitial))).text).toBe(both)
-      expect((yield* service.load([plan]).pipe(Effect.flatMap(readInitial))).text).not.toContain(
-        '<server name="alpha">',
-      )
+      expect((yield* service.load(build, [build, plan]).pipe(Effect.flatMap(readInitial))).text).toBe(both)
+      expect((yield* service.load(plan).pipe(Effect.flatMap(readInitial))).text).not.toContain('<server name="alpha">')
     }).pipe(
       Effect.provide(
         layer(
@@ -61,14 +59,14 @@ describe("McpInstructions", () => {
         rules: [{ action: "*", resource: "*", effect: "allow" }, ...rules],
       })
       const bounded = (yield* service
-        .load([[]], [ceiling([{ action: McpTool.name("alpha", "write"), resource: "*", effect: "deny" }])])
+        .load([], [[]], [ceiling([{ action: McpTool.name("alpha", "write"), resource: "*", effect: "deny" }])])
         .pipe(Effect.flatMap(readInitial))).text
 
       expect(bounded).not.toContain('<server name="alpha">')
       expect(bounded).toContain('<server name="beta">')
       // Without execute, Code Mode server tools are exposed directly, so their instructions stay.
       const direct = (yield* service
-        .load([[]], [ceiling([{ action: "execute", resource: "*", effect: "deny" }])])
+        .load([], [[]], [ceiling([{ action: "execute", resource: "*", effect: "deny" }])])
         .pipe(Effect.flatMap(readInitial))).text
       expect(direct).toContain('<server name="alpha">')
       expect(direct).toContain('<server name="beta">')

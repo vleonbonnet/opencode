@@ -380,8 +380,8 @@ const layer = Layer.unwrap(
       load: () => Effect.succeed(Instructions.empty),
     })
     const skillInstructions = Layer.mock(SkillInstructions.Service, {
-      load: ([permissions = []]) => {
-        // `setup` tags each agent's ruleset with a `skill` rule naming that agent; the acting agent's comes first.
+      load: (permissions) => {
+        // `setup` tags each agent's ruleset with a `skill` rule naming that agent.
         const baseline = permissions
           .filter((rule) => rule.action === "skill")
           .map((rule) => state.skillBaselines.get(Agent.ID.make(rule.resource)))

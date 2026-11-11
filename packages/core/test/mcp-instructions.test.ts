@@ -30,10 +30,8 @@ describe("McpInstructions", () => {
       const service = yield* McpInstructions.Service
       const generation = yield* service
         .load([
-          [
-            { action: McpTool.name("alpha", "restricted"), resource: "*", effect: "deny" },
-            { action: McpTool.name("hidden", "search"), resource: "*", effect: "deny" },
-          ],
+          { action: McpTool.name("alpha", "restricted"), resource: "*", effect: "deny" },
+          { action: McpTool.name("hidden", "search"), resource: "*", effect: "deny" },
         ])
         .pipe(Effect.flatMap(readInitial))
 
@@ -71,7 +69,7 @@ describe("McpInstructions", () => {
     Effect.gen(function* () {
       const service = yield* McpInstructions.Service
       const generation = yield* service
-        .load([[{ action: "execute", resource: "*", effect: "deny" }]])
+        .load([{ action: "execute", resource: "*", effect: "deny" }])
         .pipe(Effect.flatMap(readInitial))
 
       expect(generation.text).toBe(
@@ -97,7 +95,7 @@ describe("McpInstructions", () => {
     Effect.gen(function* () {
       const service = yield* McpInstructions.Service
       const generation = yield* service
-        .load([[{ action: "execute", resource: "*", effect: "deny" }]])
+        .load([{ action: "execute", resource: "*", effect: "deny" }])
         .pipe(Effect.flatMap(readInitial))
 
       expect(generation.text).toBe(
@@ -130,10 +128,10 @@ describe("McpInstructions", () => {
     let tools: Mcp.Tool[] = [tool("alpha")]
     return Effect.gen(function* () {
       const service = yield* McpInstructions.Service
-      const initialized = yield* service.load([[]]).pipe(Effect.flatMap(readInitial))
+      const initialized = yield* service.load([]).pipe(Effect.flatMap(readInitial))
 
       tools = [{ ...tool("alpha"), codemode: false }]
-      const changed = yield* readUpdate(yield* service.load([[]]), initialized)
+      const changed = yield* readUpdate(yield* service.load([]), initialized)
       expect(changed.text).toBe(
         [
           "The following MCP server instructions have changed. Each entry replaces the previously listed server with the same name:",
@@ -157,10 +155,10 @@ describe("McpInstructions", () => {
     const tools = [tool("alpha"), tool("beta")]
     return Effect.gen(function* () {
       const service = yield* McpInstructions.Service
-      const initialized = yield* service.load([[]]).pipe(Effect.flatMap(readInitial))
+      const initialized = yield* service.load([]).pipe(Effect.flatMap(readInitial))
 
       catalog = [instructions("alpha", "Alpha instructions"), instructions("beta", "Beta instructions")]
-      const added = yield* readUpdate(yield* service.load([[]]), initialized)
+      const added = yield* readUpdate(yield* service.load([]), initialized)
       expect(added.text).toBe(
         [
           "New MCP server instructions are available in addition to those previously listed:",
@@ -172,7 +170,7 @@ describe("McpInstructions", () => {
       )
 
       catalog = [instructions("alpha", "Updated alpha"), instructions("beta", "Beta instructions")]
-      const changed = yield* readUpdate(yield* service.load([[]]), added)
+      const changed = yield* readUpdate(yield* service.load([]), added)
       expect(changed.text).toBe(
         [
           "The following MCP server instructions have changed. Each entry replaces the previously listed server with the same name:",
@@ -184,11 +182,11 @@ describe("McpInstructions", () => {
       )
 
       catalog = [instructions("beta", "Beta instructions")]
-      const removed = yield* readUpdate(yield* service.load([[]]), changed)
+      const removed = yield* readUpdate(yield* service.load([]), changed)
       expect(removed.text).toBe("Instructions for the following MCP servers are no longer available: alpha.")
 
       catalog = []
-      expect((yield* readUpdate(yield* service.load([[]]), removed)).text).toBe(
+      expect((yield* readUpdate(yield* service.load([]), removed)).text).toBe(
         "MCP server instructions are no longer available.",
       )
     }).pipe(
