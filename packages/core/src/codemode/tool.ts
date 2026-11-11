@@ -16,10 +16,11 @@ import { Flag } from "../flag.js"
 import { toSessionError } from "../session/to-session-error.js"
 import { definition, normalizedName } from "../tool/runtime.js"
 import { Permission } from "../permission.js"
-import { ToolUserStop } from "../tool/user-stop.js"
 import { CodeModeCatalog } from "./catalog.js"
 import { CodeModeExecution } from "./execution.js"
 import { CodeModeFetch } from "./fetch.js"
+
+import { ToolUserStop } from "../tool/user-stop.js"
 
 const ExecuteFile = Schema.Struct({
   data: Schema.String,

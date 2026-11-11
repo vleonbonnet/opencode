@@ -13,12 +13,10 @@ import type { SessionMessage } from "@opencode/schema/session-message"
 import type { SessionInbox } from "@opencode/schema/session-inbox"
 import type { PromptInput } from "@opencode/schema/prompt-input"
 import type { AgentAttachment } from "@opencode/schema/prompt"
-import type { SessionCache } from "@opencode/schema/session-cache"
 import type { FileDiff } from "@opencode/schema/file-diff"
 import type { Form } from "@opencode/schema/form"
 import type { DateTime } from "effect"
 import type { Money } from "@opencode/schema/money"
-import type { SessionSearch } from "@opencode/schema/session-search"
 import type { Skill } from "@opencode/schema/skill"
 import type { InstructionEntry } from "@opencode/schema/instruction-entry"
 import type { Schema } from "effect"
@@ -48,6 +46,9 @@ import type { Vcs } from "@opencode/schema/vcs"
 import type { WebSearch } from "@opencode/schema/websearch"
 import type { UsageLimits } from "@opencode/schema/usage-limits"
 import type { Config } from "@opencode/schema/config"
+
+import type { SessionCache } from "@opencode/schema/session-cache"
+import type { SessionSearch } from "@opencode/schema/session-search"
 
 export type ServerInfoOutput = {
   readonly version: string

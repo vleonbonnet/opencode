@@ -9,7 +9,6 @@ export * as EditTool from "./edit.js"
 import type { Context } from "@opencode/plugin/effect/plugin"
 import { ToolFailure } from "@opencode/ai/effect"
 import { FileDiff } from "@opencode/schema/file-diff"
-import { LineEnding } from "@opencode/util/line-ending"
 import { Effect, Schema } from "effect"
 import { toolFailure } from "../runtime.js"
 import { Environment } from "../../environment/index.js"
@@ -19,6 +18,8 @@ import { FileAccess } from "../../file-access.js"
 import { FileWrite } from "../../file-write.js"
 import { Permission } from "../../permission.js"
 import { fileDiff } from "./file-diff.js"
+
+import { LineEnding } from "@opencode/util/line-ending"
 
 export const name = "edit"
 
@@ -114,7 +115,9 @@ const withRegionEndings = (region: string, replacement: string, fallback: string
   const after = replacement.split("\n")
   const key = (line: string) => normalizeForMatch(line.trimEnd())
   const source = LineEnding.align(before.map(key), after.map(key))
-  return after.map((line, index) => (index === after.length - 1 ? line : line + (endings[source[index]!] ?? fallback))).join("")
+  return after
+    .map((line, index) => (index === after.length - 1 ? line : line + (endings[source[index]!] ?? fallback)))
+    .join("")
 }
 
 /**

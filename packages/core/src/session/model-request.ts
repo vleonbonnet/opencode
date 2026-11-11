@@ -3,7 +3,6 @@ export * as SessionModelRequest from "./model-request.js"
 import {
   ai,
   AssistantMessage,
-  type CachePolicyObject,
   type ContentPart,
   GENERATION_KEYS,
   type GenerationOptionsFields,
@@ -18,10 +17,7 @@ import {
   type ToolResultPart,
   UserMessage,
 } from "@opencode/ai/effect"
-import { AnthropicMessages, BedrockConverse } from "@opencode/ai/protocols"
-import { BedrockCache } from "@opencode/ai/protocols/utils/bedrock-cache"
-import { claudeVersion } from "@opencode/ai/protocols/utils/claude-model"
-import { mergeJsonRecords, mergeProviderOptions, mergeTransport, type StreamOptions } from "@opencode/ai/route"
+import type { StreamOptions } from "@opencode/ai/route"
 import type {
   SessionCompaction,
   SessionContext,
@@ -33,7 +29,7 @@ import type {
 import type { Agent } from "@opencode/schema/agent"
 import type { Model } from "@opencode/schema/model"
 import type { Content } from "@opencode/schema/tool"
-import { Context, Effect, Layer, Option, Stream } from "effect"
+import { Context, Effect, Layer, Stream } from "effect"
 import { HttpClientRequest, HttpClientResponse } from "effect/http"
 import { makeLocationNode } from "@opencode/util/effect/app-node"
 import { App } from "../app.js"
@@ -41,19 +37,27 @@ import { Instructions } from "../instructions/index.js"
 import { Permission } from "../permission.js"
 import { PluginHooks } from "../plugin/hooks.js"
 import { QuestionTool } from "../tool/plugin/question.js"
-import { ToolUserStop } from "../tool/user-stop.js"
 import { Tool } from "../tool.js"
 import { SessionAffinity } from "./affinity.js"
-import type { CacheLedger } from "./cache/ledger.js"
-import { CacheModel } from "./cache/model.js"
-import { SessionCache } from "./cache/service.js"
-import { CacheWire } from "./cache/wire.js"
 import { SessionModelTransport } from "./model-transport.js"
 import { SessionRunnerModel } from "./runner/model.js"
 import { SessionSchema } from "./schema.js"
 import { SessionSystemPrompt } from "./system-prompt.js"
-import { toLLMMessages, type DroppedReasoning } from "./runner/to-llm-message.js"
+import { toLLMMessages } from "./runner/to-llm-message.js"
 import type { SessionMessage } from "./message.js"
+
+import type { CachePolicyObject } from "@opencode/ai/effect"
+import { AnthropicMessages, BedrockConverse } from "@opencode/ai/protocols"
+import { BedrockCache } from "@opencode/ai/protocols/utils/bedrock-cache"
+import { claudeVersion } from "@opencode/ai/protocols/utils/claude-model"
+import { mergeJsonRecords, mergeProviderOptions, mergeTransport } from "@opencode/ai/route"
+import { Option } from "effect"
+import { ToolUserStop } from "../tool/user-stop.js"
+import type { CacheLedger } from "./cache/ledger.js"
+import { CacheModel } from "./cache/model.js"
+import { SessionCache } from "./cache/service.js"
+import { CacheWire } from "./cache/wire.js"
+import type { DroppedReasoning } from "./runner/to-llm-message.js"
 
 const IMAGE_BYTES_TRIGGER = 25 * 1024 * 1024 // 25 MiB
 const IMAGE_BYTES_TARGET = 15 * 1024 * 1024 // 15 MiB

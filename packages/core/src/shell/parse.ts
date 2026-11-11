@@ -4,11 +4,12 @@ import { Effect, Result } from "effect"
 import fs from "fs"
 import os from "os"
 import path from "path"
-import { ShellPowerShell } from "./powershell.js"
 import { ShellScan } from "./scan.js"
 import { ShellSelect } from "./select.js"
-import { ShellUnwrap } from "./unwrap.js"
 import { Wildcard } from "../util/wildcard.js"
+
+import { ShellPowerShell } from "./powershell.js"
+import { ShellUnwrap } from "./unwrap.js"
 
 type Part = { type: string; text: string; raw: string; unquotedTilde?: boolean }
 const CWD = new Set(["cd", "chdir", "popd", "pushd", "push-location", "set-location"])

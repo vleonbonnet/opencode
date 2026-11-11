@@ -5,7 +5,7 @@ import { Session } from "@opencode/schema/session"
 import { SessionStats } from "@opencode/schema/session-stats"
 import { InstructionEntry } from "@opencode/schema/instruction-entry"
 import { Project } from "@opencode/schema/project"
-import { DateTimeUtcFromMillis, NonNegativeInt, optional, PositiveInt } from "@opencode/schema/schema"
+import { DateTimeUtcFromMillis, NonNegativeInt, PositiveInt } from "@opencode/schema/schema"
 import { Event } from "@opencode/schema/event"
 import { SessionLegacy } from "@opencode/schema/session-legacy"
 import { Context, Schema, SchemaGetter, Struct } from "effect"
@@ -36,9 +36,11 @@ import { SessionEvent } from "@opencode/schema/session-event"
 import { EventLog } from "@opencode/schema/event-log"
 import { FileDiff } from "@opencode/schema/file-diff"
 import { Form } from "@opencode/schema/form"
+import { PublicSessionMessage } from "./message.js"
+
+import { optional } from "@opencode/schema/schema"
 import { SessionCache } from "@opencode/schema/session-cache"
 import { SessionSearch } from "@opencode/schema/session-search"
-import { PublicSessionMessage } from "./message.js"
 
 const SessionActive = Schema.Struct({
   type: Schema.Literal("running"),

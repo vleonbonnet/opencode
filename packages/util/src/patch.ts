@@ -2,6 +2,7 @@ export * as Patch from "./patch.js"
 
 import { Result, Schema } from "effect"
 import { Bom } from "./bom.js"
+
 import { LineEnding } from "./line-ending.js"
 
 export class BoundaryError extends Schema.TaggedError<BoundaryError>()("Patch.BoundaryError", {

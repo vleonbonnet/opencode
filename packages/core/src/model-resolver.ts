@@ -13,7 +13,6 @@ import {
 } from "@opencode/ai/effect"
 import { Auth, mergeTransport } from "@opencode/ai/route"
 import { Context, Effect, Layer, Schema, Struct } from "effect"
-import { Hash } from "@opencode/util/hash"
 import { AISDK } from "./aisdk.js"
 import { Credential } from "./credential.js"
 import { Integration } from "./integration.js"
@@ -21,6 +20,8 @@ import { Capabilities, Compatibility, ID, Info, Model, Ref, VariantID } from "./
 import type { RuntimeInfo } from "./model.js"
 import { Npm } from "@opencode/util/npm"
 import { Provider } from "./provider.js"
+
+import { Hash } from "@opencode/util/hash"
 
 export class VariantUnavailableError extends Schema.TaggedError<VariantUnavailableError>()(
   "SessionRunnerModel.VariantUnavailableError",

@@ -43,8 +43,6 @@ import { Schedule } from "@opencode/schema/schedule"
 import { Session } from "@opencode/schema/session"
 import { SessionMessage } from "@opencode/schema/session-message"
 import { SessionInbox } from "@opencode/schema/session-inbox"
-import { SessionCache } from "@opencode/schema/session-cache"
-import { SessionSearch } from "@opencode/schema/session-search"
 import { Shell } from "@opencode/schema/shell"
 import { Skill } from "@opencode/schema/skill"
 import { Snapshot } from "@opencode/schema/snapshot"
@@ -54,6 +52,9 @@ import { WebSearch } from "@opencode/schema/websearch"
 import { Workspace } from "@opencode/schema/workspace"
 import { Effect, Schema } from "effect"
 import { fileURLToPath } from "url"
+
+import { SessionCache } from "@opencode/schema/session-cache"
+import { SessionSearch } from "@opencode/schema/session-search"
 
 const promiseContract = compile(ClientApi, {
   groupNames,

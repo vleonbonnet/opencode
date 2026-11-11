@@ -1,15 +1,16 @@
 export * as Command from "./command.js"
 
 import { Command } from "@opencode/schema/command"
-import type { Model } from "@opencode/schema/model"
 import type { PromptInput } from "@opencode/schema/prompt-input"
-import type { PromptMetadata } from "@opencode/schema/session-cache"
 import type { Session } from "@opencode/schema/session"
 import type { SessionInbox } from "@opencode/schema/session-inbox"
 import { makeLocationNode } from "@opencode/util/effect/app-node"
 import { Context, Effect, Layer, Schema } from "effect"
 import { Bus } from "./bus.js"
 import { State } from "./state.js"
+
+import type { Model } from "@opencode/schema/model"
+import type { PromptMetadata } from "@opencode/schema/session-cache"
 
 export const Info = Command.Info
 export type Info = Command.Info

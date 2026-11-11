@@ -7,9 +7,10 @@ import { makeGlobalNode, makeLocationNode } from "@opencode/util/effect/app-node
 import { FSUtil } from "@opencode/util/fs-util"
 import { Global } from "@opencode/util/global"
 import { Identifier } from "@opencode/schema/identifier"
-import type { SessionError } from "@opencode/schema/session-error"
 import { FileRetention } from "./file-retention.js"
 import { State } from "./state.js"
+
+import type { SessionError } from "@opencode/schema/session-error"
 
 export const MAX_LINES = 2_000
 export const MAX_BYTES = 50 * 1024 // 50 KiB

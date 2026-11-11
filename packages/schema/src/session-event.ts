@@ -11,7 +11,6 @@ import { SessionID } from "./session-id.js"
 import { SessionMetadata } from "./session-metadata.js"
 import { Location } from "./location.js"
 import { SessionMessage } from "./session-message.js"
-import { SessionCache } from "./session-cache.js"
 import { Revert } from "./session-revert.js"
 import { Shell as ShellSchema } from "./shell.js"
 import { SessionError } from "./session-error.js"
@@ -26,6 +25,8 @@ import { SessionInbox } from "./session-inbox.js"
 import { Project } from "./project.js"
 import { SessionFork } from "./session-fork.js"
 import { Permission } from "./permission.js"
+
+import { SessionCache } from "./session-cache.js"
 import { SessionDelegator } from "./session-delegator.js"
 
 const Base = {

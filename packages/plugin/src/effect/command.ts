@@ -1,11 +1,12 @@
 import type { CommandApi } from "@opencode/client/effect/api"
-import type { Model } from "@opencode/schema/model"
 import type { PromptInput } from "@opencode/schema/prompt-input"
-import type { PromptMetadata } from "@opencode/schema/session-cache"
 import type { Session } from "@opencode/schema/session"
 import type { SessionInbox } from "@opencode/schema/session-inbox"
 import type { Effect } from "effect"
 import type { Transform } from "./registration.js"
+
+import type { Model } from "@opencode/schema/model"
+import type { PromptMetadata } from "@opencode/schema/session-cache"
 
 export interface CommandInvocation {
   readonly sessionID: Session.ID
