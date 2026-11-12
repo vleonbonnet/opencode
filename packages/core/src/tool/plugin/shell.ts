@@ -5,10 +5,13 @@ import type { Context } from "@opencode/plugin/effect/plugin"
 import type { SessionHooks } from "@opencode/plugin/effect/session"
 import type { ShellCreateBefore } from "@opencode/plugin/effect/shell"
 import type { Tool } from "@opencode/schema/tool"
+import type { FileDiff } from "@opencode/schema/file-diff"
 import { Deferred, Effect, Schema, Scope } from "effect"
+import path from "path"
 import { Environment } from "../../environment/index.js"
 import { Job } from "../../job.js"
 import { FileAccess } from "../../file-access.js"
+import { Location } from "../../location.js"
 import { Permission } from "../../permission.js"
 import { NonNegativeInt } from "../../schema.js"
 import { Session } from "../../session.js"
@@ -17,6 +20,7 @@ import { Shell } from "../../shell.js"
 import { ShellParse } from "../../shell/parse.js"
 import { ShellSelect } from "../../shell/select.js"
 import { ShellResult } from "../../shell/result.js"
+import { Snapshot } from "../../snapshot.js"
 
 export const name = "shell"
 export const DEFAULT_TIMEOUT_MS = 2 * 60 * 1_000
@@ -90,7 +94,16 @@ const resultMessages = (output: Output) => {
   return [...(output.output ? [output.output] : []), ...(notice ? [notice] : [])]
 }
 
-const toolResult = (output: Output) => {
+// A command can rewrite a whole tree, as a checkout does: its report keeps the first files' diffs and counts the rest.
+const MAX_CHANGED_FILES = 50
+const MAX_CHANGED_PATCH_BYTES = 512 * 1024
+
+interface Changes {
+  readonly files: readonly FileDiff.Info[]
+  readonly omitted: number
+}
+
+const toolResult = (output: Output, changes?: Changes) => {
   return {
     output,
     content: resultMessages(output).map((text) => ({ type: "text" as const, text })),
@@ -98,6 +111,8 @@ const toolResult = (output: Output) => {
       status: output.status,
       ...ShellResult.metadata(output),
       ...(output.shellID !== undefined ? { shellID: output.shellID } : {}),
+      ...(changes ? { files: changes.files } : {}),
+      ...(changes?.omitted ? { filesOmitted: changes.omitted } : {}),
     },
   }
 }
@@ -121,7 +136,37 @@ export const Plugin = {
     const shellSelect = yield* ShellSelect.Service
     const compatibleShell = shellSelect.resolve({ priority: "compat" })
     const permission = yield* Permission.Service
+    const snapshots = yield* Snapshot.Service
+    const location = yield* Location.Service
 
+    // Files are named as the edit tool names them, relative to the Location, while a snapshot names them from the
+    // project root.
+    const changes = Effect.fn("ShellTool.changes")(
+      function* (before: Snapshot.ID) {
+        const after = yield* snapshots.capture()
+        if (!after || after === before) return undefined
+        const paths = yield* snapshots.files({ from: before, to: after })
+        if (paths.length === 0) return undefined
+        const diffs = yield* snapshots.diff({ from: before, to: after, paths: paths.slice(0, MAX_CHANGED_FILES) })
+        const files = diffs.reduce(
+          (result, diff) => {
+            const relative = path
+              .relative(location.directory, path.join(location.project.directory, diff.file))
+              .replaceAll("\\", "/")
+            const file = relative.startsWith("..") ? diff.file : relative
+            const bytes = Buffer.byteLength(diff.patch)
+            const fits = result.bytes + bytes <= MAX_CHANGED_PATCH_BYTES
+            return {
+              bytes: fits ? result.bytes + bytes : result.bytes,
+              files: [...result.files, { ...diff, file, patch: fits ? diff.patch : "" }],
+            }
+          },
+          { bytes: 0, files: [] as FileDiff.Info[] },
+        ).files
+        return { files, omitted: paths.length - files.length } satisfies Changes
+      },
+      Effect.catch((cause) => Effect.logWarning("failed to diff shell changes", { cause }).pipe(Effect.as(undefined))),
+    )
     const prepare = Effect.fn("ShellTool.prepare")(function* (invocation: ShellCreateBefore, context: Tool.Context) {
       const target = yield* access.resolve({ path: invocation.cwd, kind: "directory" })
       invocation.cwd = target.absolute
@@ -207,6 +252,8 @@ export const Plugin = {
             Effect.gen(function* () {
               const timeout = input.background === true ? (input.timeout ?? 0) : (input.timeout ?? DEFAULT_TIMEOUT_MS)
               let finalTimeout = timeout
+              // Taken once approved, as the command starts: what it changes is reviewed as an edit is.
+              let before: Snapshot.ID | undefined
               const info = yield* shell.create(
                 {
                   command: input.command,
@@ -222,6 +269,7 @@ export const Plugin = {
                     invocation.env.AI_AGENT ||= "opencode"
                     invocation.env.OPENCODE_SESSION_ID = context.sessionID
                     finalTimeout = yield* prepare(invocation, context)
+                    if (input.background !== true) before = yield* snapshots.capture()
                   }),
               )
               yield* context.progress({ shellID: info.id })
@@ -261,7 +309,7 @@ export const Plugin = {
               if (input.background === true) {
                 yield* jobs.background(job.id)
                 yield* notifyWhenDone(context.sessionID, job.id, info.id, info.command, settled)
-                return backgroundResult(info.id, info.file)
+                return toolResult(backgroundResult(info.id, info.file))
               }
 
               const result = yield* jobs
@@ -270,15 +318,15 @@ export const Plugin = {
               if (result?.type === "backgrounded") {
                 yield* shell.timeout(info.id, 0)
                 yield* notifyWhenDone(context.sessionID, job.id, info.id, info.command, settled)
-                return backgroundResult(info.id, info.file)
+                return toolResult(backgroundResult(info.id, info.file))
               }
               if (result?.info.status === "error")
                 return yield* Effect.fail(new Error(result.info.error ?? "Command failed"))
               if (result?.info.status === "cancelled") return yield* Effect.fail(new Error("Command cancelled"))
 
-              return yield* Deferred.await(settled)
+              const output = yield* Deferred.await(settled)
+              return toolResult(output, before ? yield* changes(before) : undefined)
             }).pipe(
-              Effect.map(toolResult),
               Effect.mapError(
                 (error) => new ToolFailure({ message: `Unable to execute command: ${input.command}`, error }),
               ),

@@ -22,6 +22,11 @@ export interface Written extends FileMutation.TextWriteResult {
   readonly formatted?: string
 }
 
+export interface WholeWritten extends Written {
+  /** The change the write made, formatting included. */
+  readonly diff: FileDiff.Info
+}
+
 export interface Interface {
   /** Resolve a file to write and obtain external-directory approval. */
   readonly target: (
@@ -44,7 +49,7 @@ export interface Interface {
     input: WriteInput,
     context: FileAccess.Invocation,
   ) => Effect.Effect<
-    Written,
+    WholeWritten,
     Environment.NotFound | Environment.WrongKind | Environment.Failed | Permission.Error | SessionErrors.NotFoundError
   >
 }
@@ -92,12 +97,14 @@ const layer = Layer.effect(
     const write = Effect.fn("FileWrite.write")(function* (input: WriteInput, context: FileAccess.Invocation) {
       const resolved = yield* target(input.path, context)
       const current = yield* FileMutation.readOptionalText(environment.files, resolved.absolute)
-      yield* authorize(
-        resolved,
-        context,
-        fileDiff(resolved.resource, current?.text ?? "", Bom.split(input.content).text, current ? "modified" : "added"),
-      )
-      return yield* commit(resolved, input.content)
+      const status = current ? "modified" : "added"
+      const content = Bom.split(input.content).text
+      yield* authorize(resolved, context, fileDiff(resolved.resource, current?.text ?? "", content, status))
+      const written: Written = yield* commit(resolved, input.content)
+      return {
+        ...written,
+        diff: fileDiff(resolved.resource, current?.text ?? "", written.formatted ?? content, status),
+      } satisfies WholeWritten
     })
 
     return Service.of({ target, authorize, commit, write })

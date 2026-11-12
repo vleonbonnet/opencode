@@ -126,6 +126,17 @@ describe("WriteTool", () => {
               existed: false,
             },
             content: [{ type: "text", text: "Created file successfully: src/new.txt" }],
+            metadata: {
+              files: [
+                {
+                  file: "src/new.txt",
+                  status: "added",
+                  additions: 1,
+                  deletions: 0,
+                  patch: expect.stringContaining("+created"),
+                },
+              ],
+            },
           })
           expect(yield* Effect.promise(() => fs.readFile(path.join(tmp.path, "src", "new.txt"), "utf8"))).toBe(
             "created",
@@ -163,8 +174,18 @@ describe("WriteTool", () => {
         })
       return withTool(tmp.path, fixture, (registry) =>
         Effect.gen(function* () {
+          yield* Effect.promise(() => fs.writeFile(target, "old\n"))
           expect(yield* executeTool(registry, call({ path: "formatted.txt", content: "format me" }))).toMatchObject({
             status: "completed",
+            metadata: {
+              files: [
+                {
+                  file: "formatted.txt",
+                  status: "modified",
+                  patch: expect.stringMatching(/-old\n[\s\S]*\+FORMAT ME/),
+                },
+              ],
+            },
           })
           expect(yield* Effect.promise(() => fs.readFile(target, "utf8"))).toBe("FORMAT ME")
         }),

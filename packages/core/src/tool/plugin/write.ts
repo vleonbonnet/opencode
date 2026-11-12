@@ -55,13 +55,20 @@ export const Plugin = {
             Effect.gen(function* () {
               const written = yield* fileWrite.write(input, context)
               return {
-                operation: written.operation,
-                target: written.target,
-                resource: written.resource,
-                existed: written.existed,
+                output: {
+                  operation: written.operation,
+                  target: written.target,
+                  resource: written.resource,
+                  existed: written.existed,
+                },
+                files: [written.diff],
               }
             }).pipe(
-              Effect.map((output) => ({ output, content: toModelContent(output) })),
+              Effect.map((result) => ({
+                output: result.output,
+                content: toModelContent(result.output),
+                metadata: { files: result.files },
+              })),
               Effect.mapError((error) => new ToolFailure({ message: `Unable to write ${input.path}`, error })),
             ),
         }),
