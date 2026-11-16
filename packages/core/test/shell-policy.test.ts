@@ -93,18 +93,20 @@ describe("ShellPolicy denies recursive removal however a script runs it", () => 
   test.skipIf(!ShellUnwrap.CASELESS).each(["RM -rf build", "/bin/RM -rf build"])(
     "%s where file names ignore case",
     async (command) => {
-      expect(await decide(command)).toMatchObject({ effect: "deny", rule: rule("rm -r *", "deny", cleanup) })
+      expect(await decide(command)).toMatchObject({ effect: "deny", reason: `Permission denied: shell. ${cleanup}` })
     },
   )
 
   test("names the command, the rule and the spelling it matched", async () => {
-    expect(await decide("ls && sudo rm -fr build")).toEqual({
+    const decided = await decide("ls && sudo rm -fr build")
+    expect(decided).toMatchObject({
       effect: "deny",
       resource: "rm -fr build",
-      rule: rule("rm * -r *", "deny", cleanup),
       spelling: "rm -f -r build",
       reason: `Permission denied: shell. ${cleanup}`,
     })
+    // Windows matches rules without case, so `rm * -R *`, the later rule, decides there.
+    expect(decided.rule?.resource.toLowerCase()).toBe("rm * -r *")
   })
 })
 
