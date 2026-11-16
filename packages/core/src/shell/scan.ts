@@ -1036,8 +1036,9 @@ function scanBashOperatorOrSeparator(
       const delimiter = bashHeredocDelimiter(input, index + redirect.length, redirect === "<<-")
       if (!delimiter) return { kind: "opaque", reason: "invalid-redirect" }
       state.hasFileRedirect = true
-      state.redirectPrefixEnd ??=
-        " \t".includes(input[index + redirect.length] ?? "") ? index + redirect.length : delimiter.end + 1
+      state.redirectPrefixEnd ??= " \t".includes(input[index + redirect.length] ?? "")
+        ? index + redirect.length
+        : delimiter.end + 1
       state.heredocs.push({ ...delimiter, stage: bashStage(state), at: index })
       state.wordEnd = delimiter.end + 1
       state.redirectTarget = false
@@ -1193,7 +1194,8 @@ function scanBashCommandStart(
   const keywordStep = scanBashKeyword(state, index, depth, context)
   if (keywordStep !== undefined) return keywordStep
   if (structure?.kind === "for" && structure.phase === "do" && char !== "\n" && char !== "#" && char !== ";") {
-    if (char !== "{" || !testAt(SPACE_CONTINUATION_AHEAD_RE, input, index + 1)) return { kind: "opaque", reason: "compound-command" }
+    if (char !== "{" || !testAt(SPACE_CONTINUATION_AHEAD_RE, input, index + 1))
+      return { kind: "opaque", reason: "compound-command" }
     bashClose(state)
   }
   const atStart = atCommandStart(state)
@@ -1233,11 +1235,7 @@ function scanBashCommandStart(
     if (end) return end
     if (forHeader) return { kind: "opaque", reason: "invalid-structure" }
   }
-  if (
-    atStart &&
-    (char === "(" ||
-      (char === "{" && testAt(SPACE_CONTINUATION_AHEAD_RE, input, index + 1)))
-  ) {
+  if (atStart && (char === "(" || (char === "{" && testAt(SPACE_CONTINUATION_AHEAD_RE, input, index + 1)))) {
     const group = scanBash(
       input,
       index + 1,
@@ -1255,11 +1253,7 @@ function scanBashCommandStart(
     state.compoundEnd = true
     return group.end
   }
-  if (
-    atStart &&
-    compoundOpen === "[[" &&
-    testAt(SPACE_CONTINUATION_AHEAD_RE, input, index + 2)
-  ) {
+  if (atStart && compoundOpen === "[[" && testAt(SPACE_CONTINUATION_AHEAD_RE, input, index + 2)) {
     const end = scanBashConditional(input, index + 2, depth, context, state.commands)
     if (typeof end === "object") return end
     if (bashCrossesHeredoc(state, index, end)) return { kind: "opaque", reason: "heredoc" }
@@ -1698,7 +1692,10 @@ function scanBashDollarOrBacktick(
       (context.dialect !== "bash" &&
         input[start + 2] === "(" &&
         testAt(ZSH_SAFE_FLAGS_RE, input, start) &&
-        input.slice(start + 3, ZSH_SAFE_FLAGS_RE.lastIndex - 1).replace(ZSH_QUOTED_FLAG_ARG_RE, "").includes("P"))
+        input
+          .slice(start + 3, ZSH_SAFE_FLAGS_RE.lastIndex - 1)
+          .replace(ZSH_QUOTED_FLAG_ARG_RE, "")
+          .includes("P"))
     if (indirect) {
       context.variableSink = true
       if (bashEvaluatesExpansion(parameter, "binding", context)) return { kind: "opaque", reason: "dynamic-execution" }
@@ -2484,6 +2481,14 @@ function scanPowerShellList(
     const assign = inExpression && !clause && (char === "=" || (/[-+*/%]/.test(char) && input[index + 1] === "="))
     if (assign || (inExpression && close === ")" && !started && testAt(POWERSHELL_IN_RE, input, index))) {
       if (assign) finishWord(index)
+      // An environment variable it sets reaches the commands after it, as an exported POSIX assignment does.
+      if (assign && words.length === 1 && POWERSHELL_ENV_RE.test(words[0]))
+        commands.push({
+          resource: input.slice(segment, commandEnd).trimEnd(),
+          words: [...words],
+          rawWords: [...rawWords],
+          assignment: true,
+        })
       words.length = 0
       rawWords.length = 0
       wordEnds.length = 0
@@ -2741,6 +2746,7 @@ const POWERSHELL_KEYWORD_RE = /[A-Za-z]+(?=$|[\s&(),;{|}])/y
 const POWERSHELL_FOREACH_RE = /foreach\s*\(/isy
 const POWERSHELL_PARAM_RE = /param\s*\(/isy
 const POWERSHELL_IN_RE = /in(?=$|[\s&(),;{|}])/iy
+const POWERSHELL_ENV_RE = /^\$\{?env:/i
 const POWERSHELL_AT_OPENER_RE = /[({'"\p{L}\p{Nl}\d_?]/uy
 const POWERSHELL_INDEXABLE_VAR_RE = /(?::[\p{L}\p{Nl}\d_?]+|[\p{L}\p{Nl}\d_][\p{L}\p{Nl}\d_?]*)/uy
 const POWERSHELL_HERE_HEADER_RE = /@['"][^\S\r\n]*(?:\r\n|\r|\n)/y

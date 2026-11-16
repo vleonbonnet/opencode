@@ -1,5 +1,7 @@
 export * as ShellPowerShell from "./powershell.js"
 
+import { ShellUnwrap } from "./unwrap.js"
+
 // The cmdlets Windows PowerShell 5.1 runs for its built-in aliases, by the alias in lower case.
 const ALIASES: Record<string, string> = {
   "%": "ForEach-Object",
@@ -202,17 +204,27 @@ const PARAMETER = /^-([A-Za-z_?][\w?]*)(?::(.*))?$/s
 
 // The command written as WORDS, which keep their quoting, spelled as the cmdlet it runs: an alias or a cmdlet named by
 // its module as the cmdlet's own name, and each parameter of a cmdlet listed above under its full name, a switch set
-// with `:$true` written bare. Rules match command text, so one rule then sees each way of writing the command. None
-// when the words name no cmdlet listed here.
+// with `:$true` written bare. Rules match command text, so one rule then sees each way of writing the command. A
+// command naming no cmdlet listed here is a native one, spelled by its bare program name.
 export function spellings(words: readonly string[]): string[] {
   const name = cmdlet(words[0])
-  if (!name) return []
+  if (!name) return native(words)
   const parameters = PARAMETERS[name]
   const end = words.indexOf("--")
   const spelled = words
     .slice(1)
     .map((word, index) => (parameters && (end < 0 || index + 1 < end) ? parameter(word, parameters) : word))
   return [[name, ...spelled].join(" ")]
+}
+
+// A native command spelled by its program without directory or executable suffix and, where file names ignore case,
+// in lower case, as a POSIX command is (`C:\bin\Kubectl.exe delete` as `kubectl delete`); none when it is written so,
+// or its first word is no bare program name, such as an expression or a quoted string.
+function native(words: readonly string[]) {
+  if (!words.length || !/^[\w~][\w.~:\\/-]*$/.test(words[0])) return []
+  const bare = ShellUnwrap.program(words[0])
+  const program = ShellUnwrap.CASELESS ? bare.toLowerCase() : bare
+  return program === words[0] ? [] : [[program, ...words.slice(1)].join(" ")]
 }
 
 // The cmdlet WORD runs, when it names one listed here.

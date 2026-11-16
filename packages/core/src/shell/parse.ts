@@ -183,7 +183,7 @@ export function scan(command: string, shell: string, cwd: string): Effect.Effect
       const nested = ShellScan.scanPowerShell(text)
       if (nested.kind === "opaque") return
       return nested.commands
-        .filter((item) => !item.declaration && !item.assignment && !foreachBlock(item))
+        .filter((item) => !item.declaration && !foreachBlock(item))
         .map((item) => ({ text: item.resource, words: portableWords(item) }))
     }
     const options: Options = {
@@ -226,6 +226,8 @@ type Options = {
   commands: (script: Script) => ShellUnwrap.Unwrapped[] | undefined
   // The commands of a script handed to PowerShell, each as written and as its words; none when it cannot be read.
   powershellCommands: (text: string) => PowerShellCommand[] | undefined
+  // How many scripts handed to cmd, fish or csh the commands being read are nested in.
+  foreign?: number
 }
 type PowerShellCommand = { text: string; words: string[] }
 type Script = ShellUnwrap.Script
@@ -299,7 +301,8 @@ function portableCommands(output: Collector, scanned: Portable, options: Options
       output.command(resource, `${head}${separator}*`)
       continue
     }
-    // Declarations and assignments are checked as written, which the substitutions within them are as well.
+    // Declarations and assignments are checked as written, which the substitutions within them are as well. PowerShell
+    // reports only those setting environment variables.
     if (item.declaration || item.assignment) {
       if (options.posix)
         variables(
@@ -309,6 +312,7 @@ function portableCommands(output: Collector, scanned: Portable, options: Options
           Boolean(item.declaration),
           redirects(item, place, spans),
         )
+      else if (powershell) output.command(resource, exact(resource))
       continue
     }
     const words = portableWords(item)
@@ -383,6 +387,7 @@ function portableCommands(output: Collector, scanned: Portable, options: Options
     )
     scripts.push(...found.scripts)
     powershellScripts(output, found.powershell, options)
+    scripts.push(...foreignScripts(output, found, options))
     const downstream = scanned.downstream.get(item)
     if (downstream)
       reads.push(
@@ -527,6 +532,7 @@ function emit(output: Collector, reads: readonly Read[], options: Options) {
       )
       scripts.push(...found.scripts)
       powershellScripts(output, found.powershell, options)
+      scripts.push(...foreignScripts(output, found, options))
     }
     scripts.push(...item.scripts)
   }
@@ -657,6 +663,30 @@ function powershellScripts(output: Collector, texts: readonly string[], options:
   for (const text of texts)
     for (const command of options.powershellCommands(text) ?? [])
       if (command.words.length) powershellCommand(output, command, exact(command.text), options, depth)
+}
+
+// Reads each script FOUND hands to cmd, fish or csh command by command as a POSIX script, whose simple commands
+// those shells write alike, while the script stays checked whole as written as well. One that cannot be read so is
+// checked whole only. Returns the scripts its commands hand to a POSIX shell.
+function foreignScripts(output: Collector, found: ShellUnwrap.Unwrapped, options: Options): Script[] {
+  const texts = found.texts.filter((text) => !found.powershell.includes(text))
+  if (!texts.length) return []
+  const depth = (options.foreign ?? 0) + 1
+  if (depth > ShellUnwrap.MAX_SCRIPT_DEPTH) {
+    output.fail(`Shell command nests scripts more than ${ShellUnwrap.MAX_SCRIPT_DEPTH} levels deep`)
+    return []
+  }
+  return texts.flatMap((text) => {
+    const nested = ShellScan.statements(text, "posix")
+    if (nested.kind === "opaque") return []
+    return portableCommands(output, nested, {
+      ...options,
+      powershell: false,
+      posix: true,
+      dialect: "posix",
+      foreign: depth,
+    })
+  })
 }
 
 // The command as its bare program name runs it, when that differs from the program as written.

@@ -36,6 +36,8 @@ const MAX_INPUTS = 16
 const ASSIGNMENT = /^[A-Za-z_][A-Za-z0-9_]*=/
 const CLUSTER = /^-[A-Za-z]{2,}$/
 const STDIN = new Set(["-", "/dev/stdin", "/dev/fd/0", "/proc/self/fd/0"])
+// Where file names ignore case, as on macOS and Windows volumes by default, `RM` runs rm.
+export const CASELESS = process.platform === "darwin" || process.platform === "win32"
 
 // How a command reads its options, getopt style: `values` take the rest of a short cluster, what follows `=`, or
 // else the next word; `optional` take a value only when it is attached; `flags` take none; after one of `none` no
@@ -145,7 +147,8 @@ const RUNNERS: Record<string, Grammar> = {
     none: ["-m", "--max", "-p", "--pid", ...HELP],
     operands: 1,
   },
-  command: { flags: ["-p", "-v", "-V"] },
+  // -v and -V only tell what a name is.
+  command: { flags: ["-p"], none: ["-v", "-V"] },
   coproc: {},
   doas: { values: ["-a", "-C", "-u"], flags: ["-L", "-n", "-s"], shell: ["-s"] },
   env: {
@@ -1211,11 +1214,14 @@ export function spellings(item: View) {
   return [...new Set(forms.map((form) => form.join(" ")))]
 }
 
-// The command named by its bare program when that differs from the program as written (`/bin/rm`, `rm.exe`): another
-// file may run under that name, so it is a command of its own, which must be allowed as well.
+// The command named by its bare program when that differs from the program as written (`/bin/rm`, `rm.exe`, or `RM`
+// where file names ignore case): another file may run under that name, so it is a command of its own, which must be
+// allowed as well.
 export function renamed(item: View): View | undefined {
-  if (dynamic(item.program) || literal(item.program) === item.name) return
-  return { name: item.name, program: quote(item.name), args: item.args }
+  if (dynamic(item.program)) return
+  const name = CASELESS ? item.name.toLowerCase() : item.name
+  if (literal(item.program) === name) return
+  return { name, program: quote(name), args: item.args }
 }
 
 // The words of ITEM unquoted when every one is static, else as written: the spelling an approval saves.
