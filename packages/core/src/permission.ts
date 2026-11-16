@@ -13,6 +13,7 @@ import { SessionStore } from "./session/store.js"
 import { Wildcard } from "./util/wildcard.js"
 import { PermissionSaved } from "./permission/saved.js"
 import { PermissionDelegation } from "./permission/delegation.js"
+import { PermissionMatch } from "./permission/match.js"
 import { PluginHooks } from "./plugin/hooks.js"
 
 const PermissionEffect = Permission.Effect
@@ -93,40 +94,10 @@ export class NotFoundError extends Schema.TaggedError<NotFoundError>()("Permissi
 
 export type Error = BlockedError | CorrectedError
 
-export function evaluate(action: string, resource: string, ...rulesets: Permission.Ruleset[]): Permission.Rule {
-  return (
-    deciding(action, resource, ...rulesets) ?? {
-      action,
-      resource: "*",
-      effect: "ask",
-    }
-  )
-}
-
-// The rule that decides ACTION on RESOURCE, the last one matching; none when no rule matches, and asking is the
-// default.
-export function deciding(action: string, resource: string, ...rulesets: Permission.Ruleset[]) {
-  return rulesets
-    .flat()
-    .findLast((rule) => Wildcard.match(action, rule.action) && Wildcard.match(resource, rule.resource))
-}
-
-// The spellings of the resource at INDEX of a request: the resource, then its alternates.
-export function spellings(input: Pick<Request, "resources" | "alternates">, index: number) {
-  return [input.resources[index], ...(input.alternates?.[index] ?? [])]
-}
-
-// The rule that decides ACTION on a resource written as SPELLINGS: the latest rule in the merged order that matches
-// any of them, with the spelling it matched; none when no rule matches any, and asking is the default.
-export function decidingAny(action: string, spellings: readonly string[], ...rulesets: Permission.Ruleset[]) {
-  const rules = rulesets.flat()
-  for (let index = rules.length - 1; index >= 0; index--) {
-    const rule = rules[index]
-    if (!Wildcard.match(action, rule.action)) continue
-    const spelling = spellings.find((item) => Wildcard.match(item, rule.resource))
-    if (spelling !== undefined) return { rule, spelling }
-  }
-}
+export const evaluate = PermissionMatch.evaluate
+export const deciding = PermissionMatch.deciding
+export const spellings = PermissionMatch.spellings
+export const decidingAny = PermissionMatch.decidingAny
 
 export function merge(...rulesets: Permission.Ruleset[]): Permission.Ruleset {
   return rulesets.flat()
@@ -254,26 +225,28 @@ const layer = Layer.effect(
       }
     })
 
-    // A resource is denied when the configured rule deciding any of its spellings denies it.
-    function denied(input: Pick<Request, "action" | "resources" | "alternates">, rules: Permission.Ruleset) {
-      return input.resources.some((_, index) =>
-        spellings(input, index).some((spelling) => evaluate(input.action, spelling, rules).effect === "deny"),
-      )
-    }
-
     function relevant(input: AssertInput, rules: Permission.Ruleset) {
       return rules.filter((rule) => Wildcard.match(input.action, rule.action))
     }
 
     const evaluateInput = Effect.fnUntraced(function* (input: AssertInput) {
       const { rules, ceilings } = yield* configured(input.sessionID, input.agent)
-      if (denied(input, rules)) return { effect: "deny" as const, rules, reasons: [] }
-      const ceiling = ceilings.find((item) => denied(input, item.rules))
+      // A resource is denied when the configured rule deciding any of its spellings denies it.
+      const denial = PermissionMatch.denial(input, rules)
+      if (denial) {
+        const message = PermissionMatch.reason(input.action, denial.rule)
+        return { effect: "deny" as const, rules, reasons: [], ...(message === undefined ? {} : { message }) }
+      }
+      const ceiling = ceilings
+        .map((item) => ({ item, denial: PermissionMatch.denial(input, item.rules) }))
+        .find((found) => found.denial !== undefined)
       if (ceiling)
         return {
           effect: "deny" as const,
-          rules: ceiling.rules,
-          message: delegatedDenial(input.action, ceiling),
+          rules: ceiling.item.rules,
+          message: [delegatedDenial(input.action, ceiling.item), ceiling.denial?.rule.message]
+            .filter((text) => text !== undefined)
+            .join(" "),
           reasons: [],
         }
       const saved = yield* savedRules()

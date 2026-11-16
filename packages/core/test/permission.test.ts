@@ -604,6 +604,25 @@ describe("shell command spellings", () => {
     }),
   )
 
+  it.live("tells the agent the message of the rule that denies a command", () =>
+    Effect.gen(function* () {
+      const message = "Run `agent-cleanup -- PATH...` instead."
+      yield* setup([rule("*", "allow"), { ...rule("rm -r *", "deny"), message }])
+      const service = yield* Permission.Service
+      const parsed = yield* ShellParse.scan("ls; rm -rf build", "bash", "/project")
+      const blocked = yield* service
+        .assert({ ...assertion({ action: "shell" }), ...shellRequest(parsed) })
+        .pipe(Effect.flip)
+      expect(blocked).toBeInstanceOf(Permission.BlockedError)
+      expect(blocked.message).toBe(`Permission denied: shell. ${message}`)
+      yield* setRules([rule("*", "allow"), rule("rm -r *", "deny")])
+      const plain = yield* service
+        .assert({ ...assertion({ action: "shell" }), ...shellRequest(parsed) })
+        .pipe(Effect.flip)
+      expect(plain.message).toBe("Permission denied: shell")
+    }),
+  )
+
   it.live("names the spelling and the rule that asks", () =>
     Effect.gen(function* () {
       yield* setup([
@@ -919,9 +938,7 @@ describe("shell scanner permission impact", () => {
           const parsed = yield* ShellParse.scan(fixture.command, fixture.shell, "/project")
           expect(parsed.commands.length).toBeGreaterThan(0)
           expect(parsed.directories).toEqual([])
-          const result = yield* service.ask(
-            assertion({ action: "shell", ...shellRequest(parsed) }),
-          )
+          const result = yield* service.ask(assertion({ action: "shell", ...shellRequest(parsed) }))
           expect(result.effect).toBe(scenario.expected[1])
           const pending = yield* service.list()
           expect(pending).toHaveLength(result.effect === "ask" ? 1 : 0)
@@ -999,10 +1016,7 @@ describe("shell scanner permission impact", () => {
       shell: "bash",
       command: "FOO=bar > output; printf done",
       // The assignment is read as one, with its redirect in its text, and saved with it.
-      grants: [
-        ["printf *"],
-        ["FOO=bar > output", "printf *"],
-      ],
+      grants: [["printf *"], ["FOO=bar > output", "printf *"]],
       repeat: [
         ["allow", "allow"],
         ["allow", "allow"],
@@ -1014,10 +1028,7 @@ describe("shell scanner permission impact", () => {
       name: "PowerShell method prefix",
       shell: "pwsh",
       command: '[IO.File]::Delete("C:\\first")',
-      grants: [
-        ["[IO.File]::Delete(*"],
-        ["[IO.File]::Delete(*"],
-      ],
+      grants: [["[IO.File]::Delete(*"], ["[IO.File]::Delete(*"]],
       repeat: [
         ["allow", "allow"],
         ["allow", "allow"],
@@ -1044,9 +1055,7 @@ describe("shell scanner permission impact", () => {
         const service = yield* Permission.Service
         const saved = yield* PermissionSaved.Service
         const parsed = yield* ShellParse.scan(fixture.command, fixture.shell, "/project")
-        const first = yield* service.ask(
-          assertion({ action: "shell", ...shellRequest(parsed) }),
-        )
+        const first = yield* service.ask(assertion({ action: "shell", ...shellRequest(parsed) }))
         expect(first.effect).toBe("ask")
         expect(yield* service.list()).toHaveLength(1)
         yield* service.reply({ requestID: first.id, reply: "always" })
@@ -1057,9 +1066,7 @@ describe("shell scanner permission impact", () => {
 
         for (const command of [fixture.command, fixture.next]) {
           const parsed = yield* ShellParse.scan(command, fixture.shell, "/project")
-          const result = yield* service.ask(
-            assertion({ action: "shell", ...shellRequest(parsed) }),
-          )
+          const result = yield* service.ask(assertion({ action: "shell", ...shellRequest(parsed) }))
           expect(result.effect, command).toBe(command === fixture.next ? fixture.nextEffect[1] : fixture.repeat[1]?.[1])
           if (result.effect === "ask") yield* service.reply({ requestID: result.id, reply: "once" })
           expect(yield* service.list()).toEqual([])

@@ -21277,6 +21277,9 @@
           },
           "effect": {
             "$ref": "#/components/schemas/Permission.Effect"
+          },
+          "message": {
+            "type": "string"
           }
         },
         "required": ["action", "resource", "effect"],

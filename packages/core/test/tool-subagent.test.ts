@@ -662,11 +662,13 @@ describe("SubagentTool", () => {
       Effect.flatMap((dir) =>
         Effect.gen(function* () {
           const push: Permission.Rule = { action: "shell", resource: "git push *", effect: "ask" }
+          const cleanup = "Run `agent-cleanup -- PATH...` instead."
           const { permission, delegate } = yield* planDelegation(dir.path, {
             plan: [
               { action: "subagent", resource: "reviewer", effect: "allow" },
               { action: "shell", resource: "*", effect: "allow" },
               { action: "shell", resource: "rm *", effect: "deny" },
+              { action: "shell", resource: "rm -r *", effect: "deny", message: cleanup },
               push,
             ],
             subagents: { reviewer: [{ action: "shell", resource: "*", effect: "allow" }] },
@@ -677,6 +679,13 @@ describe("SubagentTool", () => {
 
           // Only the bare spelling matches plan's deny.
           expect((yield* ask("/usr/bin/rm -rf src", "rm -rf src")).effect).toBe("deny")
+          // The child is told why plan denies it, after whose rule denies it.
+          const blocked = yield* permission
+            .assert({ sessionID: child, action: "shell", resources: ["rm -r src"] })
+            .pipe(Effect.flip)
+          expect(blocked.message).toBe(
+            `Permission denied: shell. The ${planAgent} agent that delegated this task does not permit it. ${cleanup}`,
+          )
           // The child's own rules allow the push; plan's ask decides it, through the bare spelling.
           const asked = yield* ask("/usr/bin/git push origin", "git push origin")
           expect(asked.effect).toBe("ask")

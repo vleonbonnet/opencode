@@ -1,0 +1,67 @@
+export * as PermissionMatch from "./match.js"
+
+import type { Permission } from "@opencode/schema/permission"
+import { Wildcard } from "../util/wildcard.js"
+
+// How rules decide a request, without the services that collect them, so agents other than OpenCode can bundle it.
+
+export function evaluate(action: string, resource: string, ...rulesets: Permission.Ruleset[]): Permission.Rule {
+  return (
+    deciding(action, resource, ...rulesets) ?? {
+      action,
+      resource: "*",
+      effect: "ask",
+    }
+  )
+}
+
+// The rule that decides ACTION on RESOURCE, the last one matching; none when no rule matches, and asking is the
+// default.
+export function deciding(action: string, resource: string, ...rulesets: Permission.Ruleset[]) {
+  return rulesets
+    .flat()
+    .findLast((rule) => Wildcard.match(action, rule.action) && Wildcard.match(resource, rule.resource))
+}
+
+// The spellings of the resource at INDEX of a request: the resource, then its alternates.
+export function spellings(input: Pick<Permission.Request, "resources" | "alternates">, index: number) {
+  return [input.resources[index], ...(input.alternates?.[index] ?? [])]
+}
+
+// The rule that decides ACTION on a resource written as SPELLINGS: the latest rule in the merged order that matches
+// any of them, with the spelling it matched; none when no rule matches any, and asking is the default.
+export function decidingAny(action: string, spellings: readonly string[], ...rulesets: Permission.Ruleset[]) {
+  const rules = rulesets.flat()
+  for (let index = rules.length - 1; index >= 0; index--) {
+    const rule = rules[index]
+    if (!Wildcard.match(action, rule.action)) continue
+    const spelling = spellings.find((item) => Wildcard.match(item, rule.resource))
+    if (spelling !== undefined) return { rule, spelling }
+  }
+}
+
+// The rule that decides ACTION on a resource written as SPELLINGS, with the spelling it matched: a spelling the rule
+// deciding it alone denies, else the latest rule matching any of them; none when no rule matches any.
+export function decidingResource(action: string, spellings: readonly string[], ...rulesets: Permission.Ruleset[]) {
+  for (const spelling of spellings) {
+    const rule = deciding(action, spelling, ...rulesets)
+    if (rule?.effect === "deny") return { rule, spelling }
+  }
+  return decidingAny(action, spellings, ...rulesets)
+}
+
+// The first resource of a request RULES deny, with the rule and the spelling it denies.
+export function denial(
+  input: Pick<Permission.Request, "action" | "resources" | "alternates">,
+  rules: Permission.Ruleset,
+) {
+  for (const [index, resource] of input.resources.entries()) {
+    const decided = decidingResource(input.action, spellings(input, index), rules)
+    if (decided?.rule.effect === "deny") return { resource, ...decided }
+  }
+}
+
+// Why RULE denies ACTION, as the agent is told: its message after the permission, none when it has no message.
+export function reason(action: string, rule: Permission.Rule) {
+  return rule.message === undefined ? undefined : `Permission denied: ${action}. ${rule.message}`
+}

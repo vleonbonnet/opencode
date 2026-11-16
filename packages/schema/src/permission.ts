@@ -31,6 +31,8 @@ export const Rule = Schema.Struct({
   action: Schema.String,
   resource: Schema.String,
   effect: Effect,
+  // What the agent is told when the rule denies a request, after the permission it denies.
+  message: Schema.String.pipe(optional),
 }).annotate({ identifier: "Permission.Rule" })
 
 export const Ruleset = Schema.Array(Rule).annotate({ identifier: "Permission.Ruleset" })
