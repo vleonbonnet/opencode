@@ -2787,7 +2787,7 @@ testEffect(Layer.empty).effect("flush stops waiting for a hung server when its s
       const registration = yield* McpTool.Service
       yield* Deferred.await(gated.started)
       const flush = yield* registration.flush.pipe(Effect.forkChild({ startImmediately: true }))
-      yield* TestClock.adjust("1999 millis")
+      yield* TestClock.adjust("9999 millis")
       expect(flush.pollUnsafe()).toBeUndefined()
 
       yield* TestClock.adjust("1 millis")
