@@ -2,6 +2,7 @@ import { expect } from "bun:test"
 import { Session } from "@opencode/schema/session"
 import { SessionSearch } from "@opencode/schema/session-search"
 import { Effect, Schema } from "effect"
+import { tmpdirScoped } from "../../../core/test/fixture/tmpdir"
 import { it } from "../../../core/test/lib/effect"
 import { ServerFetch } from "../../src/fetch"
 
@@ -9,8 +10,11 @@ const SessionResponse = Schema.Struct({ data: Schema.toEncoded(Session.Info) })
 const SearchResponse = Schema.toEncoded(SessionSearch.Response)
 
 const setup = Effect.gen(function* () {
+  // An empty global configuration, so the server loads none of the user's, MCP servers included.
+  const config = (yield* tmpdirScoped("opencode-server-config-")).path
   const handler = yield* ServerFetch.make({
     app: { version: "test" },
+    config: { directory: config, project: false, content: "{}" },
     database: { path: ":memory:" },
     fs: { filewatcher: false },
     models: { fetch: false },
