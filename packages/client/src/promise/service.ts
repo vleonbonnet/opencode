@@ -1,10 +1,10 @@
 import { readFile, rm } from "node:fs/promises"
-import type { DiscoverOptions, Endpoint, Info, EnsureOptions, StopOptions } from "../service.js"
+import type { DiscoverOptions, Endpoint, Info, EnsureOptions, EnsureReason, StopOptions } from "../service.js"
 import { contenderPool, spawnServiceContender } from "../service-contender.js"
 import { defaultEnsureTiming, ensureTiming, type EnsureTiming } from "../service-timing.js"
 import { matchesVersion } from "../service-version.js"
 import { PtyHandoff } from "../pty-handoff.js"
-import { decide, fallback, headers, probeResult, same } from "../service-probe.js"
+import { decide, failedToStart, fallback, headers, probeResult, same } from "../service-probe.js"
 
 export * from "../service.js"
 export { fallback, headers }
@@ -31,8 +31,10 @@ export async function ensure(options: EnsureOptions = {}): Promise<Endpoint> {
   const pool = contenderPool(timing)
   let timeouts: { readonly info: Info; readonly count: number } | undefined
   let announced = false
+  // Whether this call started a service process: one that then fails to start is reported, not restarted.
+  let started = false
 
-  const announce = (reason: "missing" | "version-mismatch", previousVersion?: string) => {
+  const announce = (reason: EnsureReason, previousVersion?: string) => {
     if (announced) return
     announced = true
     options.onStart?.(reason, previousVersion)
@@ -84,12 +86,20 @@ export async function ensure(options: EnsureOptions = {}): Promise<Endpoint> {
           await stop({ file: options.file, pty: decision.pty }).catch(() => undefined)
           pool.evict(service.info.pid)
         }
+        if (decision._tag === "restart") {
+          if (started) throw new Error(failedToStart)
+          announce("failed")
+          console.warn("Background service failed to start; restarting it")
+          await stop({ file: options.file, pty: "clear" }).catch(() => undefined)
+          pool.evict(service.info.pid)
+        }
       } else {
         const failed = pool.reap()
         if (failed !== undefined) throw failed
         if (pool.shouldRecruit(registration.info !== undefined)) {
           announce("missing")
           pool.add(await spawnContender())
+          started = true
         }
       }
       await delay(timing.pollInterval)

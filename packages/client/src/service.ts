@@ -22,7 +22,7 @@ export type DiscoverOptions = {
 }
 
 /** Reason ensuring the service requires a new process. */
-export type EnsureReason = "missing" | "version-mismatch"
+export type EnsureReason = "missing" | "version-mismatch" | "failed"
 
 /** Options used to ensure the local OpenCode service is running. */
 export type EnsureOptions = DiscoverOptions & {

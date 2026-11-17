@@ -1,10 +1,10 @@
 import { Effect, FileSystem, Option, Schedule, Schema } from "effect"
-import type { DiscoverOptions, EnsureOptions, StopOptions } from "../service.js"
+import type { DiscoverOptions, EnsureOptions, EnsureReason, StopOptions } from "../service.js"
 import { contenderPool, spawnServiceContender } from "../service-contender.js"
 import { defaultEnsureTiming, ensureTiming, type EnsureTiming } from "../service-timing.js"
 import { matchesVersion } from "../service-version.js"
 import { PtyHandoff } from "../pty-handoff.js"
-import { decide, fallback, headers, probeResult, same } from "../service-probe.js"
+import { decide, failedToStart, fallback, headers, probeResult, same } from "../service-probe.js"
 
 export * from "../service.js"
 export { headers }
@@ -51,7 +51,9 @@ export const ensure = Effect.fn("service.ensure")(function* (options: EnsureOpti
   const pool = contenderPool(timing)
   let timeouts: { readonly info: Info; readonly count: number } | undefined
   let announced = false
-  const announce = (reason: "missing" | "version-mismatch", previousVersion?: string) =>
+  // Whether this call started a service process: one that then fails to start is reported, not restarted.
+  let started = false
+  const announce = (reason: EnsureReason, previousVersion?: string) =>
     Effect.sync(() => {
       if (announced) return
       announced = true
@@ -102,6 +104,13 @@ export const ensure = Effect.fn("service.ensure")(function* (options: EnsureOpti
         yield* stop({ file: options.file, pty: decision.pty }).pipe(Effect.ignore)
         pool.evict(service.info.pid)
       }
+      if (decision._tag === "restart") {
+        if (started) return yield* Effect.fail(new Error(failedToStart))
+        yield* announce("failed")
+        yield* Effect.logWarning("Background service failed to start; restarting it")
+        yield* stop({ file: options.file, pty: "clear" }).pipe(Effect.ignore)
+        pool.evict(service.info.pid)
+      }
       return Option.none()
     }
 
@@ -110,6 +119,7 @@ export const ensure = Effect.fn("service.ensure")(function* (options: EnsureOpti
     if (pool.shouldRecruit(info !== undefined)) {
       yield* announce("missing")
       pool.add(yield* spawnContender)
+      started = true
     }
     return Option.none()
   }).pipe(

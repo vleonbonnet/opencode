@@ -17,7 +17,8 @@ export type LocalService = {
 
 /**
  * What `ensure()` does with a registered service that answered: return it, keep polling while
- * it starts, replace it because its version does not meet the requirement, or fail.
+ * it starts, replace it because its version does not meet the requirement, restart it because it
+ * failed to start, or fail.
  */
 export function decide(service: LocalService, options: DiscoverOptions) {
   if (!matchesVersion(service.version, options))
@@ -27,9 +28,14 @@ export function decide(service: LocalService, options: DiscoverOptions) {
       "Background service uses an incompatible health protocol. Update this client or explicitly restart the service.",
     )
   if (service.state === "ready") return { _tag: "reuse" } as const
-  if (service.state === "failed") return fail("Background service failed to start")
+  // A service that failed to start serves nothing but its failure, and keeps its port and registration until
+  // stopped, so nothing could start another; ensure() restarts it, unless that call started it.
+  if (service.state === "failed") return { _tag: "restart" } as const
   return { _tag: "wait" } as const
 }
+
+/** Why ensure() fails when the service it restarted fails to start as well. */
+export const failedToStart = "Background service failed to start"
 
 function fail(message: string) {
   return { _tag: "fail" as const, error: new Error(message) }
