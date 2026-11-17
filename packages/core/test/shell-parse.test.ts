@@ -205,7 +205,8 @@ describe("ShellParse", () => {
         { resource: "cd {..,x}", save: "cd *" },
         { resource: "cd .[.]", save: "cd *" },
         { resource: "cd .?", save: "cd *" },
-        { resource: "cd $'\\x2e'[.]", save: "cd *" },
+        // ANSI-C quoting is also checked as the word it decodes to.
+        { resource: "cd $'\\x2e'[.]", save: "cd *", alternates: ["cd .[.]"] },
       ])
 
       const nobodyHome = await Effect.runPromise(
