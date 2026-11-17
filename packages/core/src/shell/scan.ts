@@ -2136,15 +2136,6 @@ function bashHeredocDelimiter(input: string, start: number, tabs: boolean, diale
   if (started && !quote) return { delimiter, dashDelimiter, quoted, tabs, end }
 }
 
-// How bash reads a heredoc whose delimiter word follows `<<`, or `<<-` when TABS, at START, and whose body begins on
-// the line starting at BODY: where that word ends, whether it quotes the body, and the newline ending the line that
-// closes the body, absent when no line does; undefined when the shells read the delimiter differently.
-export function heredocExtent(input: string, start: number, tabs: boolean, body: number) {
-  const delimiter = bashHeredocDelimiter(input, start, tabs, "bash")
-  if (!delimiter) return
-  return { word: delimiter.end + 1, quoted: delimiter.quoted, end: bashHeredoc(input, body, delimiter)?.end }
-}
-
 function bashHeredoc(
   input: string,
   start: number,
