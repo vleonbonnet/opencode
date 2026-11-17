@@ -72,7 +72,13 @@ const layer = Layer.effect(
             error instanceof AIError && CacheLedger.isThinkingRefusal(toSessionError(error).message),
           (error) =>
             new StepFailedError({
-              error: { type: STALE_THINKING_ERROR, message: CacheLedger.refusalMessage(toSessionError(error).message) },
+              error: {
+                type: STALE_THINKING_ERROR,
+                message: CacheLedger.refusalMessage(
+                  toSessionError(error).message,
+                  !CacheModel.isClaudeModel(input.model.model.id),
+                ),
+              },
             }),
         ),
       )

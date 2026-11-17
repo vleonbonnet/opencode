@@ -46,7 +46,7 @@ export const Divergence = Schema.Struct({
   previousExcerpt: Schema.String.pipe(optional),
 }).annotate({ identifier: "SessionCache.Divergence" })
 
-/** What the next turn reuses when it is sent with `thinkingLoss: "accept"` and replays the stale blocks as text. */
+/** What the next turn reuses when it is sent with `thinkingLoss: "accept"`. */
 export interface ConsentOutcome extends Schema.Schema.Type<typeof ConsentOutcome> {}
 export const ConsentOutcome = Schema.Struct({
   reusableTokens: NonNegativeInt,
@@ -63,6 +63,8 @@ export const StaleThinking = Schema.Struct({
   /** How many thinking blocks consent converts: the first reported block and every signed block after it. */
   count: NonNegativeInt,
   reason: Schema.String,
+  /** Whether consent replays the stale blocks as `<earlier-reasoning>` text; false when the model omits them instead. */
+  asText: Schema.Boolean.pipe(optional),
   /** The first cache unit where the prompt changed since the blocks were accepted, when it is known. */
   unit: Schema.String.pipe(optional),
   /** The turn's cache reuse with consent, when it could be predicted. */

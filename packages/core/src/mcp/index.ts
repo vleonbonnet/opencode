@@ -118,7 +118,7 @@ type AttachedEntry = {
 }
 
 // How long a model call may wait for a server that is still connecting, counted from when it began.
-const STARTUP_GRACE_MS = 2_000
+const STARTUP_GRACE_MS = 10_000
 
 // Bounds re-listing the tools of an attached connection that takes over the top of its stack.
 const FALLBACK_LIST_TIMEOUT = "5 seconds"

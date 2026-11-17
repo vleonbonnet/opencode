@@ -217,6 +217,7 @@ export const models = {
   primary: resolvedModel(route.model({ id: MODEL_ID })),
   chat: resolvedModel(chatRoute.model({ id: "gpt-chat" }), undefined, "key:chat-key"),
   other: resolvedModel(route.model({ id: "claude-mythos-5-1" })),
+  bound: resolvedModel(route.model({ id: "reasoner-1", compatibility: { supportsThinkingBlockBinding: true } })),
   deep: resolvedModel(
     route.model({ id: MODEL_ID, options: { providerOptions: { thinking: { type: "enabled", budgetTokens: 4096 } } } }),
     "deep",
@@ -227,11 +228,13 @@ const modelService = Layer.mock(SessionRunnerModel.Service)({
     Effect.succeed(
       session.model?.id === "claude-mythos-5-1"
         ? models.other
-        : session.model?.id === "gpt-chat"
-          ? models.chat
-          : session.model?.variant === "deep"
-            ? models.deep
-            : models.primary,
+        : session.model?.id === "reasoner-1"
+          ? models.bound
+          : session.model?.id === "gpt-chat"
+            ? models.chat
+            : session.model?.variant === "deep"
+              ? models.deep
+              : models.primary,
     ),
 })
 

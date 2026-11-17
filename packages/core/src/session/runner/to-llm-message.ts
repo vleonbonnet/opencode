@@ -12,6 +12,7 @@ import {
 import type { Model } from "@opencode/schema/model"
 import { Option, Schema } from "effect"
 import { fileURLToPath } from "url"
+import { CacheModel } from "../cache/model.js"
 import { SessionMessage } from "../message.js"
 import { SessionHistory } from "../history.js"
 import { SessionRecentText } from "../recent-text.js"
@@ -151,6 +152,7 @@ export interface DroppedReasoning {
   readonly ordinal: number
   /** Replay its text as `<earlier-reasoning>`; otherwise omit it. */
   readonly asText: boolean
+  readonly reason?: string
 }
 
 export interface Options {
@@ -174,12 +176,16 @@ const assistant = (
   let ordinal = 0
   const content = message.content.flatMap((item): Array<AssistantMessage["content"][number]> => {
     if (item.type === "reasoning") {
-      // Thinking the provider no longer accepts stays out of every later request. Dropped with consent, it was
-      // converted before the request that dropped it, so that request and every later one carry the same text;
-      // dropped by the provider, the thinking produced since is bound to a prompt without it.
+      // Thinking the provider no longer accepts stays out of every later request. Anthropic blocks requests that replay
+      // reasoning text (`reasoning_extraction`), so Claude turns omit consented blocks while non-Claude models still
+      // read them as `<earlier-reasoning>` text.
       const marker = dropped.get(droppedKey(message.id, ordinal++))
-      if (marker)
-        return marker.asText && item.text.trim().length > 0 ? [{ type: "text", text: earlierReasoning(item.text) }] : []
+      if (marker) {
+        const replayAsText =
+          !CacheModel.isClaudeModel(model.id) &&
+          (marker.asText || Boolean(marker.reason?.startsWith("dropped with consent")))
+        return replayAsText && item.text.trim().length > 0 ? [{ type: "text", text: earlierReasoning(item.text) }] : []
+      }
     }
     if (item.type === "text")
       return [

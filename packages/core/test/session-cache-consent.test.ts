@@ -143,7 +143,7 @@ const forgetBindings = (sessionID: Session.ID) =>
   })
 
 describe("stale thinking consent", () => {
-  it.effect("a turn that asks is refused on stale thinking, and the consented turn drops it as text", () =>
+  it.effect("a Claude turn that asks is refused on stale thinking, and the consented turn omits it", () =>
     Effect.gen(function* () {
       const sessionID = Session.ID.make("ses_consent_stale")
       yield* createSession(sessionID)
@@ -165,7 +165,12 @@ describe("stale thinking consent", () => {
       // The system prompt changes: sig-1 no longer matches, nor does sig-2, which no request replayed yet.
       change.changed = true
       const report = yield* session.preflight({ sessionID, text: "third" })
-      expect(report.staleThinking).toMatchObject({ count: 2, reason: "the system prompt changed", unit: "system[0]" })
+      expect(report.staleThinking).toMatchObject({
+        count: 2,
+        reason: "the system prompt changed",
+        asText: false,
+        unit: "system[0]",
+      })
       expect(report.staleThinking?.consent).toBeDefined()
 
       // A turn that asks first is refused before anything is sent, and the error says what to send.
@@ -175,25 +180,25 @@ describe("stale thinking consent", () => {
       expect(failure?.type).toBe("thinking.stale")
       expect(failure?.message).toBe(
         "Stale thinking: 2 thinking blocks from earlier turns no longer match the conversation (the system prompt changed). " +
-          'Send the turn again with metadata.thinkingLoss "accept" to replay them as text, or undo the change.',
+          'Send the turn again with metadata.thinkingLoss "accept" to drop them, or undo the change.',
       )
 
-      // With consent the turn asks the provider to drop what the check could not foresee, and already carries the
-      // stale blocks as text.
+      // With consent on Claude the turn omits the stale blocks instead of replaying `<earlier-reasoning>` text, which
+      // Anthropic blocks as `reasoning_extraction`.
       provider.reply(turn({ thinking: { text: "reasoning three", signature: "sig-3" }, text: "answer three" }))
       yield* run(sessionID, "fourth", accept)
       expect(provider.requests.length).toBe(start + 3)
       const consented = provider.requests[start + 2]
       expect(behavior(consented)).toBe("drop_block")
       expect(signatures(consented)).toEqual([])
-      expect(texts(consented)).toContain(earlier("reasoning one"))
-      expect(texts(consented)).toContain(earlier("reasoning two"))
+      expect(texts(consented)).not.toContain(earlier("reasoning one"))
+      expect(texts(consented)).not.toContain(earlier("reasoning two"))
 
       const [first, secondAssistant] = yield* assistantIDs(sessionID)
       const markers = yield* session.thinking(sessionID)
       expect(markers.map(({ time: _time, ...marker }) => marker)).toEqual([
-        { messageID: first, ordinal: 0, reason: CacheLedger.DROPPED_WITH_CONSENT, asText: true },
-        { messageID: secondAssistant, ordinal: 0, reason: CacheLedger.DROPPED_WITH_CONSENT, asText: true },
+        { messageID: first, ordinal: 0, reason: CacheLedger.DROPPED_WITH_CONSENT, asText: false },
+        { messageID: secondAssistant, ordinal: 0, reason: CacheLedger.DROPPED_WITH_CONSENT, asText: false },
       ])
       yield* eventually(
         Effect.sync(() => (dropped.length > 0 ? dropped : undefined)),
@@ -203,14 +208,14 @@ describe("stale thinking consent", () => {
         {
           sessionID,
           blocks: [
-            { messageID: first, ordinal: 0, reason: CacheLedger.DROPPED_WITH_CONSENT, asText: true },
-            { messageID: secondAssistant, ordinal: 0, reason: CacheLedger.DROPPED_WITH_CONSENT, asText: true },
+            { messageID: first, ordinal: 0, reason: CacheLedger.DROPPED_WITH_CONSENT, asText: false },
+            { messageID: secondAssistant, ordinal: 0, reason: CacheLedger.DROPPED_WITH_CONSENT, asText: false },
           ],
         },
       ])
       yield* confirmed(sessionID, 3)
 
-      // Later turns fail loudly again, replay the converted text byte for byte, and keep the new thinking signed.
+      // Later turns fail loudly again, keep the same omitted prefix, and keep the new thinking signed.
       provider.reply(turn({ text: "answer five" }))
       yield* run(sessionID, "fifth", ask)
       const next = provider.requests[start + 3]
@@ -218,6 +223,17 @@ describe("stale thinking consent", () => {
       expect(signatures(next)).toEqual(["sig-3"])
       expect(blocks(next).slice(0, blocks(consented).length)).toEqual(blocks(consented))
       expect(dropped).toHaveLength(1)
+
+      // Switching the session to a non-Claude provider still replays the consented blocks as `<earlier-reasoning>` text.
+      yield* session.switchModel({ sessionID, model: models.chat.ref })
+      provider.reply(chatTurn({ text: "chat six" }))
+      yield* run(sessionID, "sixth", ask)
+      const chatSent = (provider.requests[start + 4].body.messages as Array<{ content: string }>)
+        .map((m) => m.content)
+        .join("\n")
+      expect(chatSent).toContain(earlier("reasoning one"))
+      expect(chatSent).toContain(earlier("reasoning two"))
+      yield* session.switchModel({ sessionID, model: models.primary.ref })
 
       // A fork keeps the history under new message IDs: the markers follow it, and so do the thinking bindings.
       const kv = yield* KV.Service
@@ -228,7 +244,7 @@ describe("stale thinking consent", () => {
       )
       const forkAssistants = yield* assistantIDs(fork.id)
       expect(forkedMarkers.map((marker) => marker.messageID)).toEqual(forkAssistants.slice(0, 2))
-      expect(forkedMarkers.every((marker) => marker.asText && marker.ordinal === 0)).toBe(true)
+      expect(forkedMarkers.every((marker) => !marker.asText && marker.ordinal === 0)).toBe(true)
       const parentRecord = (yield* kv.get(`session-cache:${sessionID}`)) as { thinking: Record<string, unknown> }
       const forkRecord = (yield* kv.get(`session-cache:${fork.id}`)) as { thinking: Record<string, unknown> }
       expect(Object.keys(forkRecord.thinking).sort()).toEqual(Object.keys(parentRecord.thinking).sort())
@@ -239,6 +255,38 @@ describe("stale thinking consent", () => {
         kv.get(`session-cache:${fork.id}`).pipe(Effect.map((record) => (record === undefined ? true : undefined))),
         "the deleted session's record to go",
       )
+    }),
+  )
+
+  it.effect("a non-Claude model replays consented stale thinking as earlier-reasoning text", () =>
+    Effect.gen(function* () {
+      const sessionID = Session.ID.make("ses_consent_non_claude")
+      yield* createSession(sessionID)
+      const session = yield* Session.Service
+      yield* session.switchModel({ sessionID, model: models.bound.ref })
+      const change = yield* systemChange(sessionID)
+      const start = provider.requests.length
+
+      provider.reply(turn({ thinking: { text: "reasoning nc", signature: "sig-nc" }, text: "answer nc" }))
+      yield* run(sessionID, "first", ask)
+      yield* confirmed(sessionID, 1)
+
+      change.changed = true
+      const report = yield* session.preflight({ sessionID, text: "second" })
+      expect(report.staleThinking).toMatchObject({
+        count: 1,
+        reason: "the system prompt changed",
+        asText: true,
+      })
+      const refused = yield* run(sessionID, "second", ask)
+      expect(failureOf(refused)?.message).toContain("to replay it as text, or undo the change.")
+
+      provider.reply(turn({ text: "answer two" }))
+      yield* run(sessionID, "second", accept)
+      const consented = provider.requests[start + 1]
+      expect(signatures(consented)).toEqual([])
+      expect(texts(consented)).toContain(earlier("reasoning nc"))
+      expect((yield* session.thinking(sessionID)).map((marker) => marker.asText)).toEqual([true])
     }),
   )
 
@@ -266,7 +314,7 @@ describe("stale thinking consent", () => {
       const consented = yield* run(sessionID, "second", accept)
       expect(Exit.isSuccess(consented)).toBe(true)
       expect(signatures(provider.requests[start + 1])).toEqual([])
-      expect(texts(provider.requests[start + 1])).toContain(earlier("reasoning s"))
+      expect(texts(provider.requests[start + 1])).not.toContain(earlier("reasoning s"))
     }),
   )
 
@@ -331,8 +379,9 @@ describe("stale thinking consent", () => {
       const consented = provider.requests[start + 3]
       expect(behavior(consented)).toBe("drop_block")
       expect(signatures(consented)).toEqual([])
-      expect(texts(consented)).toEqual(expect.arrayContaining([earlier("reasoning a"), earlier("reasoning b")]))
-      expect((yield* session.thinking(sessionID)).map((marker) => marker.asText)).toEqual([true, true])
+      expect(texts(consented)).not.toContain(earlier("reasoning a"))
+      expect(texts(consented)).not.toContain(earlier("reasoning b"))
+      expect((yield* session.thinking(sessionID)).map((marker) => marker.asText)).toEqual([false, false])
       yield* confirmed(sessionID, 3)
       expect((yield* session.preflight({ sessionID, text: "sixth" })).staleThinking).toBeUndefined()
     }),

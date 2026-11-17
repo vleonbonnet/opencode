@@ -2550,7 +2550,7 @@
             }
           }
         },
-        "description": "Predict how much of the provider's prompt cache the next turn reuses, and whether earlier signed thinking no longer matches the conversation, by dry-running the exact request it would send: the selected or given agent and model, the history, any pending instruction update, and a message built from text, files or a command. Nothing is enqueued, persisted or sent. While a turn runs the report is unknown. When staleThinking is present, a turn sent with metadata.thinkingLoss 'ask' fails with a thinking.stale error (unless its reason is 'unknown binding': those blocks are sent, and only a provider refusal fails the turn); with 'accept' it replays them as text, as staleThinking.consent predicts; without thinkingLoss the provider drops them. previous.expires and previous.ttl describe the entry a turn extending the previous request reuses: its longest prefix with a live entry, shared prefixes (the system prompt and tools other sessions keep warm) included, unlike experimental.session.cache, which counts only the entry of the session's own conversation. An unknown command or agent, or an unavailable model, is a 400.",
+        "description": "Predict how much of the provider's prompt cache the next turn reuses, and whether earlier signed thinking no longer matches the conversation, by dry-running the exact request it would send: the selected or given agent and model, the history, any pending instruction update, and a message built from text, files or a command. Nothing is enqueued, persisted or sent. While a turn runs the report is unknown. When staleThinking is present, a turn sent with metadata.thinkingLoss 'ask' fails with a thinking.stale error (unless its reason is 'unknown binding': those blocks are sent, and only a provider refusal fails the turn); with 'accept' it drops them (replaying them as text when staleThinking.asText is not false), as staleThinking.consent predicts; without thinkingLoss the provider drops them. previous.expires and previous.ttl describe the entry a turn extending the previous request reuses: its longest prefix with a live entry, shared prefixes (the system prompt and tools other sessions keep warm) included, unlike experimental.session.cache, which counts only the entry of the session's own conversation. An unknown command or agent, or an unavailable model, is a 400.",
         "summary": "Preflight the next turn",
         "requestBody": {
           "content": {
@@ -25022,6 +25022,9 @@
           },
           "reason": {
             "type": "string"
+          },
+          "asText": {
+            "type": "boolean"
           },
           "unit": {
             "type": "string"

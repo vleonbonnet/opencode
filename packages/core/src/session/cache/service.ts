@@ -686,6 +686,7 @@ const layer = Layer.effect(
         // What consent converts: the reported blocks and every signed block after the first.
         count: stale.converted.length,
         reason: stale.reason,
+        asText: CacheModel.replaysConsentAsText(request),
         ...(stale.path ? { unit: stale.path } : {}),
       } satisfies StaleThinking
     }
@@ -743,11 +744,10 @@ const layer = Layer.effect(
       time: number,
     ) => {
       const located = locate(messages)
+      const asText = CacheModel.replaysConsentAsText(request)
       return CacheLedger.consentedThinking(record, request).flatMap((item) => {
         const where = located.get(item.signature)
-        return where
-          ? [{ signature: item.signature, block: { ...where, reason: item.reason, asText: true, time } }]
-          : []
+        return where ? [{ signature: item.signature, block: { ...where, reason: item.reason, asText, time } }] : []
       })
     }
 
@@ -756,6 +756,7 @@ const layer = Layer.effect(
         const record = yield* readRecord(input.sessionID)
         const stale = CacheLedger.staleThinking(record, input.request, excerpts.get(input.sessionID))
         if (!stale) return { type: "ok" } as const
+        const asText = CacheModel.replaysConsentAsText(input.request)
         // Blocks of unknown binding may well still match: a turn that asked first sends them, and only the provider
         // can refuse them.
         if (!input.accept)
@@ -763,10 +764,11 @@ const layer = Layer.effect(
             ? ({ type: "ok" } as const)
             : ({
                 type: "refused",
-                error: { type: STALE_THINKING_ERROR, message: CacheLedger.staleMessage(stale) },
+                error: { type: STALE_THINKING_ERROR, message: CacheLedger.staleMessage(stale, asText) },
               } as const)
-        // The consented request already replays the blocks as text, like every later one: the provider caches one
-        // prompt, and the thinking it produces is bound to it. drop_block covers blocks this could not place.
+        // The consented request drops the stale blocks (replaying them as text on non-Claude models), like every later
+        // one: the provider caches one prompt, and the thinking it produces is bound to it. drop_block covers blocks
+        // this could not place.
         const converted = conversion(record, input.request, input.messages, yield* Clock.currentTimeMillis)
         const result = yield* updateRecord(input.sessionID, (current) =>
           Effect.sync(() => {
@@ -784,7 +786,7 @@ const layer = Layer.effect(
           }),
         )
         yield* publishDropped(input.sessionID, result.added)
-        yield* Effect.logWarning("stale thinking kept as text", {
+        yield* Effect.logWarning(asText ? "stale thinking kept as text" : "stale thinking dropped with consent", {
           sessionID: input.sessionID,
           stale: stale.blocks.length,
           converted: converted.length,

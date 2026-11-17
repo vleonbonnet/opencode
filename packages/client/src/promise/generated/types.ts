@@ -716,6 +716,7 @@ export type SessionSearchSnippet = { text: string; matches: Array<SessionSearchR
 export type SessionCacheStaleThinking = {
   count: number
   reason: string
+  asText?: boolean
   unit?: string
   consent?: SessionCacheConsentOutcome
 }

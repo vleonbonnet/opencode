@@ -640,6 +640,20 @@ export function analyze(request: Captured): Analyzed {
 export const checksThinking = (model: LanguageModel) =>
   model.route.protocol === AnthropicMessages.protocol.id && AnthropicMessages.bindsThinking(model)
 
+/**
+ * True for Claude model IDs (including gateway namespaces and Vertex suffixes). Anthropic blocks requests that replay
+ * earlier reasoning as plain text (`reasoning_extraction`), so Claude turns omit consented stale thinking while other
+ * providers keep the text replay.
+ */
+export const isClaudeModel = (id: string) => /(?:^|[./])claude-[a-z]+-\d+(?:[.-]\d{1,2})?(?:$|[-:@])/i.test(id)
+
+/** Whether a consented turn for REQUEST replays stale thinking blocks as `<earlier-reasoning>` text. */
+export function replaysConsentAsText(request: Captured): boolean {
+  const body = parse(request)
+  if (!isRecord(body) || detect(request, body) !== "anthropic" || typeof body.model !== "string") return true
+  return !isClaudeModel(body.model)
+}
+
 /** The block-binding behavior a captured Anthropic request asks for, if any. */
 export function bindingBehavior(request: Captured): string | undefined {
   const body = parse(request)

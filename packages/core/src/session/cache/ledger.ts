@@ -916,12 +916,14 @@ export const STALE_THINKING = "Stale thinking"
 const RETRY_WITH_CONSENT = `Send the turn again with metadata.${THINKING_LOSS} "accept"`
 
 /** Why a turn that asked first was refused: the session error message, starting with "Stale thinking:". */
-export function staleMessage(stale: StaleThinking) {
+export function staleMessage(stale: StaleThinking, asText = true) {
   const count = stale.blocks.length
+  const pronoun = stale.converted.length === 1 ? "it" : "them"
+  const action = asText ? `to replay ${pronoun} as text` : `to drop ${pronoun}`
   return (
     `${STALE_THINKING}: ${count} thinking block${count === 1 ? "" : "s"} from earlier turns no longer ` +
     `match${count === 1 ? "es" : ""} the conversation (${stale.reason}). ` +
-    `${RETRY_WITH_CONSENT} to replay ${stale.converted.length === 1 ? "it" : "them"} as text, or undo the change.`
+    `${RETRY_WITH_CONSENT} ${action}, or undo the change.`
   )
 }
 
@@ -929,10 +931,11 @@ export function staleMessage(stale: StaleThinking) {
  * Why a turn that asked first failed when the provider rejected a thinking block the ledger could not vouch for
  * (MESSAGE is the provider's error): the session error message, starting with "Stale thinking:".
  */
-export function refusalMessage(message: string) {
+export function refusalMessage(message: string, asText = true) {
+  const action = asText ? "to replay it and the thinking after it as text" : "to drop it and the thinking after it"
   return (
     `${STALE_THINKING}: the provider rejected a thinking block from an earlier turn (${refusalDetail(message)}). ` +
-    `${RETRY_WITH_CONSENT} to replay it and the thinking after it as text, or undo the change.`
+    `${RETRY_WITH_CONSENT} ${action}, or undo the change.`
   )
 }
 
