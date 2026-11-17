@@ -195,7 +195,7 @@ describe("session cache expiry", () => {
 
       yield* TestClock.adjust(Duration.minutes(50))
       provider.reply(turn({ text: "OK", usage: { input: 3, output: 1, read: 120_000, write: 500 } }))
-      expect(yield* session.generate({ sessionID, prompt: "Reply with exactly: OK" })).toBe("OK")
+      expect((yield* session.generate({ sessionID, prompt: "Reply with exactly: OK" })).text).toBe("OK")
       const [, kept] = yield* updatesOf(seen, sessionID, 2)
       // The generation read the Session's tip; its own prompt is not the Session's.
       const expected = { expires: sent + 50 * 60_000 + HOUR, ttl: HOUR, tokens: 120_000, promptTokens: 120_003 }

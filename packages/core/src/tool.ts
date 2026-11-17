@@ -9,6 +9,7 @@ import { Context, Effect, Layer, Ref, Result, Schema, SchemaIssue, Types } from 
 import { makeLocationNode } from "@opencode/util/effect/app-node"
 import type { Agent } from "./agent.js"
 import { CodeModeCatalog } from "./codemode/catalog.js"
+import { CodeModeJob } from "./codemode/job.js"
 import { CodeModeTool } from "./codemode/tool.js"
 import { Image } from "./image.js"
 import { Permission } from "./permission.js"
@@ -83,6 +84,8 @@ export interface Snapshot {
     readonly messageID: SessionMessage.ID
     readonly call: ToolCall
     readonly progress?: (update: Tool.Metadata) => Effect.Effect<void>
+    /** Completes when the user asks the call to stop; see `Tool.Context.cancel`. */
+    readonly cancel?: Effect.Effect<void>
     /** Surviving request definitions, keyed by the names advertised after session context hooks. */
     readonly definitions?: ReadonlyMap<string, ToolDefinition>
   }) => Effect.Effect<NormalizedResult, Tool.Error>
@@ -147,6 +150,7 @@ const layer = Layer.effect(
         "gen_ai.tool.name": name,
         "gen_ai.tool.call.id": context.id,
         "session.id": context.sessionID,
+        "gen_ai.agent.name": context.agent,
       })
       const execution = yield* execute(tool, input, context).pipe(
         Effect.map((value) => ({ value })),
@@ -187,8 +191,19 @@ const layer = Layer.effect(
       }
     })
 
-    const run = (tool: Tool.Info, name: string, input: unknown, context: Tool.Context) =>
-      beforeExecute(name, input, context).pipe(Effect.flatMap((event) => executeTool(tool, name, event.input, context)))
+    // A plugin may rename a call in a Code Mode program, as it may a direct call, to another of the program's tools.
+    const run = Effect.fnUntraced(function* (
+      tools: ReadonlyMap<string, Tool.Info>,
+      tool: Tool.Info,
+      name: string,
+      input: unknown,
+      context: Tool.Context,
+    ) {
+      const event = yield* beforeExecute(name, input, context)
+      const selected = event.tool === name ? tool : tools.get(event.tool)
+      if (!selected) return yield* new Tool.Error({ message: `Tool is not available for this request: ${event.tool}` })
+      return yield* executeTool(selected, event.tool, event.input, context)
+    })
 
     let catalog:
       | {
@@ -293,7 +308,7 @@ const layer = Layer.effect(
                   Effect.suspend(() => {
                     const error = refused(name, tool.options?.permission ?? name, context.agent)
                     if (error) return Effect.fail(error)
-                    return run(tool, name, input, context)
+                    return run(codeModeInventory.tools, tool, name, input, context)
                   }),
                 permission,
               )
@@ -325,6 +340,7 @@ const layer = Layer.effect(
                 messageID: input.messageID,
                 id: Tool.CallID.make(input.call.id),
                 progress: input.progress ?? (() => Effect.void),
+                cancel: input.cancel,
               }
               const refusedCall = (called: string) => {
                 const requested = input.definitions?.get(called)
@@ -346,8 +362,11 @@ const layer = Layer.effect(
               const late = refusedCall(event.tool)
               if (late) return yield* late
               const name = requested?.name ?? event.tool
-              if (name === "execute" && codeModeTool)
-                return yield* executeTool(codeModeTool, name, event.input, context)
+              if (name === "execute" && codeModeTool) {
+                const run = (ctx: Tool.Context) => executeTool(codeModeTool, name, event.input, ctx)
+                const background = yield* CodeModeJob.Current
+                return yield* background ? background(context, run) : run(context)
+              }
               const tool = direct.get(name)
               if (tool) return yield* executeTool(tool, name, event.input, context)
               return yield* new Tool.Error({
@@ -388,7 +407,7 @@ const layer = Layer.effect(
                 ...input.context,
                 id: Tool.CallID.make(`call_${input.context.messageID}_${index}`),
               }
-              return yield* run(tool, name, toolInput, context)
+              return yield* run(tools, tool, name, toolInput, context)
             }),
         )
       }),

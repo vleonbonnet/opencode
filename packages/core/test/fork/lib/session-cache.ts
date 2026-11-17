@@ -342,6 +342,9 @@ export const createSession = Effect.fn("test.createSession")(function* (sessionI
       agent.permissions.push({ action: "execute", resource: "*", effect: "deny" })
     }),
   )
+  // A background summary would take the scripted reply meant for the next turn.
+  const compaction = yield* SessionCompaction.Service
+  yield* compaction.transform((editor) => editor.configure({ background: false }))
   const { db } = yield* Database.Service
   yield* db
     .insert(ProjectTable)

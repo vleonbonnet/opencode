@@ -81,19 +81,8 @@ export function createTimelineCache(
         const readImage = select(() => markdown?.readImage)
         const openSession = select(() => markdown?.openSession)
         const sessionTitle = select(() => markdown?.sessionTitle)
+        const sessionMenu = select(() => markdown?.sessionMenu)
         const turnDiff = select(() => data.turnDiff)
-
-        // The Location's config is a query: read it in the reader and only while selected, so a pending config
-        // suspends that reader as the live provider would rather than this view's owner, the whole screen.
-        let compaction = false
-
-        const backgroundCompaction = () => {
-          if (!active()) return compaction
-
-          compaction = data.backgroundCompaction
-
-          return compaction
-        }
 
         const view = () =>
           render(
@@ -131,8 +120,8 @@ export function createTimelineCache(
                 get agents() {
                   return agents()
                 },
-                get backgroundCompaction() {
-                  return backgroundCompaction()
+                get copyAlwaysVisible() {
+                  return data.copyAlwaysVisible
                 },
                 navigateToSession: data.navigateToSession,
                 sessionHref: data.sessionHref,
@@ -159,6 +148,9 @@ export function createTimelineCache(
                     },
                     get sessionTitle() {
                       return sessionTitle()
+                    },
+                    get sessionMenu() {
+                      return sessionMenu()
                     },
                   },
                   view,

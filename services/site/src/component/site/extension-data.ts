@@ -18,7 +18,7 @@ type Extension = {
   intro: string
   features: { title: string; body: string }[]
   /** How to get it: a command to copy, or where to find it in the desktop app. */
-  install: { lead: string; command?: string }
+  install: { lead: string; command?: string; commands?: { method: string; command: string }[] }
   /** The Chrome Web Store listing, when there is one. The page's main action. */
   store?: string
   source: string
@@ -26,6 +26,8 @@ type Extension = {
   product?: boolean
   /** For the page's structured data; every OS when left out. */
   operatingSystem?: string
+  /** A hero still per theme (product-hero.tsx heroStills); the hero stays black when left out. */
+  hero?: boolean
 }
 
 export const extensionPages: readonly Extension[] = [
@@ -35,25 +37,31 @@ export const extensionPages: readonly Extension[] = [
     body: "Let agents use your real browser.",
     title: "OpenCode | Browse, your real browser for coding agents",
     description:
-      "Browse lets OpenCode and other MCP clients use your real browser. Agents drive background tabs with Playwright and hand logins and 2FA back to you.",
+      "Browse lets OpenCode and other MCP clients use your real browser. Agents read, click, type, take screenshots, record tabs and hand logins and 2FA back to you.",
     intro:
-      "An MCP server and a Chromium extension that let your agents use your real browser, with your tabs, your logins and your extensions. They open and drive tabs with Playwright, take screenshots and record the screen, in background tabs grouped out of your way. When it's your turn, for a login, a 2FA prompt or a payment, they hand the tab back to you and continue once you click Continue.",
+      "An MCP server and a Chromium extension that let your agents use your real browser, with your tabs, your logins and your extensions. They open tabs in the background, grouped out of your way, and read pages, click, type, take screenshots and record tabs. When it's your turn, for a login, a 2FA prompt or a payment, they hand the tab back to you and continue once you click Continue.",
     features: [
       { title: "Your real browser", body: "Chrome, Edge, Brave, Arc, Helium, Vivaldi, Opera and Chromium." },
       { title: "Out of your way", body: "Agent tabs open in the background, in collapsed groups." },
       { title: "Handoffs", body: "Do the login or 2FA step yourself, then click Continue." },
       { title: "Lend a tab", body: "Click the toolbar button to hand an agent a tab you have open." },
-      { title: "Record and capture", body: "Screenshots, screen recordings and network traffic as a HAR." },
+      { title: "Record and capture", body: "Screenshots, tab recordings and network traffic." },
       { title: "Any MCP client", body: "OpenCode, Claude Code, Cursor, Codex, Zed and many more." },
-      { title: "Named sessions", body: "Each session keeps its own tabs, across restarts." },
-      { title: "Allowlists", body: "Limit a session's tabs to the sites you name." },
+      { title: "All your logins", body: "Agents use the sites you're already signed into. No keys, no setup." },
+      { title: "Allowed sites", body: "Keep an agent's tab on the sites you name." },
     ],
     install: {
-      lead: "One line installs Browse, adds it to the agents it finds and pairs the extension. On Windows, run irm https://opencode.ai/browse/install.ps1 | iex. Or ask your agent to set it up.",
-      command: "curl -fsSL https://opencode.ai/browse/install | bash",
+      lead: "Install the [Chrome extension] first. It walks you through the rest of the steps. To install the CLI directly (you should not need to do this), use any of these.",
+      commands: [
+        { method: "curl", command: "curl -fsSL https://opencode.ai/browse/install | bash" },
+        { method: "pwsh", command: "irm https://opencode.ai/browse/install.ps1 | iex" },
+        { method: "npm", command: "npm install -g @opencode/browse && browse install" },
+        { method: "bun", command: "bun add -g @opencode/browse && browse install" },
+      ],
     },
     store: "https://chromewebstore.google.com/detail/mfnicocicmmlkpjnaffgihfjhdgjkdjg",
     product: true,
+    hero: true,
     source: "https://github.com/anomalyco/browse",
   },
   // {

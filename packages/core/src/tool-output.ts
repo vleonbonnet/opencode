@@ -41,9 +41,6 @@ export interface Interface extends State.Transformable<Editor> {
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/ToolOutput") {}
 
-const preview = (cut: { readonly kept: string; readonly marker: string }) =>
-  cut.kept === "" ? cut.marker : `${cut.kept}\n${cut.marker}`
-
 const cleanup = Effect.fn("ToolOutput.cleanup")(function* (fs: FSUtil.Interface, directory: string) {
   const entries = yield* fs.readDirectory(directory).pipe(
     Effect.map((entries) => entries.filter((entry) => /^tool_[0-9a-f]{12}/.test(entry))),
@@ -55,6 +52,12 @@ const cleanup = Effect.fn("ToolOutput.cleanup")(function* (fs: FSUtil.Interface,
     RETENTION,
   )
 })
+
+// The system error message ("ENOSPC: no space left on device, write") without the stack or wrapper text.
+const describe = (error: FSUtil.Error) => {
+  const cause = error._tag === "PlatformError" ? error.reason.cause : error.cause
+  return cause instanceof Error ? cause.message.split("\n")[0] : error.message
+}
 
 const layer = Layer.effect(
   Service,
@@ -73,88 +76,59 @@ const layer = Layer.effect(
       }),
     })
 
-    /**
-     * The leading lines of text that exceed the limits; undefined when it fits. With `partial`, a first line too long
-     * to fit keeps as many leading characters as fit instead of nothing.
-     */
-    const bound = (text: string, partial: boolean) => {
-      const limits = state.get()
-      const lines = text.split("\n")
-      if (text.endsWith("\n")) lines.pop()
-      const totalBytes = Buffer.byteLength(text, "utf-8")
-      if (lines.length <= limits.maxLines && totalBytes <= limits.maxBytes) return undefined
-
-      const kept: string[] = []
-      let bytes = 0
-      for (const line of lines.slice(0, limits.maxLines)) {
-        const size = Buffer.byteLength(line, "utf-8") + (kept.length > 0 ? 1 : 0)
-        if (bytes + size > limits.maxBytes) break
-        kept.push(line)
-        bytes += size
-      }
-      if (kept.length > 0 || !partial || lines[0] === undefined)
-        return {
-          kept: kept.join("\n"),
-          shown: `${kept.length > 0 ? `lines 1-${kept.length}` : "0 lines"} of ${lines.length}`,
-        }
-      // encodeInto stops before a character that would not fit, so the kept text never ends in a split one.
-      const first = lines[0]
-      const prefix = new TextEncoder().encodeInto(first, new Uint8Array(limits.maxBytes))
-      return {
-        kept: first.slice(0, prefix.read),
-        shown: `${prefix.written} of ${Buffer.byteLength(first, "utf-8")} bytes of line 1 of ${lines.length}`,
-      }
-    }
-
-    const saveText = Effect.fnUntraced(function* (text: string) {
-      const file = path.join(directory, fileName())
-      yield* fs.ensureDir(directory)
-      yield* fs.writeFileString(file, text)
-      return file
-    })
-
-    /** Saves text that exceeds the limits and returns the leading lines that fit; undefined when it fits. */
-    const cut = Effect.fnUntraced(function* (text: string, label: string) {
-      const bounded = bound(text, false)
-      if (bounded === undefined) return undefined
-      const file = yield* saveText(text).pipe(Effect.orDie)
-      return { kept: bounded.kept, file, marker: `[showing ${bounded.shown}; full ${label} saved to ${file}]` }
-    })
-
-    // A failed save must not turn the tool's error into a defect, so the bounded text says the rest is lost instead.
-    const cutError = Effect.fnUntraced(function* (text: string, label: string) {
-      const bounded = bound(text, true)
-      if (bounded === undefined) return undefined
-      const saved = yield* saveText(text).pipe(
-        Effect.map((file) => `full ${label} saved to ${file}`),
-        Effect.catch((error) =>
-          Effect.logWarning("failed to save truncated tool error", { error }).pipe(
-            Effect.as(`the full ${label} could not be saved`),
-          ),
-        ),
-      )
-      return { kept: bounded.kept, marker: `[showing ${bounded.shown}; ${saved}]` }
-    })
-
     const truncate = Effect.fnUntraced(function* (result: Result) {
       if (result.metadata?.truncated !== undefined) return result
       const content = result.content
-      const text = content.flatMap((item) => (item.type === "text" ? [item.text] : [])).join("\n")
-      const saved = yield* cut(text, "output")
-      if (saved === undefined) return { ...result, metadata: { ...result.metadata, truncated: false } }
-      const { file, marker } = saved
+      // A line break joins text parts unless the text before already ends in one.
+      const text = content.reduce(
+        (joined, item) =>
+          item.type !== "text"
+            ? joined
+            : joined === "" || joined.endsWith("\n")
+              ? joined + item.text
+              : `${joined}\n${item.text}`,
+        "",
+      )
+      const limits = state.get()
+      const totalLines = countLines(text)
+      if (totalLines <= limits.maxLines && Buffer.byteLength(text, "utf-8") <= limits.maxBytes)
+        return { ...result, metadata: { ...result.metadata, truncated: false } }
+
+      // Cut once, at the line or byte limit, whichever comes first, so a line too long for the space left shows its
+      // start. The preview never ends on a line break.
+      const end = Math.min(afterLines(text, limits.maxLines), byteBoundary(text, limits.maxBytes))
+      const shown = text.slice(0, text.endsWith("\r\n", end) ? end - 2 : text.endsWith("\n", end) ? end - 1 : end)
+      const file = path.join(directory, fileName())
+      const failure = yield* fs.ensureDir(directory).pipe(
+        Effect.andThen(fs.writeFileString(file, text)),
+        Effect.as(undefined),
+        Effect.catch((error) =>
+          Effect.logWarning("failed to save full tool output", { file, cause: error }).pipe(Effect.as(describe(error))),
+        ),
+      )
+      // Counted before the final line break is stripped, so a blank last line still counts.
+      const shownLines = countLines(text.slice(0, end))
+      const lastLineCut =
+        shownLines > 0 &&
+        shown.length < text.length &&
+        !text.startsWith("\n", shown.length) &&
+        !text.startsWith("\r\n", shown.length)
+      const range = shownLines === 0 ? "0 lines" : `lines 1-${shownLines}`
+      const marker = `[showing ${range} of ${totalLines}${lastLineCut ? " (last line cut)" : ""}; ${
+        failure === undefined ? `full output saved to ${file}` : `full output could not be saved: ${failure}`
+      }]`
       const bounded: Tool.Content[] = []
-      let remaining = saved.kept.length
-      let seenText = false
+      let remaining = shown.length
+      let separator = false
       let marked = false
       for (const item of content) {
         if (item.type === "file") {
           bounded.push(item)
           continue
         }
-        if (seenText && remaining > 0) remaining--
-        seenText = true
-        if (remaining >= item.text.length) {
+        if (separator && remaining > 0) remaining--
+        separator = item.text !== "" && !item.text.endsWith("\n")
+        if (!marked && remaining >= item.text.length) {
           bounded.push(item)
           remaining -= item.text.length
           continue
@@ -168,8 +142,39 @@ const layer = Layer.effect(
       return {
         ...result,
         content: bounded,
-        metadata: { ...result.metadata, truncated: true, outputPath: file },
+        metadata: { ...result.metadata, truncated: true, ...(failure === undefined && { outputPath: file }) },
       }
+    })
+
+    // Cut as `truncate` cuts output. A failed save must not turn the tool's error into a defect, so the bounded text
+    // says the rest is lost instead.
+    const cutError = Effect.fnUntraced(function* (text: string, label: string) {
+      const limits = state.get()
+      const totalLines = countLines(text)
+      if (totalLines <= limits.maxLines && Buffer.byteLength(text, "utf-8") <= limits.maxBytes) return undefined
+      const end = Math.min(afterLines(text, limits.maxLines), byteBoundary(text, limits.maxBytes))
+      const shown = text.slice(0, text.endsWith("\r\n", end) ? end - 2 : text.endsWith("\n", end) ? end - 1 : end)
+      const file = path.join(directory, fileName())
+      const failure = yield* fs.ensureDir(directory).pipe(
+        Effect.andThen(fs.writeFileString(file, text)),
+        Effect.as(undefined),
+        Effect.catch((error) =>
+          Effect.logWarning("failed to save truncated tool error", { file, cause: error }).pipe(
+            Effect.as(describe(error)),
+          ),
+        ),
+      )
+      const shownLines = countLines(text.slice(0, end))
+      const lastLineCut =
+        shownLines > 0 &&
+        shown.length < text.length &&
+        !text.startsWith("\n", shown.length) &&
+        !text.startsWith("\r\n", shown.length)
+      const range = shownLines === 0 ? "0 lines" : `lines 1-${shownLines}`
+      const marker = `[showing ${range} of ${totalLines}${lastLineCut ? " (last line cut)" : ""}; ${
+        failure === undefined ? `full ${label} saved to ${file}` : `full ${label} could not be saved: ${failure}`
+      }]`
+      return shown === "" ? marker : `${shown}\n${marker}`
     })
 
     // The model reads an error's message and any provider response body, so each is bounded like output.
@@ -179,8 +184,8 @@ const layer = Layer.effect(
       if (message === undefined && body === undefined) return error
       return {
         ...error,
-        ...(message === undefined ? {} : { message: preview(message) }),
-        ...(body === undefined ? {} : { response: { ...error.response, body: preview(body) } }),
+        ...(message === undefined ? {} : { message }),
+        ...(body === undefined ? {} : { response: { ...error.response, body } }),
       }
     })
 
@@ -223,3 +228,41 @@ export const node = makeLocationNode({
   layer,
   deps: [FSUtil.node, Global.node, cleanupNode],
 })
+
+/** How many lines `text` has, not counting an empty one after a final line break. Counts without splitting. */
+function countLines(text: string) {
+  if (text === "") return 0
+  let count = 1
+  for (let index = text.indexOf("\n"); index !== -1 && index < text.length - 1; index = text.indexOf("\n", index + 1))
+    count++
+  return count
+}
+
+/** Where the line after the first `count` lines starts, or the end of `text`. */
+function afterLines(text: string, count: number) {
+  let index = 0
+  for (let line = 0; line < count; line++) {
+    const next = text.indexOf("\n", index)
+    if (next === -1) return text.length
+    index = next + 1
+  }
+  return index
+}
+
+const encoder = new TextEncoder()
+const graphemes = new Intl.Segmenter(undefined, { granularity: "grapheme" })
+
+/** The longest start of `text` that fits in `budget` UTF-8 bytes without splitting a character, emoji included. */
+function byteBoundary(text: string, budget: number) {
+  // encodeInto only encodes what fits in the buffer, and stops at a whole code point.
+  const index = encoder.encodeInto(text, new Uint8Array(Math.max(0, budget))).read
+  if (index === text.length || index === 0) return index
+  const before = text.charCodeAt(index - 1)
+  const after = text.charCodeAt(index)
+  // Two ASCII characters always have a boundary between them, except the two halves of \r\n.
+  if (before < 0x80 && after < 0x80) return before === 13 && after === 10 ? index - 1 : index
+  // Otherwise back off to the start of the grapheme the cut is in. A line break always ends one, so segmenting from the
+  // start of the line keeps flag pairs and long emoji sequences exact; one code point past the cut gives the context.
+  const start = text.lastIndexOf("\n", index - 1) + 1
+  return start + (graphemes.segment(text.slice(start, index + 2)).containing(index - start)?.index ?? index - start)
+}

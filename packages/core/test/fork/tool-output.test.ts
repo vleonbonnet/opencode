@@ -73,7 +73,7 @@ describe("ToolOutput", () => {
           // Two bytes per character: the sixth would cross the limit, and no character is split.
           const message = `${"é".repeat(50)}\nsecond`
           const bounded = yield* output.truncateError({ type: "tool.execution", message })
-          const kept = /^é{5}\n\[showing 10 of 100 bytes of line 1 of 2; full error saved to (.+)\]$/.exec(
+          const kept = /^é{5}\n\[showing lines 1-1 of 2 \(last line cut\); full error saved to (.+)\]$/.exec(
             bounded.message,
           )
           expect(bounded).toEqual({ type: "tool.execution", message: expect.any(String) })
@@ -92,7 +92,9 @@ describe("ToolOutput", () => {
           yield* fs.writeFileString(path.join(root, ToolOutput.DIRECTORY), "")
           expect(yield* output.truncateError({ type: "tool.execution", message: "one\ntwo\nthree" })).toEqual({
             type: "tool.execution",
-            message: "one\ntwo\n[showing lines 1-2 of 3; the full error could not be saved]",
+            message: expect.stringMatching(
+              /^one\ntwo\n\[showing lines 1-2 of 3; full error could not be saved: E[A-Z]+: [^\n]+\]$/,
+            ),
           })
         }),
       { maxLines: 2, maxBytes: 1_000 },

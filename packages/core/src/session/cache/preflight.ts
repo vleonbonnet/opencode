@@ -123,7 +123,9 @@ const predict = Effect.fn("SessionPreflight.predict")(function* (input: {
     return yield* unknown(selection.failure.message)
   }
   const selected = selection.success
-  const resolved = yield* context.resolveModel(selected.session).pipe(Effect.result)
+  const resolved = yield* context
+    .resolveModel(selected.session, { kind: "primary", agent: selected.agent.id })
+    .pipe(Effect.result)
   if (resolved._tag === "Failure") {
     if (
       resolved.failure instanceof SessionRunnerModel.ModelUnavailableError &&

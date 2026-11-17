@@ -72,6 +72,8 @@ export const {
     sessionID?: string
     /** Whether message meta names the agent; the app follows its Show agent setting. Defaults to true. */
     agents?: boolean
+    /** Whether the assistant copy control stays visible at rest; the app enables this on dev/local builds. */
+    copyAlwaysVisible?: boolean
     shellRunning?: (id: string) => boolean
     shellOutput?: (input: ShellOutputInput) => Promise<ShellOutputOutput>
     turnDiff?: TurnDiffSource
@@ -79,8 +81,6 @@ export const {
     peekMedia?: PeekMediaUrlFn
     onNavigateToSession?: NavigateToSessionFn
     onSessionHref?: SessionHrefFn
-    /** Whether `experimental.background_compaction` is on for this location; automatic compactions then show quietly. */
-    backgroundCompaction?: boolean
   }) => {
     return {
       get store() {
@@ -95,8 +95,8 @@ export const {
       get agents() {
         return props.agents ?? true
       },
-      get backgroundCompaction() {
-        return props.backgroundCompaction === true
+      get copyAlwaysVisible() {
+        return props.copyAlwaysVisible === true
       },
       navigateToSession: props.onNavigateToSession,
       sessionHref: props.onSessionHref,

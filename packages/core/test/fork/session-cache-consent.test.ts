@@ -604,7 +604,7 @@ describe("stale thinking consent", () => {
           ],
         }),
       )
-      expect(yield* session.generate({ sessionID, prompt: "Reply with exactly: OK" })).toBe("OK")
+      expect((yield* session.generate({ sessionID, prompt: "Reply with exactly: OK" })).text).toBe("OK")
       expect(behavior(provider.requests[start + 2])).toBe("drop_block")
       // The Session's thinking state is what its turns left.
       expect(yield* kv.get(`session-cache:${sessionID}`)).toEqual(before)

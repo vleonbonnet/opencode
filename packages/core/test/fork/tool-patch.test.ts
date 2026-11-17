@@ -1,10 +1,12 @@
 import fs from "fs/promises"
 import path from "path"
 import { describe, expect } from "bun:test"
-import { Effect, Layer, Schema } from "effect"
+import { Effect, Layer } from "effect"
 import { AppNodeBuilder } from "@opencode/core/effect/app-node-builder"
 import { LayerNode } from "@opencode/util/effect/layer-node"
+import { Config } from "@opencode/core/config"
 import { Environment } from "@opencode/core/environment/index"
+import { Flag } from "@opencode/core/flag"
 import { Formatter } from "@opencode/core/formatter"
 import { FileMutation } from "@opencode/core/file-mutation"
 import { Location } from "@opencode/core/location"
@@ -39,6 +41,8 @@ const patchToolNode = makeLocationNode({
     Formatter.node,
     Location.node,
     Permission.node,
+    Config.node,
+    Flag.node,
   ],
 })
 
@@ -100,11 +104,11 @@ describe("PatchTool", () => {
           "﻿#+name: example\r\n#+begin_src bash\r\necho new\r\necho added\r\n#+end_src\r\n",
         )
         expect(yield* Effect.promise(() => fs.readFile(unix, "utf8"))).toBe("before\nnew\nafter\n")
-        const output = Schema.decodeUnknownSync(PatchTool.Output)(settled.output)
-        expect(output.files[0]?.patch).not.toContain("-#+name:")
-        expect(output.files[0]?.patch).not.toContain("+#+name:")
-        expect(output.files[0]?.patch).not.toContain("﻿")
-        expect(output.files[0]).toMatchObject({ additions: 2, deletions: 1 })
+        const file = settled.metadata?.files?.[0]
+        expect(file?.patch).not.toContain("-#+name:")
+        expect(file?.patch).not.toContain("+#+name:")
+        expect(file?.patch).not.toContain("﻿")
+        expect(file).toMatchObject({ additions: 2, deletions: 1 })
       }),
     ),
   )

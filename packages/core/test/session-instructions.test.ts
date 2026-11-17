@@ -6,6 +6,7 @@ import { Agent } from "@opencode/core/agent"
 import { AppNodeBuilder } from "@opencode/core/effect/app-node-builder"
 import { LayerNode } from "@opencode/util/effect/layer-node"
 import { Config } from "@opencode/core/config"
+import { Flag } from "@opencode/core/flag"
 import { Database } from "@opencode/core/database/database"
 import { Bus } from "@opencode/core/bus"
 import { FSUtil } from "@opencode/util/fs-util"
@@ -13,6 +14,7 @@ import { Global } from "@opencode/util/global"
 import { Image } from "@opencode/core/image"
 import { Location } from "@opencode/core/location"
 import { FileAccess } from "@opencode/core/file-access"
+import { Environment } from "@opencode/core/environment/index"
 import { Model } from "@opencode/core/model"
 import { Permission } from "@opencode/core/permission"
 import { Project } from "@opencode/core/project"
@@ -50,7 +52,10 @@ const readToolNode = makeLocationNode({
     SessionInstructions.node,
     Skill.node,
     FSUtil.node,
+    Environment.node,
     Location.node,
+    Config.node,
+    Flag.node,
   ],
 })
 

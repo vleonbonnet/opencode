@@ -8,6 +8,7 @@ export type OpaqueReason =
   | "heredoc"
   | "invalid-redirect"
   | "invalid-structure"
+  | "unsupported-escape"
   | "unterminated-escape"
   | "unterminated-quote"
 
@@ -1033,7 +1034,7 @@ function scanBashOperatorOrSeparator(
       state.redirectWordCount = state.words.length
     }
     if (redirect === "<<" || redirect === "<<-") {
-      const delimiter = bashHeredocDelimiter(input, index + redirect.length, redirect === "<<-")
+      const delimiter = bashHeredocDelimiter(input, index + redirect.length, redirect === "<<-", context.dialect)
       if (!delimiter) return { kind: "opaque", reason: "invalid-redirect" }
       state.hasFileRedirect = true
       state.redirectPrefixEnd ??= " \t".includes(input[index + redirect.length] ?? "")
@@ -1480,8 +1481,8 @@ function scanBashUnit(
     return index + 1
   }
   if (mode === "word" && opener === "$'") {
-    const quote = bashAnsiQuote(input, index + 1)
-    if (!quote) return { kind: "opaque", reason: "unterminated-quote" }
+    const quote = bashAnsiQuote(input, index + 1, context.dialect)
+    if ("reason" in quote) return quote
     const firstQuote = input.indexOf("'", index + 2)
     // Dash does not support $'...' and closes the single-quoted span at the first `'`, even after `\`.
     if (
@@ -1495,8 +1496,8 @@ function scanBashUnit(
     return quote.end
   }
   if (mode === "arithmetic" && opener === "$'") {
-    const quote = bashAnsiQuote(input, index + 1)
-    if (!quote || quote.end !== input.indexOf("'", index + 2) || /[()[\];"}]/.test(quote.value))
+    const quote = bashAnsiQuote(input, index + 1, context.dialect)
+    if ("reason" in quote || quote.end !== input.indexOf("'", index + 2) || /[()[\];"}]/.test(quote.value))
       return { kind: "opaque", reason: "invalid-structure" }
     if (text) bashAppend(text, quote.value)
     return scanBashSpan(input, index + 2, depth, context, commands, BASH_SPANS.arithmeticQuote, allowBracket, text)
@@ -1837,8 +1838,8 @@ function scanBashParameter(
     if (!quoted && context.dialect !== "bash" && char === "(" && index > start)
       return { kind: "opaque", reason: "dynamic-execution" }
     if (quoted && char === "'" && input[index - 1] === "$") {
-      const ansi = bashAnsiQuote(input, index)
-      if (!ansi) return { kind: "opaque", reason: "unterminated-quote" }
+      const ansi = bashAnsiQuote(input, index, context.dialect)
+      if ("reason" in ansi) return ansi
       text.literal += ansi.value
     }
     const subscript = index === colon && char === "["
@@ -2017,7 +2018,12 @@ function scanBashArrayOrPattern(
   return { kind: "opaque", reason: "command-substitution" }
 }
 
-function bashAnsiQuote(input: string, start: number, allowUnicode = true) {
+function bashAnsiQuote(
+  input: string,
+  start: number,
+  dialect: Dialect,
+  allowUnicode = true,
+): { value: string; end: number } | Opaque {
   let value = ""
   for (let index = start + 1; index < input.length; index++) {
     if (input[index] === "'") return { value, end: index }
@@ -2026,7 +2032,7 @@ function bashAnsiQuote(input: string, start: number, allowUnicode = true) {
       continue
     }
     const escaped = input[++index]
-    if (escaped === undefined) return
+    if (escaped === undefined) break
     if (escaped in BASH_ANSI_ESCAPES) {
       value += BASH_ANSI_ESCAPES[escaped]
       continue
@@ -2041,16 +2047,30 @@ function bashAnsiQuote(input: string, start: number, allowUnicode = true) {
             : /[0-7]/.test(escaped)
               ? /^[0-7]{1,3}/.exec(input.slice(index, index + 3))?.[0]
               : undefined
-    if (!digits) return
-    const octal = /[0-7]/.test(escaped)
-    const point = parseInt(digits, octal ? 8 : 16)
-    if (point === 0 || point > 0x10ffff || (point >= 0xd800 && point <= 0xdfff)) return
-    value += String.fromCodePoint(point)
-    index += digits.length - (octal ? 1 : 0)
+    if (digits) {
+      const octal = /[0-7]/.test(escaped)
+      const point = parseInt(digits, octal ? 8 : 16)
+      if (point === 0 || point > 0x10ffff || (point >= 0xd800 && point <= 0xdfff))
+        return { kind: "opaque", reason: "unsupported-escape" }
+      value += String.fromCodePoint(point)
+      index += digits.length - (octal ? 1 : 0)
+      continue
+    }
+    // Bash keeps the backslash of an unknown escape and Zsh drops it, so Posix, which covers both, can't know the value.
+    // Bash 3.2 and 5 decode \c control escapes differently, and \u or \U stay rejected where Unicode is. Zsh reads \C and \M as key escapes, and \x, \u or \U
+    // without digits as NUL.
+    if (
+      dialect === "posix" ||
+      (dialect === "bash" && (escaped === "c" || (!allowUnicode && /[uU]/.test(escaped)))) ||
+      (dialect === "zsh" && /[CMxuU]/.test(escaped))
+    )
+      return { kind: "opaque", reason: "unsupported-escape" }
+    value += dialect === "bash" ? `\\${escaped}` : escaped
   }
+  return { kind: "opaque", reason: "unterminated-quote" }
 }
 
-function bashHeredocDelimiter(input: string, start: number, tabs: boolean) {
+function bashHeredocDelimiter(input: string, start: number, tabs: boolean, dialect: Dialect) {
   let delimiter = ""
   let dashDelimiter: string | undefined
   let quoted = false
@@ -2066,8 +2086,8 @@ function bashHeredocDelimiter(input: string, start: number, tabs: boolean) {
     if (!quote && char === "$" && input.startsWith("\\\n", index + 1)) return
     // Dash retains $ in $'...' heredoc delimiters while Bash and Zsh strip $.
     if (!quote && input.startsWith("$'", index)) {
-      const literal = bashAnsiQuote(input, index + 1, false)
-      if (!literal || literal.end !== input.indexOf("'", index + 2)) return
+      const literal = bashAnsiQuote(input, index + 1, dialect, false)
+      if ("reason" in literal || literal.end !== input.indexOf("'", index + 2)) return
       dashDelimiter = `${dashDelimiter ?? delimiter}$${input.slice(index + 2, literal.end)}`
       delimiter += literal.value
       quoted = true
@@ -2120,7 +2140,7 @@ function bashHeredocDelimiter(input: string, start: number, tabs: boolean) {
 // the line starting at BODY: where that word ends, whether it quotes the body, and the newline ending the line that
 // closes the body, absent when no line does; undefined when the shells read the delimiter differently.
 export function heredocExtent(input: string, start: number, tabs: boolean, body: number) {
-  const delimiter = bashHeredocDelimiter(input, start, tabs)
+  const delimiter = bashHeredocDelimiter(input, start, tabs, "bash")
   if (!delimiter) return
   return { word: delimiter.end + 1, quoted: delimiter.quoted, end: bashHeredoc(input, body, delimiter)?.end }
 }

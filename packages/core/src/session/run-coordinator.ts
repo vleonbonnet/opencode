@@ -7,6 +7,8 @@ import type { Promotable } from "./inbox.js"
 export interface Coordinator<Key, E, Reason = never> {
   /** Snapshots keys with an execution owned by this coordinator. */
   readonly active: Effect.Effect<ReadonlySet<Key>>
+  /** Snapshots keys genuinely draining: owned and not stopping. Settlement windows are excluded. */
+  readonly draining: Effect.Effect<ReadonlySet<Key>>
   /** Checks ownership for one key, including cleanup and terminal settlement. */
   readonly isActive: (key: Key) => Effect.Effect<boolean>
   /** Starts an execution while idle, or joins the active execution and returns its exit. */
@@ -26,6 +28,8 @@ export interface Coordinator<Key, E, Reason = never> {
    * teardown. Records the reason only: the drain still interrupts itself, and wakes stay unclaimed.
    */
   readonly stopReason: (key: Key, reason: Reason) => Effect.Effect<void>
+  /** Why the key's execution is being stopped, once `interrupt` stopped it; undefined for teardown or when running. */
+  readonly interruption: (key: Key) => Reason | undefined
   /** Resolves once no execution is active for the key. Returns immediately when already idle and never starts work. */
   readonly awaitIdle: (key: Key) => Effect.Effect<void>
 }
@@ -182,13 +186,26 @@ export const make = <Key, E, Reason = never>(options: {
         return Deferred.await(execution.done).pipe(Effect.ignoreCause, Effect.andThen(awaitIdle(key)))
       })
 
+    const interruption = (key: Key) => executions.get(key)?.interruptionReason
+
+    const draining = Effect.sync(
+      () =>
+        new Set(
+          [...executions.entries()].flatMap(([key, execution]) =>
+            execution.owner !== undefined && !execution.stopping ? [key] : [],
+          ),
+        ),
+    )
+
     return {
       active: Effect.sync(() => new Set(executions.keys())),
+      draining,
       isActive,
       run,
       wake,
       interrupt,
       stopReason,
+      interruption,
       awaitIdle,
     }
   })
