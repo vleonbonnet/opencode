@@ -28,6 +28,7 @@ import {
   type Reply,
   type Sent,
 } from "./lib/session-cache"
+import { SessionPreflight } from "@opencode/core/session/cache/preflight"
 
 const provider = makeProvider()
 const it = testEffect(stack(provider))
@@ -148,6 +149,7 @@ describe("stale thinking consent", () => {
       const sessionID = Session.ID.make("ses_consent_stale")
       yield* createSession(sessionID)
       const session = yield* Session.Service
+      const preflight = yield* SessionPreflight.Service
       const change = yield* systemChange(sessionID)
       const dropped = yield* collectDropped
       const start = provider.requests.length
@@ -164,7 +166,7 @@ describe("stale thinking consent", () => {
 
       // The system prompt changes: sig-1 no longer matches, nor does sig-2, which no request replayed yet.
       change.changed = true
-      const report = yield* session.preflight({ sessionID, text: "third" })
+      const report = yield* preflight.preflight({ sessionID, text: "third" })
       expect(report.staleThinking).toMatchObject({
         count: 2,
         reason: "the system prompt changed",
@@ -195,7 +197,7 @@ describe("stale thinking consent", () => {
       expect(texts(consented)).not.toContain(earlier("reasoning two"))
 
       const [first, secondAssistant] = yield* assistantIDs(sessionID)
-      const markers = yield* session.thinking(sessionID)
+      const markers = yield* preflight.thinking(sessionID)
       expect(markers.map(({ time: _time, ...marker }) => marker)).toEqual([
         { messageID: first, ordinal: 0, reason: CacheLedger.DROPPED_WITH_CONSENT, asText: false },
         { messageID: secondAssistant, ordinal: 0, reason: CacheLedger.DROPPED_WITH_CONSENT, asText: false },
@@ -239,7 +241,7 @@ describe("stale thinking consent", () => {
       const kv = yield* KV.Service
       const fork = yield* session.fork({ sessionID })
       const forkedMarkers = yield* eventually(
-        session.thinking(fork.id).pipe(Effect.map((items) => (items.length === 2 ? items : undefined))),
+        preflight.thinking(fork.id).pipe(Effect.map((items) => (items.length === 2 ? items : undefined))),
         "the fork's markers",
       )
       const forkAssistants = yield* assistantIDs(fork.id)
@@ -263,6 +265,7 @@ describe("stale thinking consent", () => {
       const sessionID = Session.ID.make("ses_consent_non_claude")
       yield* createSession(sessionID)
       const session = yield* Session.Service
+      const preflight = yield* SessionPreflight.Service
       yield* session.switchModel({ sessionID, model: models.bound.ref })
       const change = yield* systemChange(sessionID)
       const start = provider.requests.length
@@ -272,7 +275,7 @@ describe("stale thinking consent", () => {
       yield* confirmed(sessionID, 1)
 
       change.changed = true
-      const report = yield* session.preflight({ sessionID, text: "second" })
+      const report = yield* preflight.preflight({ sessionID, text: "second" })
       expect(report.staleThinking).toMatchObject({
         count: 1,
         reason: "the system prompt changed",
@@ -286,7 +289,7 @@ describe("stale thinking consent", () => {
       const consented = provider.requests[start + 1]
       expect(signatures(consented)).toEqual([])
       expect(texts(consented)).toContain(earlier("reasoning nc"))
-      expect((yield* session.thinking(sessionID)).map((marker) => marker.asText)).toEqual([true])
+      expect((yield* preflight.thinking(sessionID)).map((marker) => marker.asText)).toEqual([true])
     }),
   )
 
@@ -295,6 +298,7 @@ describe("stale thinking consent", () => {
       const sessionID = Session.ID.make("ses_consent_single_step")
       yield* createSession(sessionID)
       const session = yield* Session.Service
+      const preflight = yield* SessionPreflight.Service
       const review = yield* reviewAgent
       const start = provider.requests.length
 
@@ -304,7 +308,7 @@ describe("stale thinking consent", () => {
       yield* confirmed(sessionID, 1)
       yield* session.switchAgent({ sessionID, agent: review })
 
-      const report = yield* session.preflight({ sessionID, text: "second" })
+      const report = yield* preflight.preflight({ sessionID, text: "second" })
       expect(report.staleThinking).toMatchObject({ count: 1, reason: "the system prompt changed" })
       const refused = yield* run(sessionID, "second", ask)
       expect(failureOf(refused)?.type).toBe("thinking.stale")
@@ -322,7 +326,7 @@ describe("stale thinking consent", () => {
     Effect.gen(function* () {
       const sessionID = Session.ID.make("ses_consent_refused")
       yield* createSession(sessionID)
-      const session = yield* Session.Service
+      const preflight = yield* SessionPreflight.Service
       const kv = yield* KV.Service
       const start = provider.requests.length
 
@@ -360,7 +364,7 @@ describe("stale thinking consent", () => {
 
       // The preflight says so, and what the consented turn reuses: it replays both blocks as text, so the cache is
       // lost from the first of them on.
-      const report = yield* session.preflight({ sessionID, text: "fourth" })
+      const report = yield* preflight.preflight({ sessionID, text: "fourth" })
       expect(report.staleThinking?.count).toBe(2)
       expect(report.staleThinking?.reason).toBe(
         "the provider rejected the block at messages.1.content.0: The `system` prompt differs from the one this block was created with.",
@@ -381,9 +385,9 @@ describe("stale thinking consent", () => {
       expect(signatures(consented)).toEqual([])
       expect(texts(consented)).not.toContain(earlier("reasoning a"))
       expect(texts(consented)).not.toContain(earlier("reasoning b"))
-      expect((yield* session.thinking(sessionID)).map((marker) => marker.asText)).toEqual([false, false])
+      expect((yield* preflight.thinking(sessionID)).map((marker) => marker.asText)).toEqual([false, false])
       yield* confirmed(sessionID, 3)
-      expect((yield* session.preflight({ sessionID, text: "sixth" })).staleThinking).toBeUndefined()
+      expect((yield* preflight.preflight({ sessionID, text: "sixth" })).staleThinking).toBeUndefined()
     }),
   )
 
@@ -394,6 +398,7 @@ describe("stale thinking consent", () => {
         const sessionID = Session.ID.make("ses_consent_unknown")
         yield* createSession(sessionID)
         const session = yield* Session.Service
+        const preflight = yield* SessionPreflight.Service
         const review = yield* reviewAgent
         const start = provider.requests.length
 
@@ -402,7 +407,7 @@ describe("stale thinking consent", () => {
         yield* confirmed(sessionID, 1)
         // A month idle: the ledger no longer knows what sig-u was bound to, as for a session from before it.
         yield* forgetBindings(sessionID)
-        const unknown = yield* session.preflight({ sessionID, text: "second" })
+        const unknown = yield* preflight.preflight({ sessionID, text: "second" })
         expect(unknown.staleThinking).toMatchObject({ count: 1, reason: UNKNOWN_BINDING })
 
         // Switched to the reviewer, the turn sends the block, and the provider rejects it.
@@ -413,7 +418,7 @@ describe("stale thinking consent", () => {
         expect(behavior(provider.requests[start + 1])).toBe("error")
         expect(failureOf(rejected)?.type).toBe("thinking.stale")
         const reported = yield* eventually(
-          session
+          preflight
             .preflight({ sessionID, text: "second" })
             .pipe(Effect.map((report) => (report.staleThinking?.reason !== UNKNOWN_BINDING ? report : undefined))),
           "the refusal in the preflight",
@@ -422,14 +427,14 @@ describe("stale thinking consent", () => {
 
         // Switching back undoes the change: the block is of unknown binding again, sent, and accepted.
         yield* session.switchAgent({ sessionID, agent: Agent.ID.make("build") })
-        const undone = yield* session.preflight({ sessionID, text: "third" })
+        const undone = yield* preflight.preflight({ sessionID, text: "third" })
         expect(undone.staleThinking?.reason).toBe(UNKNOWN_BINDING)
         provider.reply(turn({ text: "answer three" }))
         const accepted = yield* run(sessionID, "third", ask)
         expect(Exit.isSuccess(accepted)).toBe(true)
         expect(signatures(provider.requests[start + 2])).toEqual(["sig-u"])
         yield* confirmed(sessionID, 1)
-        expect((yield* session.preflight({ sessionID, text: "fourth" })).staleThinking).toBeUndefined()
+        expect((yield* preflight.preflight({ sessionID, text: "fourth" })).staleThinking).toBeUndefined()
       }),
     // A month of hourly sweeps on the test clock.
     30_000,
@@ -440,6 +445,7 @@ describe("stale thinking consent", () => {
       const sessionID = Session.ID.make("ses_consent_unasked")
       yield* createSession(sessionID)
       const session = yield* Session.Service
+      const preflight = yield* SessionPreflight.Service
       const change = yield* systemChange(sessionID)
       const runs = yield* contextRuns(sessionID)
       const dropped = yield* collectDropped
@@ -473,7 +479,7 @@ describe("stale thinking consent", () => {
       expect(behavior(provider.requests[start + 2])).toBe("drop_block")
       expect(signatures(provider.requests[start + 2])).toEqual(["sig-x", "sig-y"])
       const markers = yield* eventually(
-        session.thinking(sessionID).pipe(Effect.map((items) => (items.length === 2 ? items : undefined))),
+        preflight.thinking(sessionID).pipe(Effect.map((items) => (items.length === 2 ? items : undefined))),
         "the provider-dropped markers",
       )
       const [first, second] = yield* assistantIDs(sessionID)
@@ -499,7 +505,7 @@ describe("stale thinking consent", () => {
       // A fork before the second answer keeps only the first answer's marker.
       const fork = yield* session.fork({ sessionID, before: second })
       const forked = yield* eventually(
-        session.thinking(fork.id).pipe(Effect.map((items) => (items.length > 0 ? items : undefined))),
+        preflight.thinking(fork.id).pipe(Effect.map((items) => (items.length > 0 ? items : undefined))),
         "the fork's marker",
       )
       const [forkFirst, ...rest] = yield* assistantIDs(fork.id)
@@ -512,7 +518,7 @@ describe("stale thinking consent", () => {
     Effect.gen(function* () {
       const sessionID = Session.ID.make("ses_consent_unreported")
       yield* createSession(sessionID)
-      const session = yield* Session.Service
+      const preflight = yield* SessionPreflight.Service
       const change = yield* systemChange(sessionID)
 
       provider.reply(turn({ thinking: { text: "reasoning p", signature: "sig-p" }, text: "answer p" }))
@@ -526,7 +532,7 @@ describe("stale thinking consent", () => {
       provider.reply(turn({ text: "answer r", transformations: false }))
       yield* run(sessionID, "third")
       const markers = yield* eventually(
-        session.thinking(sessionID).pipe(Effect.map((items) => (items.length === 2 ? items : undefined))),
+        preflight.thinking(sessionID).pipe(Effect.map((items) => (items.length === 2 ? items : undefined))),
         "the predicted markers",
       )
       expect(markers.every((marker) => marker.reason === CacheLedger.DROPPED_UNASKED && !marker.asText)).toBe(true)
@@ -538,6 +544,7 @@ describe("stale thinking consent", () => {
       const sessionID = Session.ID.make("ses_consent_subagent")
       yield* createSession(sessionID)
       const session = yield* Session.Service
+      const preflight = yield* SessionPreflight.Service
       const review = yield* reviewAgent
       const start = provider.requests.length
 
@@ -559,7 +566,7 @@ describe("stale thinking consent", () => {
       expect(provider.requests.length).toBe(start + 2)
       expect(behavior(provider.requests[start + 1])).toBe("drop_block")
       const markers = yield* eventually(
-        session.thinking(sessionID).pipe(Effect.map((items) => (items.length > 0 ? items : undefined))),
+        preflight.thinking(sessionID).pipe(Effect.map((items) => (items.length > 0 ? items : undefined))),
         "the dropped marker",
       )
       expect(markers.map((marker) => marker.reason)).toEqual([CacheLedger.DROPPED_UNASKED])
@@ -571,6 +578,7 @@ describe("stale thinking consent", () => {
       const sessionID = Session.ID.make("ses_consent_keepalive")
       yield* createSession(sessionID)
       const session = yield* Session.Service
+      const preflight = yield* SessionPreflight.Service
       const kv = yield* KV.Service
       const change = yield* systemChange(sessionID)
       const start = provider.requests.length
@@ -600,8 +608,8 @@ describe("stale thinking consent", () => {
       expect(behavior(provider.requests[start + 2])).toBe("drop_block")
       // The Session's thinking state is what its turns left.
       expect(yield* kv.get(`session-cache:${sessionID}`)).toEqual(before)
-      expect(yield* session.thinking(sessionID)).toEqual([])
-      expect((yield* session.preflight({ sessionID, text: "third" })).staleThinking?.count).toBe(2)
+      expect(yield* preflight.thinking(sessionID)).toEqual([])
+      expect((yield* preflight.preflight({ sessionID, text: "third" })).staleThinking?.count).toBe(2)
       const refused = yield* run(sessionID, "third", ask)
       expect(failureOf(refused)?.type).toBe("thinking.stale")
     }),
@@ -612,6 +620,7 @@ describe("stale thinking consent", () => {
       const sessionID = Session.ID.make("ses_consent_other_protocol")
       yield* createSession(sessionID)
       const session = yield* Session.Service
+      const preflight = yield* SessionPreflight.Service
       const change = yield* systemChange(sessionID)
       const runs = yield* contextRuns(sessionID)
       const start = provider.requests.length
@@ -632,7 +641,7 @@ describe("stale thinking consent", () => {
       expect(Exit.isSuccess(chat)).toBe(true)
       expect(runs).toEqual([undefined, true, undefined, undefined])
       expect(provider.requests[start + 2].url).toEndWith("/chat/completions")
-      expect((yield* session.preflight({ sessionID, text: "fourth" })).staleThinking).toBeUndefined()
+      expect((yield* preflight.preflight({ sessionID, text: "fourth" })).staleThinking).toBeUndefined()
     }),
   )
 
@@ -640,7 +649,7 @@ describe("stale thinking consent", () => {
     Effect.gen(function* () {
       const sessionID = Session.ID.make("ses_consent_hook_dry_run")
       yield* createSession(sessionID)
-      const session = yield* Session.Service
+      const preflight = yield* SessionPreflight.Service
       const hooks = yield* PluginHooks.Service
       const seen: Array<[string, boolean | undefined]> = []
       yield* hooks.register("session", "model.request", (event) =>
@@ -659,7 +668,7 @@ describe("stale thinking consent", () => {
         ["model.request", undefined],
         ["http.request", undefined],
       ])
-      yield* session.preflight({ sessionID, text: "second" })
+      yield* preflight.preflight({ sessionID, text: "second" })
       expect(seen.slice(2)).toEqual([
         ["model.request", true],
         ["http.request", true],
@@ -671,7 +680,7 @@ describe("stale thinking consent", () => {
     Effect.gen(function* () {
       const sessionID = Session.ID.make("ses_consent_running")
       yield* createSession(sessionID)
-      const session = yield* Session.Service
+      const preflight = yield* SessionPreflight.Service
       const start = provider.requests.length
       let release: (reply: Reply) => void = () => {}
       provider.reply({ type: "deferred", reply: new Promise<Reply>((resolve) => (release = resolve)) })
@@ -681,7 +690,7 @@ describe("stale thinking consent", () => {
         Effect.sync(() => (provider.requests.length > start ? true : undefined)),
         "the running turn's request",
       )
-      const report = yield* session.preflight({ sessionID, text: "second" })
+      const report = yield* preflight.preflight({ sessionID, text: "second" })
       expect(report.status).toBe("unknown")
       expect(report.running).toBe(true)
       expect(report.reasons).toEqual(["a turn is running"])

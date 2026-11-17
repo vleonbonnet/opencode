@@ -8,6 +8,7 @@ import { Session } from "@opencode/core/session"
 import { CacheLedger } from "@opencode/core/session/cache/ledger"
 import { CacheModel } from "@opencode/core/session/cache/model"
 import { SessionCache } from "@opencode/core/session/cache/service"
+import { SessionPreflight } from "@opencode/core/session/cache/preflight"
 import { SessionEvent } from "@opencode/core/session/event"
 import { SessionTable } from "@opencode/core/session/sql"
 import { Clock, Duration, Effect, Schema, Stream } from "effect"
@@ -99,7 +100,7 @@ describe("session cache expiry", () => {
       const idle = Session.ID.make("ses_expiry_idle")
       yield* createSession(sessionID)
       yield* createSession(idle)
-      const session = yield* Session.Service
+      const cache = yield* SessionCache.Service
       const seen = yield* collectUpdates
       const sent = yield* Clock.currentTimeMillis
       provider.reply(turn({ text: "Hello there.", usage: { input: 3, output: 5, write: 120_000 } }))
@@ -110,7 +111,7 @@ describe("session cache expiry", () => {
       const expected = { expires: sent + HOUR, ttl: HOUR, tokens: 120_000, promptTokens: 120_003 }
       const [update] = yield* updatesOf(seen, sessionID, 1)
       expect(update).toEqual({ sessionID, expiry: expected })
-      const listed = yield* session.cache
+      const listed = yield* cache.expiries
       expect(listed.get(sessionID)).toEqual(expected)
       // A Session without a confirmed request has none.
       expect(listed.has(idle)).toBe(false)
@@ -127,11 +128,11 @@ describe("session cache expiry", () => {
         tokens: 120_040,
         promptTokens: 120_060,
       })
-      expect((yield* session.cache).get(sessionID)).toEqual(refreshed.expiry!)
+      expect((yield* cache.expiries).get(sessionID)).toEqual(refreshed.expiry!)
 
       // Expiring in time publishes nothing; the list leaves the Session out.
       yield* TestClock.adjust(Duration.hours(1))
-      expect((yield* session.cache).has(sessionID)).toBe(false)
+      expect((yield* cache.expiries).has(sessionID)).toBe(false)
       expect(seen.filter((update) => update.sessionID === sessionID)).toHaveLength(2)
     }),
   )
@@ -140,7 +141,7 @@ describe("session cache expiry", () => {
     Effect.gen(function* () {
       const sessionID = Session.ID.make("ses_expiry_child")
       yield* createChild(sessionID, Session.ID.make("ses_expiry_parent"))
-      const session = yield* Session.Service
+      const cache = yield* SessionCache.Service
       const seen = yield* collectUpdates
       const sent = yield* Clock.currentTimeMillis
       provider.reply(turn({ text: "Hello there.", usage: { input: 3, output: 5, write: 60_000 } }))
@@ -150,9 +151,9 @@ describe("session cache expiry", () => {
       const expected = { expires: sent + 5 * 60_000, ttl: 5 * 60_000, tokens: 60_000, promptTokens: 60_003 }
       const [update] = yield* updatesOf(seen, sessionID, 1)
       expect(update.expiry).toEqual(expected)
-      expect((yield* session.cache).get(sessionID)).toEqual(expected)
+      expect((yield* cache.expiries).get(sessionID)).toEqual(expected)
       yield* TestClock.adjust(Duration.minutes(5))
-      expect((yield* session.cache).has(sessionID)).toBe(false)
+      expect((yield* cache.expiries).has(sessionID)).toBe(false)
     }),
   )
 
@@ -160,19 +161,19 @@ describe("session cache expiry", () => {
     Effect.gen(function* () {
       const sessionID = Session.ID.make("ses_expiry_preflight")
       yield* createSession(sessionID)
-      const session = yield* Session.Service
+      const preflight = yield* SessionPreflight.Service
       const sent = yield* Clock.currentTimeMillis
       provider.reply(turn({ text: "Hello there.", usage: { input: 3, output: 5, write: 120_000 } }))
       yield* run(sessionID, "Say hello. " + "x".repeat(200_000))
       yield* confirmed(sessionID, 1)
 
       yield* TestClock.adjust(Duration.minutes(10))
-      const report = yield* session.preflight({ sessionID, text: "And now?" })
+      const report = yield* preflight.preflight({ sessionID, text: "And now?" })
       expect(report.status).toBe("hit")
       expect(report.previous).toMatchObject({ time: sent, ageMs: 10 * 60_000, expires: sent + HOUR, ttl: HOUR })
 
       yield* TestClock.adjust(Duration.hours(1))
-      const expired = yield* session.preflight({ sessionID, text: "And now?" })
+      const expired = yield* preflight.preflight({ sessionID, text: "And now?" })
       expect(expired.previous).toMatchObject({ time: sent })
       expect(expired.previous?.expires).toBeUndefined()
       expect(expired.previous?.ttl).toBeUndefined()
@@ -184,6 +185,7 @@ describe("session cache expiry", () => {
       const sessionID = Session.ID.make("ses_expiry_keepalive")
       yield* createSession(sessionID)
       const session = yield* Session.Service
+      const cache = yield* SessionCache.Service
       const seen = yield* collectUpdates
       const sent = yield* Clock.currentTimeMillis
       provider.reply(turn({ text: "Hello there.", usage: { input: 3, output: 5, write: 120_000 } }))
@@ -198,7 +200,7 @@ describe("session cache expiry", () => {
       // The generation read the Session's tip; its own prompt is not the Session's.
       const expected = { expires: sent + 50 * 60_000 + HOUR, ttl: HOUR, tokens: 120_000, promptTokens: 120_003 }
       expect(kept.expiry).toEqual(expected)
-      expect((yield* session.cache).get(sessionID)).toEqual(expected)
+      expect((yield* cache.expiries).get(sessionID)).toEqual(expected)
     }),
   )
 
@@ -246,9 +248,9 @@ describe("session cache expiry", () => {
         Schema.encodeSync(Schema.toCodecJson(CacheLedger.Entries))(entries),
       )
 
-      const session = yield* Session.Service
+      const cache = yield* SessionCache.Service
       const seen = yield* collectUpdates
-      expect((yield* session.cache).get(sessionID)).toEqual({
+      expect((yield* cache.expiries).get(sessionID)).toEqual({
         expires: now + 3 * 60_000,
         ttl: 5 * 60_000,
         tokens: 50_000,
@@ -257,7 +259,6 @@ describe("session cache expiry", () => {
 
       // Another Session's request extending that one (a fork's, or a generation sharing the prefix) reads its tip: the
       // Session it belongs to, known only from the persisted record, is told its entry was refreshed.
-      const cache = yield* SessionCache.Service
       const other = Session.ID.make("ses_expiry_reader")
       const body = JSON.parse(captured.body)
       yield* cache.sent({ sessionID: other, ref: models.primary.ref, key: "gen_reader", snapshot: false })({
@@ -276,13 +277,13 @@ describe("session cache expiry", () => {
       const [refreshed] = yield* updatesOf(seen, sessionID, 1)
       const expected = { expires: now + 5 * 60_000, ttl: 5 * 60_000, tokens: 50_000, promptTokens: 50_003 }
       expect(refreshed.expiry).toEqual(expected)
-      expect((yield* session.cache).get(sessionID)).toEqual(expected)
+      expect((yield* cache.expiries).get(sessionID)).toEqual(expected)
       expect(seen.some((update) => update.sessionID === other)).toBe(false)
 
       // Once the conversation's 5m entry expired the Session has no cache, though its 1h system prompt (which the
       // other request refreshed too) is still live.
       yield* TestClock.adjust(Duration.minutes(5))
-      expect((yield* session.cache).has(sessionID)).toBe(false)
+      expect((yield* cache.expiries).has(sessionID)).toBe(false)
       const kept = (yield* kv.get(`prompt-cache:${CacheModel.normalize(captured).namespace}`)) as CacheLedger.Entries
       expect(Object.values(kept).some((entry) => entry.expires === now + HOUR)).toBe(true)
     }),
@@ -294,7 +295,8 @@ describe("session cache expiry", () => {
       const second = Session.ID.make("ses_expiry_root_second")
       yield* createSession(first)
       yield* createSession(second)
-      const session = yield* Session.Service
+      const preflight = yield* SessionPreflight.Service
+      const cache = yield* SessionCache.Service
       const seen = yield* collectUpdates
       const sent = yield* Clock.currentTimeMillis
       provider.reply(turn({ text: "Done.", usage: { input: 3, output: 2, write: 120_000 } }))
@@ -304,20 +306,20 @@ describe("session cache expiry", () => {
 
       // 50 minutes later the second Session reads the tools and system prompt they share, restarting their hour.
       yield* TestClock.adjust(Duration.minutes(50))
-      const shared = (yield* session.preflight({ sessionID: second, text: "Second task." })).reusableTokens
+      const shared = (yield* preflight.preflight({ sessionID: second, text: "Second task." })).reusableTokens
       expect(shared).toBeGreaterThan(0)
       expect(shared).toBeLessThan(120_000)
       provider.reply(turn({ text: "Done.", usage: { input: 3, output: 2, read: shared, write: 90_000 } }))
       yield* run(second, "Second task. " + "b".repeat(150_000))
       yield* confirmed(second, 1)
       yield* updatesOf(seen, second, 1)
-      expectAgreement(seen, yield* session.cache)
+      expectAgreement(seen, yield* cache.expiries)
 
       yield* TestClock.adjust(Duration.minutes(10))
-      const listed = yield* session.cache
+      const listed = yield* cache.expiries
       expect(listed.has(first)).toBe(false)
       // A next turn of the first Session would still read the shared prefix: its preflight says so, with the new hour.
-      const report = yield* session.preflight({ sessionID: first, text: "And now?" })
+      const report = yield* preflight.preflight({ sessionID: first, text: "And now?" })
       expect(report.reusableTokens).toBe(shared)
       expect(report.previous).toMatchObject({ expires: sent + 50 * 60_000 + HOUR, ttl: HOUR })
       expect(listed.get(second)).toEqual({
@@ -338,7 +340,8 @@ describe("session cache expiry", () => {
       const running = Session.ID.make("ses_expiry_subagent_running")
       yield* createChild(done, parent)
       yield* createChild(running, parent)
-      const session = yield* Session.Service
+      const preflight = yield* SessionPreflight.Service
+      const cache = yield* SessionCache.Service
       const seen = yield* collectUpdates
       const sent = yield* Clock.currentTimeMillis
       provider.reply(turn({ text: "Done.", usage: { input: 3, output: 2, write: 60_000 } }))
@@ -347,16 +350,16 @@ describe("session cache expiry", () => {
       yield* updatesOf(seen, done, 1)
 
       yield* TestClock.adjust(Duration.minutes(4))
-      const shared = (yield* session.preflight({ sessionID: running, text: "Look into that." })).reusableTokens
+      const shared = (yield* preflight.preflight({ sessionID: running, text: "Look into that." })).reusableTokens
       expect(shared).toBeGreaterThan(0)
       provider.reply(turn({ text: "Working.", usage: { input: 3, output: 2, read: shared, write: 40_000 } }))
       yield* run(running, "Look into that. " + "b".repeat(70_000))
       yield* confirmed(running, 1)
       yield* updatesOf(seen, running, 1)
-      expectAgreement(seen, yield* session.cache)
+      expectAgreement(seen, yield* cache.expiries)
 
       yield* TestClock.adjust(Duration.minutes(1))
-      const listed = yield* session.cache
+      const listed = yield* cache.expiries
       expect(listed.has(done)).toBe(false)
       expect(listed.get(running)).toMatchObject({ expires: sent + 9 * 60_000, ttl: 5 * 60_000 })
       expect(seen.filter((update) => update.sessionID === done)).toHaveLength(1)
@@ -368,6 +371,8 @@ describe("session cache expiry", () => {
       const parent = Session.ID.make("ses_expiry_fork_parent")
       yield* createSession(parent)
       const session = yield* Session.Service
+      const preflight = yield* SessionPreflight.Service
+      const cache = yield* SessionCache.Service
       const seen = yield* collectUpdates
       const sent = yield* Clock.currentTimeMillis
       provider.reply(turn({ text: "Hello there.", usage: { input: 3, output: 5, write: 120_000 } }))
@@ -378,7 +383,7 @@ describe("session cache expiry", () => {
       yield* TestClock.adjust(Duration.minutes(10))
       const fork = yield* session.fork({ sessionID: parent })
       // The fork replays the parent's history: its next turn reads the parent's tip.
-      expect((yield* session.preflight({ sessionID: fork.id, text: "And now?" })).reusableTokens).toBe(120_000)
+      expect((yield* preflight.preflight({ sessionID: fork.id, text: "And now?" })).reusableTokens).toBe(120_000)
       provider.reply(turn({ text: "Fine.", usage: { input: 20, output: 2, read: 120_000, write: 40 } }))
       yield* run(fork.id, "And now?")
       yield* confirmed(fork.id, 1)
@@ -391,7 +396,7 @@ describe("session cache expiry", () => {
         tokens: 120_000,
         promptTokens: 120_003,
       })
-      expectAgreement(seen, yield* session.cache)
+      expectAgreement(seen, yield* cache.expiries)
 
       // The fork goes on from its own tip; the parent's is no longer read.
       yield* TestClock.adjust(Duration.minutes(55))
@@ -400,10 +405,10 @@ describe("session cache expiry", () => {
       yield* confirmed(fork.id, 2)
       yield* updatesOf(seen, fork.id, 2)
       expect(seen.filter((update) => update.sessionID === parent)).toHaveLength(2)
-      expectAgreement(seen, yield* session.cache)
+      expectAgreement(seen, yield* cache.expiries)
 
       yield* TestClock.adjust(Duration.minutes(6))
-      const listed = yield* session.cache
+      const listed = yield* cache.expiries
       expect(listed.has(parent)).toBe(false)
       expect(listed.get(fork.id)).toEqual({
         expires: sent + 125 * 60_000,
@@ -421,6 +426,7 @@ describe("session cache expiry", () => {
       yield* createSession(first)
       yield* createSession(second)
       const session = yield* Session.Service
+      const cache = yield* SessionCache.Service
       yield* session.switchModel({ sessionID: first, model: models.chat.ref })
       yield* session.switchModel({ sessionID: second, model: models.chat.ref })
       const seen = yield* collectUpdates
@@ -447,10 +453,10 @@ describe("session cache expiry", () => {
       yield* confirmed(first, 2)
       const [, next] = yield* updatesOf(seen, first, 2)
       expect(next.expiry).toEqual({ expires: sent + 9 * 60_000, ttl: 5 * 60_000, tokens: 3_040, promptTokens: 3_040 })
-      expectAgreement(seen, yield* session.cache)
+      expectAgreement(seen, yield* cache.expiries)
 
       yield* TestClock.adjust(Duration.minutes(5))
-      expect((yield* session.cache).size).toBe(0)
+      expect((yield* cache.expiries).size).toBe(0)
     }),
   )
 })

@@ -47,6 +47,7 @@ import { Effect, Layer } from "effect"
 import { HttpClient, HttpClientRequest, HttpClientResponse } from "effect/http"
 import { promptLocationNode } from "../../fixture/prompt-location"
 import { permissionLayer } from "../../lib/permission"
+import { SessionPreflight } from "@opencode/core/session/cache/preflight"
 
 export const BASE_URL = "https://api.anthropic.test/v1"
 export const MODEL_ID = "claude-fable-5-1"
@@ -320,6 +321,7 @@ export const stack = (provider: Provider) => {
       SessionCache.node,
       SessionRunnerLLM.node,
       Session.node,
+      SessionPreflight.node,
     ]),
     [
       ...replacements,

@@ -30,6 +30,10 @@ import { AbsolutePath } from "@opencode/core/schema"
 import { locationErrors } from "../location"
 import { failedMessageDecode, failedSnapshot, missingMessage, missingSession } from "./session-error"
 
+import { SessionPreflight } from "@opencode/core/session/cache/preflight"
+import { SessionCache } from "@opencode/core/session/cache/service"
+import { SessionSearchService } from "@opencode/core/session/search/service"
+
 function missingForm(id: Form.ID) {
   return new FormNotFoundError({ id, message: `Form not found: ${id}` })
 }
@@ -40,6 +44,9 @@ export const SessionHandler = HttpApiBuilder.group(Api, "server.session", (handl
     const transfer = yield* SessionTransfer.Service
     const instructions = yield* InstructionEntry.Service
     const instances = yield* Instance.Service
+    const preflight = yield* SessionPreflight.Service
+    const cache = yield* SessionCache.Service
+    const searchIndex = yield* SessionSearchService.Service
     const requireSession = (sessionID: Session.ID) =>
       session.get(sessionID).pipe(Effect.catchTag("Session.NotFoundError", missingSession))
     const requireOwnedForm = Effect.fnUntraced(function* (sessionID: Form.Info["sessionID"], formID: Form.ID) {
@@ -166,13 +173,13 @@ export const SessionHandler = HttpApiBuilder.group(Api, "server.session", (handl
       .handle(
         "session.cache",
         Effect.fn(function* () {
-          return { data: Object.fromEntries(yield* session.cache) }
+          return { data: Object.fromEntries(yield* cache.expiries) }
         }),
       )
       .handle(
         "session.search",
         Effect.fn(function* (ctx) {
-          return yield* session
+          return yield* searchIndex
             .search({
               query: ctx.query.q,
               archived: ctx.query.archived,
@@ -395,7 +402,7 @@ export const SessionHandler = HttpApiBuilder.group(Api, "server.session", (handl
         "session.preflight",
         Effect.fn(function* (ctx) {
           return {
-            data: yield* session.preflight({ sessionID: ctx.params.sessionID, ...ctx.payload }).pipe(
+            data: yield* preflight.preflight({ sessionID: ctx.params.sessionID, ...ctx.payload }).pipe(
               Effect.catchTag("Session.NotFoundError", missingSession),
               Effect.catchTag("Session.AttachmentError", (error) =>
                 Effect.fail(new InvalidRequestError({ message: error.message, field: "files" })),
@@ -411,7 +418,7 @@ export const SessionHandler = HttpApiBuilder.group(Api, "server.session", (handl
       .handle(
         "session.thinking",
         Effect.fn(function* (ctx) {
-          const dropped = yield* session
+          const dropped = yield* preflight
             .thinking(ctx.params.sessionID)
             .pipe(Effect.catchTag("Session.NotFoundError", missingSession))
           return { data: { dropped } }

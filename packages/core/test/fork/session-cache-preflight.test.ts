@@ -67,10 +67,10 @@ describe("session preflight", () => {
     Effect.gen(function* () {
       const sessionID = Session.ID.make("ses_preflight_new")
       yield* createSession(sessionID)
-      const session = yield* Session.Service
+      const preflight = yield* SessionPreflight.Service
       const before = yield* durable(sessionID)
       const sent = provider.requests.length
-      const report = yield* session.preflight({ sessionID, text: "hello" })
+      const report = yield* preflight.preflight({ sessionID, text: "hello" })
       expect(report.status).toBe("unknown")
       expect(report.running).toBeUndefined()
       expect(report.format).toBe("anthropic")
@@ -88,7 +88,7 @@ describe("session preflight", () => {
     Effect.gen(function* () {
       const sessionID = Session.ID.make("ses_preflight_turns")
       yield* createSession(sessionID)
-      const session = yield* Session.Service
+      const preflight = yield* SessionPreflight.Service
       // The conversation, not the system prompt, holds most of the prompt.
       provider.reply(turn({ text: "Hello there.", usage: { input: 3, output: 5, write: 120_000 } }))
       yield* promptAndRun(sessionID, "Say hello. " + "x".repeat(200_000))
@@ -99,7 +99,7 @@ describe("session preflight", () => {
 
       const before = yield* durable(sessionID)
       const sent = provider.requests.length
-      const hit = yield* session.preflight({ sessionID, text: "And now?" })
+      const hit = yield* preflight.preflight({ sessionID, text: "And now?" })
       expect(hit.status).toBe("hit")
       expect(hit.reusableTokens).toBe(120_000)
       expect(hit.reusableExact).toBe(true)
@@ -112,7 +112,7 @@ describe("session preflight", () => {
       expect(hit.staleThinking).toBeUndefined()
 
       // A variant with another thinking config re-keys only the messages region: tools and system stay cached.
-      const partial = yield* session.preflight({
+      const partial = yield* preflight.preflight({
         sessionID,
         text: "And now?",
         model: { ...models.deep.ref },
@@ -124,7 +124,7 @@ describe("session preflight", () => {
         partial.reasons.some((reason) => reason.includes("request parameters that key the cache changed: thinking")),
       ).toBe(true)
 
-      const miss = yield* session.preflight({ sessionID, text: "And now?", model: { ...models.other.ref } })
+      const miss = yield* preflight.preflight({ sessionID, text: "And now?", model: { ...models.other.ref } })
       expect(miss.status).toBe("miss")
       expect(miss.model).toEqual({ id: models.other.ref.id, providerID: models.other.ref.providerID })
       expect(miss.lostTokens).toBe(120_003)
@@ -147,7 +147,7 @@ describe("session preflight", () => {
     Effect.gen(function* () {
       const sessionID = Session.ID.make("ses_preflight_hooks")
       yield* createSession(sessionID)
-      const session = yield* Session.Service
+      const preflight = yield* SessionPreflight.Service
       const hooks = yield* PluginHooks.Service
       const seen: Array<boolean | undefined> = []
       let suffix = ""
@@ -163,9 +163,9 @@ describe("session preflight", () => {
       yield* confirmed(sessionID, 1)
       expect(seen).toEqual([undefined])
 
-      expect((yield* session.preflight({ sessionID, text: "next" })).status).toBe("hit")
+      expect((yield* preflight.preflight({ sessionID, text: "next" })).status).toBe("hit")
       suffix = "\nA plugin changed the system prompt."
-      const changed = yield* session.preflight({ sessionID, text: "next" })
+      const changed = yield* preflight.preflight({ sessionID, text: "next" })
       expect(seen).toEqual([undefined, true, true])
       // Everything from the changed system block on is lost; tool definitions before it, if any, stay cached.
       expect(["partial", "miss"]).toContain(changed.status)
@@ -178,7 +178,7 @@ describe("session preflight", () => {
     Effect.gen(function* () {
       const sessionID = Session.ID.make("ses_preflight_rotating")
       yield* createSession(sessionID)
-      const session = yield* Session.Service
+      const preflight = yield* SessionPreflight.Service
       const hooks = yield* PluginHooks.Service
       // Like Entra ID or an OAuth refresh: every request carries a fresh bearer token for the same account.
       let issued = 0
@@ -194,7 +194,7 @@ describe("session preflight", () => {
       yield* confirmed(sessionID, 1)
       expect(provider.requests.at(-1)?.headers.authorization).toBe("Bearer token-1")
 
-      const report = yield* session.preflight({ sessionID, text: "next" })
+      const report = yield* preflight.preflight({ sessionID, text: "next" })
       expect(issued).toBe(2)
       expect(report.status).toBe("hit")
       expect(report.reusableTokens).toBe(120_000)
@@ -206,12 +206,12 @@ describe("session preflight", () => {
     Effect.gen(function* () {
       const sessionID = Session.ID.make("ses_preflight_errors")
       yield* createSession(sessionID)
-      const session = yield* Session.Service
+      const preflight = yield* SessionPreflight.Service
       const sent = provider.requests.length
-      const command = yield* session.preflight({ sessionID, command: { name: "nope" } }).pipe(Effect.flip)
+      const command = yield* preflight.preflight({ sessionID, command: { name: "nope" } }).pipe(Effect.flip)
       expect(command).toBeInstanceOf(SessionPreflight.InvalidInputError)
       expect(command).toMatchObject({ field: "command", message: "Command not found: nope" })
-      const agent = yield* session.preflight({ sessionID, text: "x", agent: Agent.ID.make("nope") }).pipe(Effect.flip)
+      const agent = yield* preflight.preflight({ sessionID, text: "x", agent: Agent.ID.make("nope") }).pipe(Effect.flip)
       expect(agent).toMatchObject({ field: "agent", message: 'Agent not found: "nope"' })
       expect(provider.requests.length).toBe(sent)
     }),
@@ -221,14 +221,14 @@ describe("session preflight", () => {
     Effect.gen(function* () {
       const sessionID = Session.ID.make("ses_preflight_defect")
       yield* createSession(sessionID)
-      const session = yield* Session.Service
+      const preflight = yield* SessionPreflight.Service
       const hooks = yield* PluginHooks.Service
       yield* hooks.register("session", "context", (event) =>
         event.sessionID === sessionID && event.dryRun
           ? Effect.die(new Error("hook exploded\nat stack frame"))
           : Effect.void,
       )
-      const report = yield* session.preflight({ sessionID, text: "hello" })
+      const report = yield* preflight.preflight({ sessionID, text: "hello" })
       expect(report.status).toBe("unknown")
       expect(report.reasons).toEqual(["the next turn could not be built: hook exploded"])
     }),
@@ -239,6 +239,7 @@ describe("session preflight", () => {
       const sessionID = Session.ID.make("ses_preflight_chat")
       yield* createSession(sessionID)
       const session = yield* Session.Service
+      const preflight = yield* SessionPreflight.Service
       const kv = yield* KV.Service
       yield* session.switchModel({ sessionID, model: models.chat.ref })
       for (let index = 0; index < 6; index++) {
@@ -246,7 +247,7 @@ describe("session preflight", () => {
         yield* promptAndRun(sessionID, `question ${index} ` + "q".repeat(2_000))
         yield* confirmed(sessionID, index + 1)
       }
-      const report = yield* session.preflight({ sessionID, text: "next" })
+      const report = yield* preflight.preflight({ sessionID, text: "next" })
       expect(report.format).toBe("openai-chat")
       expect(report.status).toBe("hit")
       expect(report.reusableTokens).toBe(50 + 2_000 + 5 * 60)

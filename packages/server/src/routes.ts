@@ -53,6 +53,10 @@ import { sessionLocationLayer } from "./middleware/session-location"
 import { ServerInfo } from "./server-info"
 import type { ServerOptions } from "./options"
 
+import { SessionPreflight } from "@opencode/core/session/cache/preflight"
+import { SessionCache } from "@opencode/core/session/cache/service"
+import { SessionSearchService } from "@opencode/core/session/search/service"
+
 const applicationServiceNodes = [
   Global.node,
   FSUtil.node,
@@ -83,6 +87,10 @@ const applicationServiceNodes = [
   Schedule.node,
   Workspace.node,
   FileWatch.node,
+
+  SessionPreflight.node,
+  SessionCache.node,
+  SessionSearchService.node,
 ] as const
 const applicationServices = LayerNode.group(applicationServiceNodes)
 

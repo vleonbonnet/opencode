@@ -10,7 +10,7 @@ export * as SessionPreflight from "./preflight.js"
 
 import { LLMClient, Message } from "@opencode/ai/effect"
 import type { ModelRef, PreflightInput } from "@opencode/schema/session-cache"
-import { Cause, Clock, DateTime, Effect, Schema } from "effect"
+import { Cause, Clock, Context, DateTime, Effect, Layer, Schema } from "effect"
 import { Agent } from "../../agent.js"
 import { Command } from "../../command.js"
 import { Database } from "../../database/database.js"
@@ -31,6 +31,13 @@ import type { SessionSchema } from "../schema.js"
 import { CacheGate } from "./gate.js"
 import { CacheModel } from "./model.js"
 import { SessionCache } from "./service.js"
+import { makeGlobalNode } from "@opencode/util/effect/app-node"
+import { FSUtil } from "@opencode/util/fs-util"
+import { llmClient } from "../../effect/app-node-platform.js"
+import type { FileSystem } from "../../filesystem.js"
+import { Session } from "../../session.js"
+import type { AttachmentError, NotFoundError } from "../error.js"
+import { SessionExecution } from "../execution.js"
 
 export type Input = PreflightInput
 
@@ -291,4 +298,60 @@ const predict = Effect.fn("SessionPreflight.predict")(function* (input: {
       consent: { reusableTokens: outcome.reusableTokens, lostTokens: outcome.lostTokens },
     },
   }
+})
+
+export interface Interface {
+  /**
+   * Predicts how much of the provider's prompt cache the next turn reuses, and whether its thinking needs consent, by
+   * dry-running the request it would send. Admits, persists and sends nothing. While a turn runs the next request is
+   * not the one the client would send, so the report is unknown.
+   */
+  readonly preflight: (
+    input: Input & { readonly sessionID: SessionSchema.ID },
+  ) => Effect.Effect<
+    SessionCache.Report,
+    NotFoundError | AttachmentError | FileSystem.DirectoryNotFoundError | InvalidInputError
+  >
+  /** The reasoning blocks later requests leave out (dropped thinking), oldest first. */
+  readonly thinking: (sessionID: SessionSchema.ID) => Effect.Effect<ReadonlyArray<SessionCache.Dropped>, NotFoundError>
+}
+
+export class Service extends Context.Service<Service, Interface>()("@opencode/SessionPreflight") {}
+
+export const layer = Layer.effect(
+  Service,
+  Effect.gen(function* () {
+    const sessions = yield* Session.Service
+    const execution = yield* SessionExecution.Service
+    const cache = yield* SessionCache.Service
+    const instances = yield* Instance.Service
+    const database = yield* Database.Service
+    const llm = yield* LLMClient.Service
+    const fsUtil = yield* FSUtil.Service
+    return Service.of({
+      preflight: Effect.fn("SessionPreflight.preflight")(function* (input) {
+        const { sessionID, ...request } = input
+        const session = yield* sessions.get(sessionID)
+        if (yield* execution.isActive(sessionID))
+          return { ...(yield* cache.unknown({ sessionID, reason: "a turn is running" })), running: true }
+        return yield* run({ session, request }).pipe(
+          Effect.provideService(Instance.Service, instances),
+          Effect.provideService(Database.Service, database),
+          Effect.provideService(LLMClient.Service, llm),
+          Effect.provideService(SessionCache.Service, cache),
+          Effect.provideService(FSUtil.Service, fsUtil),
+        )
+      }),
+      thinking: Effect.fn("SessionPreflight.thinking")(function* (sessionID) {
+        yield* sessions.get(sessionID)
+        return yield* cache.dropped(sessionID)
+      }),
+    })
+  }),
+)
+
+export const node = makeGlobalNode({
+  service: Service,
+  layer,
+  deps: [Session.node, SessionExecution.node, SessionCache.node, Instance.node, Database.node, llmClient, FSUtil.node],
 })
