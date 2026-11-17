@@ -10,15 +10,14 @@ import { Tool } from "@opencode/core/tool"
 import { toSessionError } from "@opencode/core/session/to-session-error"
 import type { Info } from "@opencode/schema/tool"
 import { LayerNode } from "@opencode/util/effect/layer-node"
-import { codeModeListings } from "../lib/tool"
+import { codeModeListings, toolNodeReplacements } from "../lib/tool"
 import { Effect, Layer, Schema } from "effect"
 import { testEffect } from "../lib/effect"
-import { permissionLayer } from "../lib/permission"
 
 // The registry fixture of the upstream Tool tests, without its image normalization.
 const registryLayer = AppNodeBuilder.build(LayerNode.group([Tool.node, PluginHooks.node]), [
+  ...toolNodeReplacements(),
   Image.node.replace(Layer.mock(Image.Service, {})),
-  Permission.node.replace(permissionLayer()),
 ])
 const it = testEffect(registryLayer)
 const identity = {
@@ -61,8 +60,8 @@ describe("Tool", () => {
         { action: "*", resource: "*", effect: "allow" },
         { action: "remove", resource: "*", effect: "deny" },
       ]
-      const planned = yield* service.snapshot(plan, [plan, build])
-      const built = yield* service.snapshot(build, [build, plan])
+      const planned = yield* service.snapshot(plan, undefined, [plan, build])
+      const built = yield* service.snapshot(build, undefined, [build, plan])
 
       // Only a tool every ruleset disables is left out, so both agents list the same tools and catalog.
       expect(planned.definitions.map((tool) => tool.name)).toEqual(["insert", "execute"])
@@ -111,8 +110,8 @@ describe("Tool", () => {
         { action: "execute", resource: "*", effect: "deny" },
       ]
       const build: Permission.Ruleset = [{ action: "*", resource: "*", effect: "allow" }]
-      const planned = yield* service.snapshot(plan, [plan, build])
-      const built = yield* service.snapshot(build, [build, plan])
+      const planned = yield* service.snapshot(plan, undefined, [plan, build])
+      const built = yield* service.snapshot(build, undefined, [build, plan])
       const asPlan = (input: Parameters<Tool.Snapshot["execute"]>[0]) => ({ ...input, agent: Agent.ID.make("plan") })
       const script = {
         ...call("execute", "call-script"),
@@ -152,6 +151,7 @@ describe("Tool", () => {
       const ceiling = (rules: Permission.Ruleset): Permission.Ceiling => ({ delegator, rules: [...allow, ...rules] })
       const bounded = yield* service.snapshot(
         allow,
+        undefined,
         [allow],
         [
           ceiling([{ action: "insert", resource: "*", effect: "deny" }]),
@@ -172,6 +172,7 @@ describe("Tool", () => {
 
       const closed = yield* service.snapshot(
         allow,
+        undefined,
         [allow],
         [ceiling([{ action: "execute", resource: "*", effect: "deny" }])],
       )

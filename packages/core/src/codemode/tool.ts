@@ -16,10 +16,12 @@ import { CallID } from "@opencode/schema/tool"
 import { Clock, Context, Effect, Ref, Schema, Scope, Semaphore } from "effect"
 import { toSessionError } from "../session/to-session-error.js"
 import { definition, normalizedName } from "../tool/runtime.js"
+import { Location } from "../location.js"
 import { Permission } from "../permission.js"
 import { CodeModeCatalog } from "./catalog.js"
 import { CodeModeExecution } from "./execution.js"
 import { CodeModeFetch } from "./fetch.js"
+import { CodeModePath } from "./path.js"
 
 import { ToolUserStop } from "../tool/user-stop.js"
 
@@ -90,6 +92,8 @@ export const create = (
   inventory: Inventory,
   executeTool: (name: string, tool: Info, input: unknown, context: ToolContext) => Effect.Effect<Result, Error>,
   permission: Permission.Interface,
+  /** With `full_codemode`, the session's Location, which turns on the experimental `path` global. */
+  location?: Location.Interface,
 ) => {
   return {
     name: "execute",
@@ -126,7 +130,9 @@ export const create = (
             }),
           )
         const result = yield* runtime(inventory)
-          .execute(code)
+          .execute(code, undefined, {
+            extensions: location ? [CodeModeFetch.extension, CodeModePath.extension] : [CodeModeFetch.extension],
+          })
           .pipe(
             Effect.provideService(Run, {
               executeTool: (name, tool, input) =>
@@ -169,6 +175,7 @@ export const create = (
             // Readers outlive the fetch call that returned them, up to the end of this program's scope.
             Effect.provideService(CodeModeExecution.Service, { ...context, signal: yield* Effect.abortSignal }),
             Effect.provideService(Permission.Service, permission),
+            (program) => (location ? Effect.provideService(program, Location.Service, location) : program),
           )
         const stop = yield* Ref.get(stopped)
         if (stop) return yield* Effect.die(stop)
@@ -295,9 +302,10 @@ function runtime(inventory: Inventory) {
   const cached = runtimes.get(inventory)
   if (cached) return cached
   const tools = inventoryTools(inventory)
-  const created = CodeMode.make<typeof tools, [typeof CodeModeFetch.extension]>({
+  // Every extension a run may get; `create` picks each run's.
+  const created = CodeMode.make<typeof tools, [typeof CodeModeFetch.extension, typeof CodeModePath.extension]>({
     tools,
-    extensions: [CodeModeFetch.extension],
+    extensions: [CodeModeFetch.extension, CodeModePath.extension],
     hooks: runHooks,
   })
   runtimes.set(inventory, created)

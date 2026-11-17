@@ -170,7 +170,7 @@ const layer = Layer.effect(
       const ceilings = yield* permission.ceilings(session)
       const loaded = yield* Effect.all(
         {
-          tools: registry.snapshot(permissions, exposure, ceilings),
+          tools: registry.snapshot(permissions, location, exposure, ceilings),
           builtins: builtins.load(),
           discovery: discovery.load(),
           skills: skillInstructions.load(permissions, exposure, ceilings),
