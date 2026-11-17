@@ -1,3 +1,4 @@
+import { $ } from "bun"
 import { describe, expect } from "bun:test"
 import { realpathSync } from "node:fs"
 import fs from "fs/promises"
@@ -7,6 +8,8 @@ import { Agent } from "@opencode/core/agent"
 import { Permission } from "@opencode/core/permission"
 import { ShellTool } from "@opencode/core/tool/plugin/shell"
 import type { Tool } from "@opencode/core/tool"
+import type { FileDiff } from "@opencode/schema/file-diff"
+import { initGit } from "../../fixture/git"
 import { withTempDir } from "../../fixture/tmpdir"
 import { executeTool, toolIdentity } from "../../lib/tool"
 
@@ -44,6 +47,8 @@ export interface Harness {
     unknown
   >
 }
+
+const isWindows = process.platform === "win32"
 
 export const forkTests = (harness: Harness) => {
   const { it, permissionIt, reset, assertions, call, withSession, withScanner, runPermissionCommand } = harness
@@ -136,6 +141,88 @@ export const forkTests = (harness: Harness) => {
           )
         }),
       15_000,
+    )
+  })
+
+  describe("ShellTool changed files (fork)", () => {
+    it.live("reports the files a command changed, named from the Location as edits are", () =>
+      withTempDir((tmp) =>
+        Effect.gen(function* () {
+          if (isWindows) return
+          reset()
+          const location = path.join(tmp.path, "sub")
+          yield* Effect.promise(async () => {
+            await fs.mkdir(location)
+            await fs.writeFile(path.join(location, "tracked.txt"), "one\n")
+            await fs.writeFile(path.join(location, "gone.txt"), "gone\n")
+            await initGit(tmp.path)
+            await $`git add -A && git commit -qm initial`.cwd(tmp.path).quiet()
+          })
+          const settled = yield* withSession(location, (registry) =>
+            executeTool(
+              registry,
+              call(
+                { command: "printf 'two\\n' > tracked.txt; printf 'new\\n' > added.txt; rm gone.txt" },
+                "call-changes",
+              ),
+            ),
+          )
+          expect(settled.status).toBe("completed")
+          const files = (settled.metadata as { files?: FileDiff.Info[] }).files ?? []
+          expect(files.map((file) => [file.file, file.status, file.additions, file.deletions]).sort()).toEqual([
+            ["added.txt", "added", 1, 0],
+            ["gone.txt", "deleted", 0, 1],
+            ["tracked.txt", "modified", 1, 1],
+          ])
+          expect(files.find((file) => file.file === "tracked.txt")?.patch).toMatch(/-one\n\+two/)
+          expect(settled.metadata).not.toHaveProperty("filesOmitted")
+        }),
+      ),
+    )
+
+    it.live("reports no files for a command that changes none, nor for a background one", () =>
+      withTempDir((tmp) =>
+        Effect.gen(function* () {
+          if (isWindows) return
+          reset()
+          yield* Effect.promise(async () => {
+            await fs.writeFile(path.join(tmp.path, "tracked.txt"), "one\n")
+            await initGit(tmp.path)
+            await $`git add -A && git commit -qm initial`.cwd(tmp.path).quiet()
+          })
+          const [quiet, background] = yield* withSession(tmp.path, (registry) =>
+            Effect.all([
+              executeTool(registry, call({ command: "cat tracked.txt" }, "call-read")),
+              executeTool(registry, call({ command: "printf 'two\\n' > tracked.txt", background: true }, "call-bg")),
+            ]),
+          )
+          expect(quiet.status).toBe("completed")
+          expect(quiet.metadata).not.toHaveProperty("files")
+          expect(background.metadata).not.toHaveProperty("files")
+        }),
+      ),
+    )
+
+    it.live("keeps the diffs of the first changed files and counts the others", () =>
+      withTempDir((tmp) =>
+        Effect.gen(function* () {
+          if (isWindows) return
+          reset()
+          yield* Effect.promise(async () => {
+            await fs.writeFile(path.join(tmp.path, "keep.txt"), "keep\n")
+            await initGit(tmp.path)
+            await $`git add -A && git commit -qm initial`.cwd(tmp.path).quiet()
+          })
+          const settled = yield* withSession(tmp.path, (registry) =>
+            executeTool(
+              registry,
+              call({ command: 'for i in $(seq 1 53); do printf "$i\\n" > "file-$i.txt"; done' }, "call-many"),
+            ),
+          )
+          expect((settled.metadata as { files?: FileDiff.Info[] }).files).toHaveLength(50)
+          expect(settled.metadata).toMatchObject({ filesOmitted: 3 })
+        }),
+      ),
     )
   })
 }

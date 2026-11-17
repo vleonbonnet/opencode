@@ -12,11 +12,12 @@ import {
 import type { Model } from "@opencode/schema/model"
 import { Option, Schema } from "effect"
 import { fileURLToPath } from "url"
-import { CacheModel } from "../cache/model.js"
 import { SessionMessage } from "../message.js"
 import { SessionHistory } from "../history.js"
 import { SessionRecentText } from "../recent-text.js"
 import type { FileAttachment } from "@opencode/schema/prompt"
+
+import { CacheModel } from "../cache/model.js"
 
 const imageMimes = new Set(["image/png", "image/jpeg", "image/gif", "image/webp"])
 

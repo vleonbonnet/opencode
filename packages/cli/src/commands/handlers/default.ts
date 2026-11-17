@@ -11,10 +11,12 @@ import { UpdatePreflight } from "../../services/update-preflight"
 import { Npm } from "@opencode/util/npm"
 import { OPENCODE_ARTIFACT, OPENCODE_CHANNEL, OPENCODE_HIGHLIGHTS, OPENCODE_VERSION } from "../../version"
 import { Env } from "../../env"
-import { Service, type EnsureReason } from "@opencode/client/effect/service"
+import { Service } from "@opencode/client/effect/service"
 import { OpenCode } from "@opencode/client/promise"
 import { findSession } from "../../session-target"
 import { errorMessage } from "../../util/error"
+
+import type { EnsureReason } from "@opencode/client/effect/service"
 
 export default Runtime.handler(Commands, (input) =>
   Effect.gen(function* () {

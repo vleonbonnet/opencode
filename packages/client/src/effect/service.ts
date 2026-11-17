@@ -1,10 +1,13 @@
 import { Effect, FileSystem, Option, Schedule, Schema } from "effect"
-import type { DiscoverOptions, EnsureOptions, EnsureReason, StopOptions } from "../service.js"
+import type { DiscoverOptions, EnsureOptions, StopOptions } from "../service.js"
 import { contenderPool, spawnServiceContender } from "../service-contender.js"
 import { defaultEnsureTiming, ensureTiming, type EnsureTiming } from "../service-timing.js"
 import { matchesVersion } from "../service-version.js"
 import { PtyHandoff } from "../pty-handoff.js"
-import { decide, failedToStart, fallback, headers, probeResult, same } from "../service-probe.js"
+import { decide, fallback, headers, probeResult, same } from "../service-probe.js"
+
+import type { EnsureReason } from "../service.js"
+import { failedToStart } from "../service-probe.js"
 
 export * from "../service.js"
 export { headers }
