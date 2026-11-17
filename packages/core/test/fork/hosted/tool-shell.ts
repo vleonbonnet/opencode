@@ -5,7 +5,10 @@ import fs from "fs/promises"
 import path from "path"
 import { Effect, Exit } from "effect"
 import { Agent } from "@opencode/core/agent"
+import { Job } from "@opencode/core/job"
 import { Permission } from "@opencode/core/permission"
+import { Shell } from "@opencode/core/shell"
+import { ID } from "@opencode/schema/shell"
 import { ShellTool } from "@opencode/core/tool/plugin/shell"
 import type { Tool } from "@opencode/core/tool"
 import type { FileDiff } from "@opencode/schema/file-diff"
@@ -49,6 +52,7 @@ export interface Harness {
 }
 
 const isWindows = process.platform === "win32"
+const idleCommand = isWindows ? "Start-Sleep -Seconds 60" : "sleep 60"
 
 export const forkTests = (harness: Harness) => {
   const { it, permissionIt, reset, assertions, call, withSession, withScanner, runPermissionCommand } = harness
@@ -141,6 +145,26 @@ export const forkTests = (harness: Harness) => {
           )
         }),
       15_000,
+    )
+
+    it.live("tells the model to stop and rerun a timed-out command blocked on interactive input", () =>
+      withTempDir((tmp) => {
+        reset()
+        return withSession(tmp.path, (registry) =>
+          Effect.gen(function* () {
+            const result = yield* executeTool(registry, call({ command: idleCommand, timeout: 10 }))
+            const text = result.content?.map((item) => (item.type === "text" ? item.text : "")).join("\n") ?? ""
+            expect(text).toContain("was moved to the background")
+            expect(text).toMatch(
+              /\nIf it is blocked on interactive input, stop it( by its PID)? and run it again so that it does not prompt\./,
+            )
+            // The command keeps running in the background until stopped.
+            const id = ID.make(String(result.metadata?.shellID))
+            expect(yield* (yield* Job.Service).cancel(id)).toMatchObject({ id, status: "cancelled" })
+            expect((yield* (yield* Shell.Service).wait(id)).status).toBe("killed")
+          }),
+        )
+      }),
     )
   })
 

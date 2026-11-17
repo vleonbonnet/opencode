@@ -160,6 +160,8 @@ const backgroundText = (info: ShellSchema.Info, timeout?: number) =>
       : [
           "",
           `The command did not finish within its timeout of ${timeout / 1_000} seconds and was moved to the background. Do not start another copy while it is running.`,
+          // A command waiting on a prompt never finishes in the background, and no notification comes.
+          `If it is blocked on interactive input, stop it${info.pid === undefined ? "" : " by its PID"} and run it again so that it does not prompt.`,
         ]),
   ].join("\n")
 

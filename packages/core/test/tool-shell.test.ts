@@ -1496,7 +1496,7 @@ describe("ShellTool", () => {
           expect(result.metadata).not.toHaveProperty("timeout")
           expect(result.content?.[0]).toEqual({
             type: "text",
-            text: `Command moved to the background (shell ID: ${id}).\nPID: ${info.pid}\nOutput is streaming to: ${info.file}\n\nThe command did not finish within its timeout of 0.01 seconds and was moved to the background. Do not start another copy while it is running.`,
+            text: `Command moved to the background (shell ID: ${id}).\nPID: ${info.pid}\nOutput is streaming to: ${info.file}\n\nThe command did not finish within its timeout of 0.01 seconds and was moved to the background. Do not start another copy while it is running.\nIf it is blocked on interactive input, stop it by its PID and run it again so that it does not prompt.`,
           })
           expect(info.status).toBe("running")
           expect((yield* shell.list()).map((item) => item.id)).toEqual([id])
