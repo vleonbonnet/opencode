@@ -1645,6 +1645,130 @@
         "summary": "Search session messages"
       }
     },
+    "/api/experimental/session/search/sessions": {
+      "get": {
+        "tags": ["session"],
+        "operationId": "experimental.session.searchSessions",
+        "parameters": [
+          {
+            "name": "q",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 512,
+              "description": "What the sessions must hold. Terms are read as session.search reads them: words, double-quoted phrases and prefixes ending in *. Terms side by side must all match, OR (in capitals) between them matches either, a leading - excludes the term or parenthesized group after it, and parentheses group. A term holds when any one message of the session matches it."
+            },
+            "required": true
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                }
+              ],
+              "description": "Maximum number of sessions to return, at most 100. Defaults to 20."
+            },
+            "required": false
+          },
+          {
+            "name": "archived",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "enum": ["true", "false"]
+            },
+            "required": false
+          },
+          {
+            "name": "parentID",
+            "in": "query",
+            "schema": {
+              "anyOf": [
+                {
+                  "$ref": "#/components/schemas/Session.ID"
+                },
+                {
+                  "type": "string",
+                  "enum": ["null"]
+                }
+              ],
+              "description": "Filter by parent session. Use null to return only root sessions."
+            },
+            "required": false
+          },
+          {
+            "name": "directory",
+            "in": "query",
+            "schema": {
+              "$ref": "#/components/schemas/AbsolutePath"
+            },
+            "required": false
+          },
+          {
+            "name": "project",
+            "in": "query",
+            "schema": {
+              "$ref": "#/components/schemas/Project.ID"
+            },
+            "required": false
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "schema": {
+              "$ref": "#/components/schemas/SessionSearchCursor"
+            },
+            "required": false
+          }
+        ],
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "SessionSearchSessionsResponse",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionSearchSessionsResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "InvalidCursorError | InvalidRequestError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/InvalidCursorErrorEncoded"
+                    },
+                    {
+                      "$ref": "#/components/schemas/InvalidRequestErrorEncoded"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "UnauthorizedError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UnauthorizedErrorEncoded"
+                }
+              }
+            }
+          }
+        },
+        "description": "Finds the sessions whose messages, taken together, match a query of terms combined by AND, OR, exclusion and parentheses: a term holds when any one of the session's messages matches it, searching what session.search searches. Each session comes once, with its message best matching the terms it holds and that message's snippet; a session matching only by what it lacks has none. Sessions are ranked by the sum of each held term's best relevance (BM25), then the most recently updated; use cursor.next for the following page. Filters narrow the sessions searched as session.list's do, and the index catches up with older messages as for session.search.",
+        "summary": "Search whole sessions"
+      }
+    },
     "/api/session/{sessionID}": {
       "get": {
         "tags": ["session"],
@@ -25732,6 +25856,48 @@
         "type": "string",
         "enum": ["user", "assistant"]
       },
+      "SessionSearch.SessionMatch": {
+        "type": "object",
+        "properties": {
+          "sessionID": {
+            "$ref": "#/components/schemas/Session.ID"
+          },
+          "title": {
+            "type": "string"
+          },
+          "message": {
+            "$ref": "#/components/schemas/SessionSearch.SessionMessageMatch"
+          }
+        },
+        "required": ["sessionID"],
+        "additionalProperties": false
+      },
+      "SessionSearch.SessionMessageMatch": {
+        "type": "object",
+        "properties": {
+          "messageID": {
+            "$ref": "#/components/schemas/Session.Message.ID"
+          },
+          "role": {
+            "$ref": "#/components/schemas/SessionSearch.Role"
+          },
+          "time": {
+            "type": "object",
+            "properties": {
+              "created": {
+                "type": "number"
+              }
+            },
+            "required": ["created"],
+            "additionalProperties": false
+          },
+          "snippet": {
+            "$ref": "#/components/schemas/SessionSearch.Snippet"
+          }
+        },
+        "required": ["messageID", "role", "time", "snippet"],
+        "additionalProperties": false
+      },
       "SessionSearch.Snippet": {
         "type": "object",
         "properties": {
@@ -25759,6 +25925,31 @@
             "type": "array",
             "items": {
               "$ref": "#/components/schemas/SessionSearch.Match"
+            }
+          },
+          "cursor": {
+            "type": "object",
+            "properties": {
+              "next": {
+                "$ref": "#/components/schemas/SessionSearchCursor"
+              }
+            },
+            "additionalProperties": false
+          },
+          "index": {
+            "$ref": "#/components/schemas/SessionSearch.Index"
+          }
+        },
+        "required": ["data", "cursor", "index"],
+        "additionalProperties": false
+      },
+      "SessionSearchSessionsResponse": {
+        "type": "object",
+        "properties": {
+          "data": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SessionSearch.SessionMatch"
             }
           },
           "cursor": {

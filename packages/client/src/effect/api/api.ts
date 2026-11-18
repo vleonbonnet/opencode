@@ -591,6 +591,20 @@ export type ExperimentalSessionSearchOperation<E = never> = (
   input: ExperimentalSessionSearchInput,
 ) => Effect.Effect<ExperimentalSessionSearchOutput, E>
 
+export type ExperimentalSessionSearchSessionsInput = {
+  readonly q: string
+  readonly limit?: number | undefined
+  readonly archived?: boolean | undefined
+  readonly parentID?: Session.ID | null | undefined
+  readonly directory?: AbsolutePath | undefined
+  readonly project?: Project.ID | undefined
+  readonly cursor?: SessionSearch.Cursor | undefined
+}
+export type ExperimentalSessionSearchSessionsOutput = SessionSearch.SessionsResponse
+export type ExperimentalSessionSearchSessionsOperation<E = never> = (
+  input: ExperimentalSessionSearchSessionsInput,
+) => Effect.Effect<ExperimentalSessionSearchSessionsOutput, E>
+
 export type ExperimentalSessionPreflightInput = {
   readonly sessionID: Session.ID
   readonly text?: string | undefined
@@ -1498,6 +1512,7 @@ export interface ExperimentalSessionApi<E = never> {
   readonly export: ExperimentalSessionExportOperation<E>
   readonly cache: ExperimentalSessionCacheOperation<E>
   readonly search: ExperimentalSessionSearchOperation<E>
+  readonly searchSessions: ExperimentalSessionSearchSessionsOperation<E>
   readonly preflight: ExperimentalSessionPreflightOperation<E>
   readonly thinking: ExperimentalSessionThinkingOperation<E>
   readonly skill: ExperimentalSessionSkillOperation<E>

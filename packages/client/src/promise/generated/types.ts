@@ -1255,6 +1255,13 @@ export type SessionSearchMatch = {
   snippet: SessionSearchSnippet
 }
 
+export type SessionSearchSessionMessageMatch = {
+  messageID: SessionMessageID
+  role: SessionSearchRole
+  time: { created: number }
+  snippet: SessionSearchSnippet
+}
+
 export type SessionCachePreflightReport = {
   status: SessionCachePreflightStatus
   format?: string
@@ -2818,6 +2825,12 @@ export type SessionSearchResponse = {
   index: SessionSearchIndex
 }
 
+export type SessionSearchSessionMatch = {
+  sessionID: SessionID
+  title?: string
+  message?: SessionSearchSessionMessageMatch
+}
+
 export type SessionPreflightResponse = { data: SessionCachePreflightReport }
 
 export type SessionInboxItem =
@@ -2934,6 +2947,12 @@ export type IntegrationOAuthMethod = { id: IntegrationMethodID; type: "oauth"; l
 export type IntegrationKeyMethod = { type: "key"; label?: string; form?: FormFields }
 
 export type IntegrationExternalMethod = { id: IntegrationMethodID; type: "external"; label: string; form?: FormFields }
+
+export type SessionSearchSessionsResponse = {
+  data: Array<SessionSearchSessionMatch>
+  cursor: { next?: SessionSearchCursor }
+  index: SessionSearchIndex
+}
 
 export type SessionInboxEnqueued = {
   id: EventID
@@ -4125,6 +4144,18 @@ export type ExperimentalSessionSearchInput = {
 }
 
 export type ExperimentalSessionSearchOutput = SessionSearchResponse
+
+export type ExperimentalSessionSearchSessionsInput = {
+  readonly q: string
+  readonly limit?: number | undefined
+  readonly archived?: boolean | undefined
+  readonly parentID?: string | null | undefined
+  readonly directory?: string | undefined
+  readonly project?: string | undefined
+  readonly cursor?: string | undefined
+}
+
+export type ExperimentalSessionSearchSessionsOutput = SessionSearchSessionsResponse
 
 export type ExperimentalSessionPreflightInput = {
   readonly sessionID: string

@@ -92,3 +92,30 @@ export const Response = Schema.Struct({
   cursor: Schema.Struct({ next: Cursor.pipe(optional) }),
   index: Index,
 }).annotate({ identifier: "SessionSearchResponse" })
+
+/** The message of a session that best matches the words a search of whole sessions looks for. */
+export interface SessionMessageMatch extends Schema.Schema.Type<typeof SessionMessageMatch> {}
+export const SessionMessageMatch = Schema.Struct({
+  messageID: SessionMessage.ID,
+  role: Role,
+  time: Schema.Struct({ created: DateTimeUtcFromMillis }),
+  snippet: Snippet,
+}).annotate({ identifier: "SessionSearch.SessionMessageMatch" })
+
+/**
+ * One session matching a search of whole sessions, with its best matching message. A session matching only by what
+ * it lacks, as for a query of excluded terms alone, has no message.
+ */
+export interface SessionMatch extends Schema.Schema.Type<typeof SessionMatch> {}
+export const SessionMatch = Schema.Struct({
+  sessionID: SessionID,
+  title: Schema.String.pipe(optional),
+  message: SessionMessageMatch.pipe(optional),
+}).annotate({ identifier: "SessionSearch.SessionMatch" })
+
+export interface SessionsResponse extends Schema.Schema.Type<typeof SessionsResponse> {}
+export const SessionsResponse = Schema.Struct({
+  data: Schema.Array(SessionMatch),
+  cursor: Schema.Struct({ next: Cursor.pipe(optional) }),
+  index: Index,
+}).annotate({ identifier: "SessionSearchSessionsResponse" })

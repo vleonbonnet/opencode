@@ -141,6 +141,17 @@ export const SessionSearchQuery = Schema.Struct({
   cursor: SessionSearch.Cursor.pipe(Schema.optional),
 }).annotate({ identifier: "SessionSearchQuery" })
 
+export const SessionSearchSessionsQuery = Schema.Struct({
+  ...SessionSearchQuery.fields,
+  q: SessionSearchQuery.fields.q.annotate({
+    description:
+      "What the sessions must hold. Terms are read as session.search reads them: words, double-quoted phrases and prefixes ending in *. Terms side by side must all match, OR (in capitals) between them matches either, a leading - excludes the term or parenthesized group after it, and parentheses group. A term holds when any one message of the session matches it.",
+  }),
+  limit: SessionSearchQuery.fields.limit.annotate({
+    description: `Maximum number of sessions to return, at most ${SessionSearch.MAX_LIMIT}. Defaults to ${SessionSearch.DEFAULT_LIMIT}.`,
+  }),
+}).annotate({ identifier: "SessionSearchSessionsQuery" })
+
 export const makeSessionGroup = <I extends HttpApiMiddleware.AnyId, S, FormI extends HttpApiMiddleware.AnyId, FormS>(
   sessionLocationMiddleware: Context.Key<I, S>,
   formLocationMiddleware: Context.Key<FormI, FormS>,
@@ -279,6 +290,19 @@ export const makeSessionGroup = <I extends HttpApiMiddleware.AnyId, S, FormI ext
           identifier: "experimental.session.search",
           summary: "Search session messages",
           description: `Full-text search over user prompts and the visible text of assistant messages (not tool calls, tool output or reasoning) across sessions. Each match names its session and message, with a one-line snippet of at most ${SessionSearch.MAX_SNIPPET_LENGTH} characters whose matches are located by character offsets. Matches are ranked by relevance (BM25), newer first among equal ranks; use cursor.next for the following page. Filters narrow the sessions searched as session.list's do. Messages written before the index existed are indexed in the background after the server starts: until index.complete, results come only from the messages indexed so far, and index.processed of index.total says how far it is.`,
+        }),
+      ),
+    )
+    .add(
+      HttpApiEndpoint.get("session.searchSessions", "/api/experimental/session/search/sessions", {
+        query: SessionSearchSessionsQuery,
+        success: SessionSearch.SessionsResponse,
+        error: [InvalidCursorError, InvalidRequestError],
+      }).annotateMerge(
+        OpenApi.annotations({
+          identifier: "experimental.session.searchSessions",
+          summary: "Search whole sessions",
+          description: `Finds the sessions whose messages, taken together, match a query of terms combined by AND, OR, exclusion and parentheses: a term holds when any one of the session's messages matches it, searching what session.search searches. Each session comes once, with its message best matching the terms it holds and that message's snippet; a session matching only by what it lacks has none. Sessions are ranked by the sum of each held term's best relevance (BM25), then the most recently updated; use cursor.next for the following page. Filters narrow the sessions searched as session.list's do, and the index catches up with older messages as for session.search.`,
         }),
       ),
     )

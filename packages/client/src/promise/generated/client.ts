@@ -94,6 +94,8 @@ import type {
   ExperimentalSessionCacheOutput,
   ExperimentalSessionSearchInput,
   ExperimentalSessionSearchOutput,
+  ExperimentalSessionSearchSessionsInput,
+  ExperimentalSessionSearchSessionsOutput,
   ExperimentalSessionPreflightInput,
   ExperimentalSessionPreflightOutput,
   ExperimentalSessionThinkingInput,
@@ -1126,6 +1128,26 @@ export function make(options: ClientOptions) {
             {
               method: "GET",
               path: `/api/experimental/session/search`,
+              query: {
+                q: input["q"],
+                limit: input["limit"],
+                archived: input["archived"],
+                parentID: input["parentID"],
+                directory: input["directory"],
+                project: input["project"],
+                cursor: input["cursor"],
+              },
+              successStatus: 200,
+              declaredStatuses: [400, 401],
+              empty: false,
+            },
+            requestOptions,
+          ),
+        searchSessions: (input: ExperimentalSessionSearchSessionsInput, requestOptions?: RequestOptions) =>
+          request<ExperimentalSessionSearchSessionsOutput>(
+            {
+              method: "GET",
+              path: `/api/experimental/session/search/sessions`,
               query: {
                 q: input["q"],
                 limit: input["limit"],

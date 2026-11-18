@@ -140,6 +140,50 @@ describe("SessionSearchQuery", () => {
     expect(SessionSearchQuery.terms(" ... ")).toEqual([])
   })
 
+  test("reads queries over whole sessions: AND, OR, exclusion and groups", () => {
+    const word = (text: string, prefix = false): SessionSearchQuery.Expression => ({
+      type: "term",
+      term: { text, prefix },
+    })
+    const expr = (value: SessionSearchQuery.Expression) => value
+    expect(SessionSearchQuery.parse('aiur "home lab" -nomad (consul OR vault*)')).toEqual(
+      expr({
+        type: "and",
+        items: [
+          word("aiur"),
+          word("home lab"),
+          { type: "not", item: word("nomad") },
+          { type: "or", items: [word("consul"), word("vault", true)] },
+        ],
+      }),
+    )
+    // OR binds looser than terms side by side; lower-case "or" is a word.
+    expect(SessionSearchQuery.parse("a b OR c or")).toEqual(
+      expr({
+        type: "or",
+        items: [
+          { type: "and", items: [word("a"), word("b")] },
+          { type: "and", items: [word("c"), word("or")] },
+        ],
+      }),
+    )
+    expect(SessionSearchQuery.parse('-(a OR "b c") --d e-f')).toEqual(
+      expr({
+        type: "and",
+        items: [{ type: "not", item: { type: "or", items: [word("a"), word("b c")] } }, word("d"), word("e-f")],
+      }),
+    )
+    // As typed: unclosed groups and quotes run to the end, dangling operators and stray parentheses are dropped.
+    expect(SessionSearchQuery.parse('OR (a "b c')).toEqual(expr({ type: "and", items: [word("a"), word("b c")] }))
+    expect(SessionSearchQuery.parse("a ) OR - ( )")).toEqual(word("a"))
+    expect(SessionSearchQuery.parse(" - ?! () ")).toBeUndefined()
+    const query = SessionSearchQuery.parse('a -b (a OR -(c -d)) "A"')!
+    expect(SessionSearchQuery.termsOf(query).map((term) => term.text)).toEqual(["a", "b", "c", "d"])
+    expect(SessionSearchQuery.positives(query).map((term) => term.text)).toEqual(["a", "d"])
+    expect(SessionSearchQuery.evaluate(query, (term) => term.text !== "b")).toBe(true)
+    expect(SessionSearchQuery.evaluate(query, () => true)).toBe(false)
+  })
+
   test("makes snippets one bounded line with located matches", () => {
     const { MARK_START: s, MARK_END: e } = SessionSearchDDL
     expect(SessionSearchQuery.snippet(`…the  ${s}quick${e}\n\n brown ${s}fox${e} jumps…`)).toEqual({
@@ -405,6 +449,97 @@ describe("SessionSearch", () => {
       expect(result.data).toEqual([])
       const tooMany = yield* Effect.exit(search(Array.from({ length: 33 }, (_, i) => `w${i}`).join(" ")))
       expect(Exit.isFailure(tooMany) && JSON.stringify(tooMany.cause)).toContain("SessionSearch.InvalidQueryError")
+    }),
+  )
+
+  const searchSessions = (query: string, input: Omit<SessionSearchService.Input, "query"> = {}) =>
+    SessionSearchService.Service.use((service) => service.searchSessions({ query, ...input }))
+
+  const sessionIDs = (query: string, input?: Omit<SessionSearchService.Input, "query">) =>
+    searchSessions(query, input).pipe(Effect.map((result) => result.data.map((match) => match.sessionID as string)))
+
+  it.effect("matches whole sessions: terms in different messages, OR, exclusion and groups", () =>
+    Effect.gen(function* () {
+      const db = yield* seed
+      const third = Session.ID.make("ses_search_third")
+      yield* db
+        .insert(SessionTable)
+        .values({ id: third, project_id: Project.ID.global, slug: "t", directory: "/project", version: "t" })
+        .run()
+      yield* db
+        .insert(SessionMessageTable)
+        .values([
+          userRow(sessionID, "msg_w1", 1, "Set up the aiur cluster"),
+          assistantRow(sessionID, "msg_w2", 2, [text("The homelab runs nomad.")]),
+          userRow(otherID, "msg_w3", 1, "aiur homelab with consul"),
+          userRow(third, "msg_w4", 1, "the homelab vault"),
+        ])
+        .run()
+      const sorted = (query: string, input?: Omit<SessionSearchService.Input, "query">) =>
+        sessionIDs(query, input).pipe(Effect.map((list) => list.toSorted()))
+      // Words in different messages of one session.
+      expect(yield* sorted("aiur homelab")).toEqual([otherID, sessionID].toSorted())
+      expect(yield* sorted('"aiur homelab"')).toEqual([otherID])
+      expect(yield* sorted('"aiur cluster" homelab')).toEqual([sessionID])
+      expect(yield* sorted("homelab -nomad")).toEqual([otherID, third].toSorted())
+      expect(yield* sorted("homelab (consul OR vault)")).toEqual([otherID, third].toSorted())
+      expect(yield* sorted("homelab -(consul OR vault)")).toEqual([sessionID])
+      expect(yield* sorted("nom* OR vau*")).toEqual([sessionID, third].toSorted())
+      // Excluded terms alone: every session lacking them, without a message.
+      const lacking = yield* searchSessions("-aiur")
+      expect(lacking.data).toEqual([{ sessionID: third }])
+      expect(yield* sorted("aiur", { project: Project.ID.make("prj_other") })).toEqual([otherID])
+      expect(yield* sorted("-aiur", { archived: true })).toEqual([])
+      expect((yield* searchSessions(" ?! ")).data).toEqual([])
+      const tooMany = yield* Effect.exit(searchSessions(Array.from({ length: 33 }, (_, i) => `-w${i}`).join(" ")))
+      expect(Exit.isFailure(tooMany) && JSON.stringify(tooMany.cause)).toContain("SessionSearch.InvalidQueryError")
+    }),
+  )
+
+  it.effect("gives each session once with its best message, ranked by its terms, and pages", () =>
+    Effect.gen(function* () {
+      const db = yield* seed
+      yield* db
+        .insert(SessionMessageTable)
+        .values([
+          userRow(sessionID, "msg_v1", 1, "kiwi " + "filler ".repeat(40), 10),
+          userRow(sessionID, "msg_v2", 2, "kiwi kiwi kiwi and plum", 20),
+          userRow(sessionID, "msg_v3", 3, "plum " + "filler ".repeat(40), 30),
+          userRow(otherID, "msg_v4", 1, "kiwi " + "filler ".repeat(40), 40),
+        ])
+        .run()
+      const result = yield* searchSessions("kiwi plum*")
+      expect(result.data).toEqual([
+        {
+          sessionID,
+          title: "First",
+          message: {
+            messageID: SessionMessage.ID.make("msg_v2"),
+            role: "user",
+            time: { created: DateTime.makeUnsafe(20) },
+            snippet: {
+              text: "kiwi kiwi kiwi and plum",
+              matches: [
+                { start: 0, end: 4 },
+                { start: 5, end: 9 },
+                { start: 10, end: 14 },
+                { start: 19, end: 23 },
+              ],
+            },
+          },
+        },
+      ])
+      // Sessions holding more of the terms, and better, first.
+      expect(yield* sessionIDs("kiwi OR plum")).toEqual([sessionID, otherID])
+      const first = yield* searchSessions("kiwi OR plum", { limit: 1 })
+      expect(first.data.map((match) => match.sessionID as string)).toEqual([sessionID])
+      expect(first.cursor.next).toBeDefined()
+      const second = yield* searchSessions("kiwi OR plum", { limit: 1, cursor: first.cursor.next })
+      expect(second.data.map((match) => match.sessionID as string)).toEqual([otherID])
+      expect(second.data[0]!.message?.messageID).toBe(SessionMessage.ID.make("msg_v4"))
+      expect(second.cursor.next).toBeUndefined()
+      const invalid = yield* Effect.exit(searchSessions("kiwi", { cursor: "bogus" as SessionSearch.Cursor }))
+      expect(Exit.isFailure(invalid) && JSON.stringify(invalid.cause)).toContain("SessionSearch.InvalidCursorError")
     }),
   )
 

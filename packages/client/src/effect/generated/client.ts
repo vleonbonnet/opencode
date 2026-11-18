@@ -100,6 +100,8 @@ import type {
   ExperimentalSessionCacheOutput,
   ExperimentalSessionSearchInput,
   ExperimentalSessionSearchOutput,
+  ExperimentalSessionSearchSessionsInput,
+  ExperimentalSessionSearchSessionsOutput,
   ExperimentalSessionPreflightInput,
   ExperimentalSessionPreflightOutput,
   ExperimentalSessionThinkingInput,
@@ -864,6 +866,22 @@ const EndpointExperimentalSessionSearch =
       }).pipe(Effect.mapError(mapClientError)),
     )
 
+const EndpointExperimentalSessionSearchSessions =
+  (raw: RawClient["server.session"]) => (input: ExperimentalSessionSearchSessionsInput) =>
+    preserveEffect<ExperimentalSessionSearchSessionsOutput>()(
+      raw["session.searchSessions"]({
+        query: {
+          q: input["q"],
+          limit: input["limit"],
+          archived: input["archived"],
+          parentID: input["parentID"],
+          directory: input["directory"],
+          project: input["project"],
+          cursor: input["cursor"],
+        },
+      }).pipe(Effect.mapError(mapClientError)),
+    )
+
 const EndpointExperimentalSessionPreflight =
   (raw: RawClient["server.session"]) => (input: ExperimentalSessionPreflightInput) =>
     preserveEffect<ExperimentalSessionPreflightOutput>()(
@@ -949,6 +967,7 @@ const adaptGroupExperimentalSession = (raw: RawClient["server.session"]) => ({
   export: EndpointExperimentalSessionExport(raw),
   cache: EndpointExperimentalSessionCache(raw),
   search: EndpointExperimentalSessionSearch(raw),
+  searchSessions: EndpointExperimentalSessionSearchSessions(raw),
   preflight: EndpointExperimentalSessionPreflight(raw),
   thinking: EndpointExperimentalSessionThinking(raw),
   skill: EndpointExperimentalSessionSkill(raw),

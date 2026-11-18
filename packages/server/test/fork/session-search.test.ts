@@ -8,6 +8,7 @@ import { ServerFetch } from "../../src/fetch"
 
 const SessionResponse = Schema.Struct({ data: Schema.toEncoded(Session.Info) })
 const SearchResponse = Schema.toEncoded(SessionSearch.Response)
+const SessionsResponse = Schema.toEncoded(SessionSearch.SessionsResponse)
 
 const setup = Effect.gen(function* () {
   // An empty global configuration, so the server loads none of the user's, MCP servers included.
@@ -101,6 +102,33 @@ it.live(
       expect(
         (yield* request(`/api/experimental/session/search?q=${"x".repeat(SessionSearch.MAX_QUERY_LENGTH + 1)}`)).status,
       ).toBe(400)
+
+      const sessions = (query: string) =>
+        request(`/api/experimental/session/search/sessions?q=${encodeURIComponent(query)}`).pipe(
+          Effect.map((response) => Schema.decodeUnknownSync(SessionsResponse)(response.body)),
+        )
+      expect((yield* sessions("walrus beach -penguin")).data).toEqual([
+        {
+          sessionID: id,
+          title: "Searchable",
+          message: {
+            messageID: "msg_assistant",
+            role: "assistant",
+            time: { created: 2 },
+            snippet: {
+              text: "The walrus is on the beach.",
+              matches: [
+                { start: 4, end: 10 },
+                { start: 21, end: 26 },
+              ],
+            },
+          },
+        },
+      ])
+      expect((yield* sessions("walrus -beach")).data).toEqual([])
+      expect((yield* sessions("-penguin")).data.map((match) => match.sessionID)).toContain(id)
+      for (const query of ["", "q=", "q=walrus&limit=101", "q=walrus&cursor=bogus"])
+        expect((yield* request(`/api/experimental/session/search/sessions?${query}`)).status).toBe(400)
     }).pipe(Effect.scoped),
   // Each test boots a whole server.
   30_000,
