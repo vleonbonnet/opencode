@@ -245,7 +245,6 @@ const empty = {
     project: true,
     global: true,
     claude: true,
-    claudeGlobal: true,
     load: () => Effect.succeed(Instructions.empty),
   }),
   skills: Layer.mock(SkillInstructions.Service, { load: () => Effect.succeed(Instructions.empty) }),
