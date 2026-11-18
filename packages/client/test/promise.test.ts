@@ -76,6 +76,7 @@ test("exposes every standard HTTP API group", () => {
     "export",
     "cache",
     "search",
+    "searchSessions",
     "preflight",
     "thinking",
     "skill",
