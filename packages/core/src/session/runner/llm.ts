@@ -35,8 +35,6 @@ import { Plugin } from "../../plugin.js"
 import { PluginHooks } from "../../plugin/hooks.js"
 import { MAX_STEPS_PROMPT } from "./max-steps.js"
 
-import { AIError } from "@opencode/ai/effect"
-import { STALE_THINKING_ERROR } from "@opencode/schema/session-cache"
 import { CacheGate } from "../cache/gate.js"
 import { CacheLedger } from "../cache/ledger.js"
 import { CacheModel } from "../cache/model.js"
@@ -63,25 +61,7 @@ const layer = Layer.effect(
     const title = yield* SessionTitle.Service
     const steps = yield* SessionStep.make
     const gate = yield* CacheGate.make
-    // A thinking block the provider refused is the stale thinking a turn that asked first is refused for, with the
-    // same way out; the Step's own failure keeps the provider's words.
-    const attempt = (input: Parameters<typeof steps.attempt>[0]) =>
-      steps.attempt(input).pipe(
-        Effect.catchIf(
-          (error): error is AIError =>
-            error instanceof AIError && CacheLedger.isThinkingRefusal(toSessionError(error).message),
-          (error) =>
-            new StepFailedError({
-              error: {
-                type: STALE_THINKING_ERROR,
-                message: CacheLedger.refusalMessage(
-                  toSessionError(error).message,
-                  !CacheModel.isClaudeModel(input.model.model.id),
-                ),
-              },
-            }),
-        ),
-      )
+    const attempt = CacheGate.refusing(steps.attempt)
     const pty = yield* PersistentPty.Service
     // Title generation starts once input is visible and must not delay model execution.
     const titles = yield* FiberMap.make<SessionSchema.ID, void, never>()
@@ -275,6 +255,8 @@ const layer = Layer.effect(
       let recoverOverflow = true
       let recoverContinuation = true
       let retryAttempt: number | undefined
+      // What a dry run's consent decided, for the build that follows it.
+      let consent: CacheGate.Consent | undefined
       while (true) {
         // Reuse boundary preparation once; retries refresh context without delivering more input.
         const loaded = initial ?? (yield* prepareContext(sessionID).pipe(Effect.flatMap(context.load)))
@@ -289,41 +271,39 @@ const layer = Layer.effect(
         yield* compaction.precompute(Effect.succeed(loaded), estimate)
         const stepLimitReached = loaded.agent.info.steps !== undefined && step >= loaded.agent.info.steps
         // Stale thinking is refused, or dropped with the user's consent, before the request is sent.
-        const prepared = yield* gate
-          .prepare({
-            sessionID,
-            step,
-            checks: CacheModel.checksThinking(loaded.model.model),
-            messages: loaded.messages,
-            dropped: loaded.dropped,
-            build: (build) => {
-              const transcript = SessionModelRequest.baseTranscript({
-                agent: loaded.agent.info,
-                model: loaded.model,
-                tools: loaded.tools,
-                initial: loaded.initial,
-                messages: loaded.messages,
-                dropped: build.dropped,
-              })
-              return context.request.primary({
-                session: loaded.session,
-                agent: loaded.agent.id,
-                model: loaded.model,
-                tools: loaded.tools,
-                system: transcript.system,
-                messages: stepLimitReached
-                  ? [...transcript.messages, Message.assistant(MAX_STEPS_PROMPT)]
-                  : transcript.messages,
-                // Keep tool definitions on the final Step to preserve the provider's cached prefix.
-                toolChoice: stepLimitReached ? "none" : undefined,
-                webSocket: "session",
-                inputTokens: estimate,
-                dryRun: build.dryRun,
-                thinkingBinding: build.thinkingBinding,
-                thinkingMode: build.mode,
-                cacheKey: assistantMessageID,
-              })
-            },
+        const build = yield* gate.build({
+          sessionID,
+          step,
+          checks: CacheModel.checksThinking(loaded.model.model),
+          messages: loaded.messages,
+          dropped: loaded.dropped,
+          consent,
+          cacheKey: assistantMessageID,
+        })
+        consent = undefined
+        const transcript = SessionModelRequest.baseTranscript({
+          agent: loaded.agent.info,
+          model: loaded.model,
+          tools: loaded.tools,
+          initial: loaded.initial,
+          messages: loaded.messages,
+          dropped: build.dropped,
+        })
+        const prepared = yield* context.request
+          .primary({
+            session: loaded.session,
+            agent: loaded.agent.id,
+            model: loaded.model,
+            tools: loaded.tools,
+            system: transcript.system,
+            messages: stepLimitReached
+              ? [...transcript.messages, Message.assistant(MAX_STEPS_PROMPT)]
+              : transcript.messages,
+            // Keep tool definitions on the final Step to preserve the provider's cached prefix.
+            toolChoice: stepLimitReached ? "none" : undefined,
+            webSocket: "session",
+            inputTokens: estimate,
+            ...build.request,
           })
           .pipe(
             // The hook event holds every message from before images are bounded, screenshots included, and is a separate
@@ -336,6 +316,13 @@ const layer = Layer.effect(
               executeTool: prepared.executeTool,
             })),
           )
+        if (build.dryRun) {
+          // The checked request is built again from the same history, with what consent decided.
+          consent = yield* gate.consent({ sessionID, build, prepared, messages: loaded.messages })
+          // Typed here: `loaded` is inferred from `initial`, which this assignment would otherwise feed back.
+          initial = loaded as SessionContext.Loaded
+          continue
+        }
         const outcome = yield* attempt({
           isLocationClosed: lifecycle.isClosed,
           interruption,

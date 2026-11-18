@@ -36,8 +36,13 @@ export interface Captured {
   readonly credential?: string
 }
 
+/** Where a dry run leaves the request it captured, for a caller that keeps only the stream's options. */
+export interface Capture {
+  request?: Captured
+}
+
 export type Mode =
-  | { readonly type: "dryrun" }
+  | { readonly type: "dryrun"; readonly capture?: Capture }
   /** `sent` sees every request right before it is handed to the transport; it must not fail. */
   | { readonly type: "send"; readonly sent?: (request: Captured) => Effect.Effect<void> }
 
@@ -154,6 +159,10 @@ export const make = (input: {
 }): Wire => {
   let captured: Captured | undefined
   const mode = input.mode
+  const keep = (request: Captured | undefined) => {
+    captured = request
+    if (mode.type === "dryrun" && mode.capture) mode.capture.request = request
+  }
   const stamp = (request: Captured): Captured =>
     input.credential === undefined ? request : { ...request, credential: input.credential }
 
@@ -163,7 +172,7 @@ export const make = (input: {
       Effect.gen(function* () {
         const seen = stamp(yield* fromHttp(request))
         if (mode.type === "dryrun") {
-          captured = seen
+          keep(seen)
           return yield* Effect.fail(new DryRunCaptured())
         }
         if (mode.sent) yield* quietly(mode.sent(seen))
@@ -182,7 +191,7 @@ export const make = (input: {
         const compiled = yield* fromRequest(input.request)
         const seen = compiled && stamp(compiled)
         if (mode.type === "dryrun") {
-          captured = seen
+          keep(seen)
           return yield* dryRunTransportError(exchange.connect?.url)
         }
         if (seen && mode.sent) yield* quietly(mode.sent(seen))

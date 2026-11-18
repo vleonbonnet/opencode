@@ -47,11 +47,6 @@ import { SessionSystemPrompt } from "./system-prompt.js"
 import { toLLMMessages } from "./runner/to-llm-message.js"
 import type { SessionMessage } from "./message.js"
 
-import type { CachePolicyObject } from "@opencode/ai/effect"
-import { AnthropicMessages, BedrockConverse } from "@opencode/ai/protocols"
-import { BedrockCache } from "@opencode/ai/protocols/utils/bedrock-cache"
-import { claudeVersion } from "@opencode/ai/protocols/utils/claude-model"
-import { mergeJsonRecords, mergeProviderOptions, mergeTransport } from "@opencode/ai/route"
 import { Option } from "effect"
 import { ToolUserStop } from "../tool/user-stop.js"
 import type { CacheLedger } from "./cache/ledger.js"
@@ -59,6 +54,7 @@ import { CacheModel } from "./cache/model.js"
 import { SessionCache } from "./cache/service.js"
 import { CacheWire } from "./cache/wire.js"
 import { CacheReplay } from "./cache/replay.js"
+import { CacheRequest } from "./cache/request.js"
 
 const IMAGE_BYTES_TRIGGER = 25 * 1024 * 1024 // 25 MiB
 const IMAGE_BYTES_TARGET = 15 * 1024 * 1024 // 15 MiB
@@ -89,8 +85,6 @@ export interface Prepared<Event = SessionRequest> {
   readonly executeTool: (
     input: Parameters<Tool.Snapshot["execute"]>[0],
   ) => Effect.Effect<Tool.NormalizedResult, ExecuteError>
-  /** A dry run's request as it reached the wire, once its stream has run. */
-  readonly captured?: () => CacheWire.Captured | undefined
 }
 
 export interface Input {
@@ -107,6 +101,8 @@ export interface Input {
   readonly inputTokens?: { readonly measured: number; readonly estimated: number }
   /** Build the request without sending it: hooks are told, and the wire captures it instead of any network I/O. */
   readonly dryRun?: boolean
+  /** Where a dry run leaves the request it captured. */
+  readonly capture?: CacheWire.Capture
   /** What a provider that binds thinking to the prompt does with replayed thinking whose prompt changed. */
   readonly thinkingBinding?: "error" | "drop_block"
   /** Why it does so (who was asked), for the prompt-cache ledger's dropped-thinking markers. */
@@ -279,93 +275,6 @@ export const boundImages = (messages: LLMRequest["messages"]) => {
   })
 }
 
-// The auto placement (last tool, first and last system parts, conversation tail) with a one-hour TTL.
-const ONE_HOUR_CACHE: CachePolicyObject = { tools: true, system: true, messages: { tail: 1 }, ttl: "1h" }
-
-// Vercel's gateway wraps the Anthropic Messages protocol under its own protocol ID.
-const speaksAnthropicMessages = (model: LanguageModel) =>
-  model.route.protocol === AnthropicMessages.protocol.id || model.route.id === "vercel-ai-gateway-messages"
-
-// Bedrock caches some older Claude releases for five minutes only, and the oldest not at all.
-const takesOneHour = (model: LanguageModel) => {
-  if (!model.id.includes("anthropic.claude-")) return true
-  const bedrock = BedrockCache.breakpoints(model)
-  return bedrock.supported && bedrock.ttl1h
-}
-
-/**
- * Claude prompt caches behind Anthropic Messages (Anthropic, GitHub Copilot, Vertex, Bedrock Mantle and the Anthropic
- * gateways) honour a one-hour TTL, so a short break no longer re-sends the whole conversation. A one-hour write costs
- * 2x base input instead of 1.25x, which pays off only for a root Session's own turns: auxiliary requests and child
- * Sessions run once or back to back, so their entries rarely sit five idle minutes before a reuse. Other models on the
- * protocol keep the default TTL their endpoints are known to take.
- */
-export const cachePolicy = (
-  model: LanguageModel,
-  kind: SessionRequestKind,
-  session: SessionSchema.Info,
-): CachePolicyObject | undefined =>
-  kind === "primary" &&
-  session.parentID === undefined &&
-  speaksAnthropicMessages(model) &&
-  /claude/i.test(model.id) &&
-  takesOneHour(model)
-    ? ONE_HOUR_CACHE
-    : undefined
-
-const SUMMARIZED = { display: "summarized" } as const
-
-const record = (value: unknown) =>
-  typeof value === "object" && value !== null && !Array.isArray(value) ? (value as Record<string, unknown>) : undefined
-
-// Claude 5 and later think adaptively when a request leaves thinking out.
-const thinksByDefault = (model: LanguageModel) => (claudeVersion(model.id)?.major ?? 0) >= 5
-
-const withOptions = (request: LLMRequest, thinking: Record<string, unknown>) => ({
-  ...request,
-  providerOptions: mergeProviderOptions(request.providerOptions, { thinking }),
-})
-
-const withBody = (request: LLMRequest, body: Record<string, unknown>) => ({
-  ...request,
-  http: { ...request.http, body: mergeJsonRecords(request.http?.body, body) },
-})
-
-/**
- * Adaptive thinking returns every thinking block empty unless the request asks to show it, since Claude 4.7 and later
- * default `display` to "omitted". A Claude request on Anthropic Messages, or on Bedrock Converse, which takes the same
- * thinking object in `additionalModelRequestFields`, that thinks adaptively without choosing a display asks for the
- * summarized text, as v1 did. That includes a Claude 5 request that leaves thinking out, as it thinks adaptively. The
- * summary is display only, and every request kind gets the same thinking, so none changes the prefix the others cache.
- */
-export const summarizedThinking = (request: LLMRequest): LLMRequest => {
-  const model = request.model
-  if (!/claude/i.test(model.id)) return request
-  const options = mergeProviderOptions(model.options?.providerOptions, request.providerOptions)
-  const body = mergeTransport(model.options, request).http?.body
-  if (model.route.protocol === AnthropicMessages.protocol.id) {
-    // The body overlays the thinking the options lower to, field by field.
-    const overlaid = record(body?.thinking)
-    const thinking = mergeJsonRecords(record(options?.thinking), overlaid)
-    if (thinking === undefined)
-      return thinksByDefault(model) ? withOptions(request, { type: "adaptive", ...SUMMARIZED }) : request
-    if (thinking.type !== "adaptive" || thinking.display !== undefined) return request
-    return overlaid?.type === undefined ? withOptions(request, SUMMARIZED) : withBody(request, { thinking: SUMMARIZED })
-  }
-  if (model.route.protocol === BedrockConverse.protocol.id) {
-    // Converse options spell only a manual budget; adaptive thinking reaches it through the body.
-    const overlaid = record(record(body?.additionalModelRequestFields)?.thinking)
-    const type = overlaid?.type ?? (options?.thinking === undefined ? undefined : "enabled")
-    if (type === undefined)
-      return thinksByDefault(model)
-        ? withBody(request, { additionalModelRequestFields: { thinking: { type: "adaptive", ...SUMMARIZED } } })
-        : request
-    if (type !== "adaptive" || overlaid?.display !== undefined) return request
-    return withBody(request, { additionalModelRequestFields: { thinking: SUMMARIZED } })
-  }
-  return request
-}
-
 type Definitions = PluginHooks.Domains["session"]["context"]["tools"]
 
 /** Builds the model request for each session flow. Each entry runs its own plugin hook. */
@@ -449,8 +358,7 @@ export const layer = Layer.effect(
         },
         // TODO: Persist cache lineage so nested forks reuse the root session's cache key.
         promptCacheKey: /^ses_[0-9a-f]{64}$/.test(affinity) ? affinity.slice(4) : affinity,
-        // A TTL configured for the model is the user's choice; otherwise a root Session's Claude turns take an hour.
-        cache: model.cache?.ttl !== undefined ? { ttl: model.cache.ttl } : cachePolicy(model.model, kind, session),
+        cache: CacheRequest.cache(model, kind, session),
         system: shaped.system,
         // Strip the stored metadata hooks could read, so it never reaches the provider.
         messages: boundImages(
@@ -490,7 +398,7 @@ export const layer = Layer.effect(
         modelHook.baseURL !== undefined && modelHook.baseURL !== baseURL
           ? base.model.route.with({ endpoint: { baseURL: modelHook.baseURL } })
           : base.model.route
-      const request = summarizedThinking({
+      const request = CacheRequest.summarizedThinking({
         ...base,
         model: route === base.model.route ? base.model : LanguageModel.update(base.model, { route }),
         headers: Object.keys(modelHook.headers).length === 0 ? undefined : modelHook.headers,
@@ -557,33 +465,12 @@ export const layer = Layer.effect(
 
       // Installed whether or not plugins hook HTTP, and after their hooks: the prompt-cache ledger accounts for what
       // reaches the wire, and a dry run is captured there instead of sent.
-      const wire = CacheWire.make({
-        request,
-        credential: model.credential,
-        mode: input.dryRun
-          ? { type: "dryrun" }
-          : {
-              type: "send",
-              sent:
-                cache && input.cacheKey !== undefined && (kind === "primary" || kind === "generate")
-                  ? cache.sent({
-                      sessionID: session.id,
-                      ref: model.ref,
-                      key: input.cacheKey,
-                      snapshot: kind === "primary",
-                      ...(input.thinkingMode !== undefined && CacheModel.checksThinking(model.model)
-                        ? { mode: input.thinkingMode }
-                        : {}),
-                    })
-                  : undefined,
-            },
-      })
+      const wire = CacheRequest.wire({ request, credential: model.credential, kind, session, model, cache, input })
 
       return {
         event: shaped,
         request,
         options: wire.options({ http, webSocket }),
-        ...(input.dryRun ? { captured: wire.captured } : {}),
         retry: (event: Parameters<Prepared["retry"]>[0]) =>
           hooks.trigger("session", "retry", event).pipe(Effect.asVoid),
         // Permission.assert and the question tool throw declines as defects so tools cannot

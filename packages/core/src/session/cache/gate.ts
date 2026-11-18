@@ -6,80 +6,164 @@ export * as CacheGate from "./gate.js"
 // exact request and refuse it if a block is stale; the request asks the provider to fail on whatever the check could
 // not foresee ("error"). "accept": mark the stale blocks dropped and rebuild the request so they replay as text; the
 // provider drops what the check could not foresee. Only models whose requests bind thinking are checked.
+//
+// The runner builds each request as upstream does; `build` names what it adds. A dry run goes through `consent`, and
+// the runner builds again with the consent it returns.
 
-import { LLMClient, type LLMClientShape } from "@opencode/ai/effect"
+import { AIError, LLMClient, type LLMClientShape, type LLMRequest } from "@opencode/ai/effect"
+import type { StreamOptions } from "@opencode/ai/route"
+import { STALE_THINKING_ERROR } from "@opencode/schema/session-cache"
 import { Effect, Exit, Option, Stream } from "effect"
 import { StepFailedError } from "../error.js"
 import type { SessionMessage } from "../message.js"
-import type { SessionModelRequest } from "../model-request.js"
+import type { SessionRunnerModel } from "../runner/model.js"
 import type { SessionSchema } from "../schema.js"
-import type { CacheLedger } from "./ledger.js"
+import { toSessionError } from "../to-session-error.js"
+import { CacheLedger } from "./ledger.js"
+import { CacheModel } from "./model.js"
 import { SessionCache } from "./service.js"
 import type { CacheWire } from "./wire.js"
 
-/** How the gate asks the runner to build a request. */
-export interface Build {
-  readonly dryRun: boolean
-  /** Undefined where nothing is checked: the protocol default applies, as nothing could ask for consent. */
-  readonly thinkingBinding?: "error" | "drop_block"
-  /** How the request treats stale thinking, for the ledger; undefined where nothing is checked. */
-  readonly mode?: CacheLedger.Mode
+/** How a Step's request treats stale thinking, once decided. */
+export interface Consent {
+  readonly thinkingBinding: "error" | "drop_block"
+  /** Who decided, for the ledger's dropped-thinking markers. */
+  readonly mode: CacheLedger.Mode
   readonly dropped: ReadonlyArray<SessionCache.Dropped>
 }
 
-/** Run a dry-run request's stream to the wire and return what it captured. Nothing is sent. */
-export const capture = (llm: LLMClientShape, prepared: SessionModelRequest.Prepared<unknown>) =>
+/** A request the gate asks the runner to build: the one to send, or a dry run to check first. */
+export interface Build {
+  readonly dryRun: boolean
+  /** The dropped-thinking markers the transcript applies. */
+  readonly dropped: ReadonlyArray<SessionCache.Dropped>
+  /** What the build adds to the model request. */
+  readonly request: {
+    readonly dryRun?: boolean
+    readonly capture?: CacheWire.Capture
+    /** Undefined where nothing is checked: the protocol default applies, as nothing could ask for consent. */
+    readonly thinkingBinding?: "error" | "drop_block"
+    readonly thinkingMode?: CacheLedger.Mode
+    readonly cacheKey: string
+  }
+  /** For a dry run, the consent the check starts from. */
+  readonly pending?: Consent
+}
+
+/** Run a dry-run request's stream to the wire and return what it left in CAPTURE. Nothing is sent. */
+export const capture = (
+  llm: LLMClientShape,
+  prepared: { readonly request: LLMRequest; readonly options: StreamOptions },
+  holder: CacheWire.Capture,
+) =>
   Effect.gen(function* () {
     const exit = yield* llm.stream(prepared.request, prepared.options).pipe(Stream.runDrain, Effect.exit)
-    const captured = prepared.captured?.()
-    return { captured, exit } as { readonly captured?: CacheWire.Captured; readonly exit: Exit.Exit<void, unknown> }
+    return { captured: holder.request, exit } as {
+      readonly captured?: CacheWire.Captured
+      readonly exit: Exit.Exit<void, unknown>
+    }
   })
+
+/**
+ * A Step attempt whose thinking block the provider refused fails as stale thinking: the error a turn that asked first
+ * is refused with, with the same way out. The Step's own failure keeps the provider's words.
+ */
+export const refusing =
+  <I extends { readonly model: SessionRunnerModel.Resolved }, A, E, R>(attempt: (input: I) => Effect.Effect<A, E, R>) =>
+  (input: I) =>
+    attempt(input).pipe(
+      Effect.catchIf(
+        (error): error is E & AIError =>
+          error instanceof AIError && CacheLedger.isThinkingRefusal(toSessionError(error).message),
+        (error) =>
+          new StepFailedError({
+            error: {
+              type: STALE_THINKING_ERROR,
+              message: CacheLedger.refusalMessage(
+                toSessionError(error).message,
+                !CacheModel.isClaudeModel(input.model.model.id),
+              ),
+            },
+          }),
+      ),
+    )
 
 export const make = Effect.gen(function* () {
   const cache = Option.getOrUndefined(yield* Effect.serviceOption(SessionCache.Service))
   const llm = yield* LLMClient.Service
 
-  const prepare = Effect.fn("CacheGate.prepare")(function* <P extends SessionModelRequest.Prepared<unknown>>(input: {
+  /** What the runner builds next for a Step: CONSENT once decided, else what the newest user message asks for. */
+  const build = Effect.fn("CacheGate.build")(function* (input: {
     readonly sessionID: SessionSchema.ID
     readonly step: number
     /** Whether the Step's model binds thinking to the prompt (`CacheModel.checksThinking`). */
     readonly checks: boolean
-    /** The Step's history: its newest user message decides, and converted blocks are found in it. */
+    /** The Step's history: its newest user message decides. */
     readonly messages: ReadonlyArray<SessionMessage.Info>
     readonly dropped?: ReadonlyArray<SessionCache.Dropped>
-    readonly build: (build: Build) => Effect.Effect<P>
+    readonly consent?: Consent
+    /** Correlates the request with the usage that confirms it (the Step's assistant message). */
+    readonly cacheKey: string
   }) {
-    if (!cache || !input.checks) return yield* input.build({ dryRun: false, dropped: input.dropped ?? [] })
+    const send = (consent?: Consent): Build => ({
+      dryRun: false,
+      dropped: consent?.dropped ?? input.dropped ?? [],
+      request: {
+        ...(consent ? { thinkingBinding: consent.thinkingBinding, thinkingMode: consent.mode } : {}),
+        cacheKey: input.cacheKey,
+      },
+    })
+    if (input.consent) return send(input.consent)
+    if (!cache || !input.checks) return send()
     const mode = SessionCache.thinkingMode(input.messages, input.step)
     if (mode === "unasked")
-      return yield* input.build({
-        dryRun: false,
-        thinkingBinding: "drop_block",
-        mode,
-        dropped: yield* cache.dropped(input.sessionID),
-      })
+      return send({ thinkingBinding: "drop_block", mode, dropped: yield* cache.dropped(input.sessionID) })
     const accept = mode === "accept"
-    const thinkingBinding = accept ? ("drop_block" as const) : ("error" as const)
-    const state = yield* cache.step({ sessionID: input.sessionID, accept })
-    let dropped = state.dropped
-    if (state.check) {
-      const dry = yield* input.build({ dryRun: true, thinkingBinding, mode, dropped })
-      const run = yield* capture(llm, dry)
-      if (!run.captured) {
-        // The request failed before reaching the wire; sending it fails the same way and reports why.
-        yield* Effect.logDebug("stale thinking check did not reach the wire", { sessionID: input.sessionID })
-      } else {
-        const verdict = yield* cache.consent({
-          sessionID: input.sessionID,
-          request: run.captured,
-          accept,
-          messages: input.messages,
-        })
-        if (verdict.type === "refused") return yield* new StepFailedError({ error: verdict.error })
-        if (verdict.type === "converted") dropped = verdict.dropped
-      }
+    const pending: Consent = {
+      thinkingBinding: accept ? "drop_block" : "error",
+      mode,
+      dropped: [],
     }
-    return yield* input.build({ dryRun: false, thinkingBinding, mode, dropped })
+    const state = yield* cache.step({ sessionID: input.sessionID, accept })
+    if (!state.check) return send({ ...pending, dropped: state.dropped })
+    return {
+      dryRun: true,
+      dropped: state.dropped,
+      request: {
+        dryRun: true,
+        capture: {},
+        thinkingBinding: pending.thinkingBinding,
+        thinkingMode: mode,
+        cacheKey: input.cacheKey,
+      },
+      pending: { ...pending, dropped: state.dropped },
+    } satisfies Build
+  })
+
+  /** Check a dry run's request against the Session's thinking: refuse the Step, or decide what it sends. */
+  const consent = Effect.fn("CacheGate.consent")(function* (input: {
+    readonly sessionID: SessionSchema.ID
+    readonly build: Build
+    readonly prepared: { readonly request: LLMRequest; readonly options: StreamOptions }
+    /** The Step's history, in which converted blocks are found. */
+    readonly messages: ReadonlyArray<SessionMessage.Info>
+  }) {
+    const pending = input.build.pending
+    if (!pending) return yield* Effect.die("CacheGate.consent needs a dry run's build")
+    const run = yield* capture(llm, input.prepared, input.build.request.capture ?? {})
+    if (!cache || !run.captured) {
+      // The request failed before reaching the wire; sending it fails the same way and reports why.
+      yield* Effect.logDebug("stale thinking check did not reach the wire", { sessionID: input.sessionID })
+      return pending
+    }
+    const verdict = yield* cache.consent({
+      sessionID: input.sessionID,
+      request: run.captured,
+      accept: pending.mode === "accept",
+      messages: input.messages,
+    })
+    if (verdict.type === "refused") return yield* new StepFailedError({ error: verdict.error })
+    return verdict.type === "converted" ? { ...pending, dropped: verdict.dropped } : pending
   })
 
   /** The Session's dropped-thinking markers, for requests built outside a Step. */
@@ -89,5 +173,5 @@ export const make = Effect.gen(function* () {
   const discard = (sessionID: SessionSchema.ID, key: string) =>
     cache ? cache.discard({ sessionID, key }) : Effect.void
 
-  return { prepare, dropped, discard }
+  return { build, consent, dropped, discard }
 })

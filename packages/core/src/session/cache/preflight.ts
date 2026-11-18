@@ -31,6 +31,7 @@ import type { SessionSchema } from "../schema.js"
 import { CacheGate } from "./gate.js"
 import { CacheModel } from "./model.js"
 import { SessionCache } from "./service.js"
+import type { CacheWire } from "./wire.js"
 import { makeGlobalNode } from "@opencode/util/effect/app-node"
 import { FSUtil } from "@opencode/util/fs-util"
 import { llmClient } from "../../effect/app-node-platform.js"
@@ -252,6 +253,7 @@ const predict = Effect.fn("SessionPreflight.predict")(function* (input: {
   // The turn as the runner's first Step builds it, with the Session's markers or the ones consent would add.
   const dryRun = (markers: ReadonlyArray<SessionCache.Dropped>, thinkingBinding: "error" | "drop_block") =>
     Effect.gen(function* () {
+      const capture: CacheWire.Capture = {}
       const transcript = SessionModelRequest.baseTranscript({
         agent: loaded.agent.info,
         model: loaded.model,
@@ -273,9 +275,10 @@ const predict = Effect.fn("SessionPreflight.predict")(function* (input: {
         webSocket: "session",
         inputTokens: SessionCompaction.estimatePrompt(loaded),
         dryRun: true,
+        capture,
         thinkingBinding,
       })
-      return yield* CacheGate.capture(llm, prepared)
+      return yield* CacheGate.capture(llm, prepared, capture)
     })
   const checksThinking = CacheModel.checksThinking(loaded.model.model)
   const run = yield* dryRun(dropped, "error")
