@@ -37,7 +37,7 @@ export const forkTests = ({ it, reset, invocations }: Harness) =>
           { action: McpTool.name("direct", "lookup"), resource: "*", effect: "deny" },
           { action: McpTool.name("demo", "search"), resource: "*", effect: "deny" },
         ]
-        const planned = yield* registry.snapshot(plan, undefined, [plan, build])
+        const planned = yield* registry.snapshot(plan, { exposure: [plan, build] })
 
         // Alone, plan would leave both tools out; build's rules keep them listed for plan too.
         expect((yield* registry.snapshot(plan)).definitions.map((tool) => tool.name)).not.toContain("direct_lookup")

@@ -5,6 +5,14 @@ import { Wildcard } from "../util/wildcard.js"
 
 // How rules decide a request, without the services that collect them, so agents other than OpenCode can bundle it.
 
+/** Actions whose resources are file paths. */
+export const pathActions = ["external_directory", "read", "edit"] as const
+
+/** macOS volumes ignore case by default, so `.OPENCODE/x` opens `.opencode/x`; rules for file paths must match it too. */
+export function ignoresCase(action: string) {
+  return process.platform === "darwin" && pathActions.some((item) => item === action)
+}
+
 export function evaluate(action: string, resource: string, ...rulesets: Permission.Ruleset[]): Permission.Rule {
   return (
     deciding(action, resource, ...rulesets) ?? {
@@ -18,9 +26,10 @@ export function evaluate(action: string, resource: string, ...rulesets: Permissi
 // The rule that decides ACTION on RESOURCE, the last one matching; none when no rule matches, and asking is the
 // default.
 export function deciding(action: string, resource: string, ...rulesets: Permission.Ruleset[]) {
+  const ignoreCase = ignoresCase(action)
   return rulesets
     .flat()
-    .findLast((rule) => Wildcard.match(action, rule.action) && Wildcard.match(resource, rule.resource))
+    .findLast((rule) => Wildcard.match(action, rule.action) && Wildcard.match(resource, rule.resource, ignoreCase))
 }
 
 // The spellings of the resource at INDEX of a request: the resource, then its alternates.
@@ -32,10 +41,11 @@ export function spellings(input: Pick<Permission.Request, "resources" | "alterna
 // any of them, with the spelling it matched; none when no rule matches any, and asking is the default.
 export function decidingAny(action: string, spellings: readonly string[], ...rulesets: Permission.Ruleset[]) {
   const rules = rulesets.flat()
+  const ignoreCase = ignoresCase(action)
   for (let index = rules.length - 1; index >= 0; index--) {
     const rule = rules[index]
     if (!Wildcard.match(action, rule.action)) continue
-    const spelling = spellings.find((item) => Wildcard.match(item, rule.resource))
+    const spelling = spellings.find((item) => Wildcard.match(item, rule.resource, ignoreCase))
     if (spelling !== undefined) return { rule, spelling }
   }
 }

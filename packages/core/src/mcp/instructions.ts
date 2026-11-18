@@ -2,8 +2,10 @@ export * as McpInstructions from "./instructions.js"
 
 import { makeLocationNode } from "@opencode/util/effect/app-node"
 import { Context, Effect, Layer, Schema } from "effect"
-import { Permission } from "../permission.js"
+import type { CodeModeCatalog } from "../codemode/catalog.js"
+import type { Tool } from "../tool.js"
 import { McpTool } from "../tool/mcp.js"
+import { normalizedName } from "../tool/runtime.js"
 import { Mcp } from "./index.js"
 import { Instructions } from "../instructions/index.js"
 
@@ -42,15 +44,19 @@ const update = Instructions.listUpdate<Summary>({
   },
 })
 
+function catalogPaths(
+  items: ReadonlyArray<CodeModeCatalog.Tool | CodeModeCatalog.Namespace>,
+  prefix = "",
+): ReadonlyArray<string> {
+  return items.flatMap((item) => {
+    const path = prefix ? `${prefix}.${item.name}` : item.name
+    return item.type === "tool" ? [path] : catalogPaths(item.tools, path)
+  })
+}
+
 export interface Interface {
-  /** Lists server instructions reachable under the given ruleset; callers pass the merged agent and Session permissions. */
-  readonly load: (
-    permissions: Permission.Ruleset,
-    /** The merged permissions of every agent sharing the request's exposure; instructions any of them reaches are listed. */
-    exposure?: ReadonlyArray<Permission.Ruleset>,
-    /** The Session's delegation ceilings, which bind every ruleset of the exposure. */
-    ceilings?: ReadonlyArray<Permission.Ceiling>,
-  ) => Effect.Effect<Instructions.List>
+  /** Lists instructions for MCP servers that have at least one tool in the Session's tool snapshot. */
+  readonly load: (tools: Pick<Tool.Snapshot, "definitions" | "codeModeCatalog">) => Effect.Effect<Instructions.List>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/McpInstructions") {}
@@ -61,7 +67,7 @@ export const layer = Layer.effect(
     const mcp = yield* Mcp.Service
 
     return Service.of({
-      load: Effect.fn("McpInstructions.load")(function* (permissions, exposure = [permissions], ceilings = []) {
+      load: Effect.fn("McpInstructions.load")(function* (snapshot) {
         const source = (value: ReadonlyArray<Summary> | Instructions.Removed) =>
           Instructions.make<ReadonlyArray<Summary>>({
             key: Instructions.Key.make("core/mcp-guidance"),
@@ -76,19 +82,18 @@ export const layer = Layer.effect(
         const [instructions, tools] = yield* Effect.all([mcp.instructions(), mcp.tools()], {
           concurrency: "unbounded",
         })
-        // Shown when any ruleset allows, matching how the tool listing and Code Mode catalog are shared.
-        const allowed = (action: string) =>
-          exposure.some((permissions) => Permission.decide(action, "*", permissions, ceilings) !== "deny")
-        const canExecute = allowed("execute")
+        const direct = new Set(snapshot.definitions.map((tool) => tool.name))
+        const codemode = new Set(snapshot.codeModeCatalog ? catalogPaths(snapshot.codeModeCatalog.tools) : [])
         // Instructions are useful only when this Session can reach at least one server tool.
         const visible = instructions
           .flatMap((item) => {
+            const namespace = McpTool.namespace(item.server)
             const owned = tools.filter((tool) => tool.server === item.server)
-            // Without execute, Code Mode server tools are exposed directly.
-            const codemode = canExecute && owned[0]?.codemode !== false
-            if (!owned.some((tool) => allowed(McpTool.name(tool.server, tool.name)))) return []
+            const inCodeMode = owned.some((tool) => codemode.has(`${namespace}.${normalizedName({ name: tool.name })}`))
+            const inDirect = owned.some((tool) => direct.has(McpTool.name(item.server, tool.name)))
+            if (!inCodeMode && !inDirect) return []
             return [
-              codemode
+              inCodeMode
                 ? { server: item.server, instructions: item.instructions }
                 : { server: item.server, instructions: item.instructions, codemode: false as const },
             ]

@@ -95,6 +95,9 @@ export class NotFoundError extends Schema.TaggedError<NotFoundError>()("Permissi
 
 export type Error = BlockedError | CorrectedError
 
+// Rule matching lives in permission/match.ts, which the shell policy bundle shares: port upstream's changes there.
+export const pathActions = PermissionMatch.pathActions
+export const ignoresCase = PermissionMatch.ignoresCase
 export const evaluate = PermissionMatch.evaluate
 export const deciding = PermissionMatch.deciding
 export const spellings = PermissionMatch.spellings

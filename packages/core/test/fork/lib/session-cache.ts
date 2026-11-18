@@ -37,6 +37,7 @@ import { SessionRunCoordinator } from "@opencode/core/session/run-coordinator"
 import { SessionRunner } from "@opencode/core/session/runner/index"
 import { SessionRunnerLLM } from "@opencode/core/session/runner/llm"
 import { SessionRunnerModel } from "@opencode/core/session/runner/model"
+import { SessionSchema } from "@opencode/core/session/schema"
 import { SessionTable } from "@opencode/core/session/sql"
 import { SessionStore } from "@opencode/core/session/store"
 import { SkillInstructions } from "@opencode/core/skill/instructions"
@@ -224,19 +225,23 @@ export const models = {
     "deep",
   ),
 }
+const sessionModel = (session: SessionSchema.Info) =>
+  session.model?.id === "claude-mythos-5-1"
+    ? models.other
+    : session.model?.id === "reasoner-1"
+      ? models.bound
+      : session.model?.id === "gpt-chat"
+        ? models.chat
+        : session.model?.variant === "deep"
+          ? models.deep
+          : models.primary
 const modelService = Layer.mock(SessionRunnerModel.Service)({
-  resolve: (session) =>
-    Effect.succeed(
-      session.model?.id === "claude-mythos-5-1"
-        ? models.other
-        : session.model?.id === "reasoner-1"
-          ? models.bound
-          : session.model?.id === "gpt-chat"
-            ? models.chat
-            : session.model?.variant === "deep"
-              ? models.deep
-              : models.primary,
-    ),
+  select: (session) =>
+    Effect.sync(() => {
+      const resolved = sessionModel(session)
+      return { info: Model.Info.default(resolved.ref.providerID, resolved.ref.id), variant: resolved.ref.variant }
+    }),
+  resolve: (session) => Effect.succeed(sessionModel(session)),
 })
 
 const empty = {

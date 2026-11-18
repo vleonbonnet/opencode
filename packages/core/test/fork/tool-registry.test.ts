@@ -60,8 +60,8 @@ describe("Tool", () => {
         { action: "*", resource: "*", effect: "allow" },
         { action: "remove", resource: "*", effect: "deny" },
       ]
-      const planned = yield* service.snapshot(plan, undefined, [plan, build])
-      const built = yield* service.snapshot(build, undefined, [build, plan])
+      const planned = yield* service.snapshot(plan, { exposure: [plan, build] })
+      const built = yield* service.snapshot(build, { exposure: [build, plan] })
 
       // Only a tool every ruleset disables is left out, so both agents list the same tools and catalog.
       expect(planned.definitions.map((tool) => tool.name)).toEqual(["insert", "execute"])
@@ -110,8 +110,8 @@ describe("Tool", () => {
         { action: "execute", resource: "*", effect: "deny" },
       ]
       const build: Permission.Ruleset = [{ action: "*", resource: "*", effect: "allow" }]
-      const planned = yield* service.snapshot(plan, undefined, [plan, build])
-      const built = yield* service.snapshot(build, undefined, [build, plan])
+      const planned = yield* service.snapshot(plan, { exposure: [plan, build] })
+      const built = yield* service.snapshot(build, { exposure: [build, plan] })
       const asPlan = (input: Parameters<Tool.Snapshot["execute"]>[0]) => ({ ...input, agent: Agent.ID.make("plan") })
       const script = {
         ...call("execute", "call-script"),
@@ -149,11 +149,9 @@ describe("Tool", () => {
       const allow: Permission.Ruleset = [{ action: "*", resource: "*", effect: "allow" }]
       const delegator = { sessionID: Session.ID.make("ses_parent"), agent: Agent.ID.make("plan") }
       const ceiling = (rules: Permission.Ruleset): Permission.Ceiling => ({ delegator, rules: [...allow, ...rules] })
-      const bounded = yield* service.snapshot(
-        allow,
-        undefined,
-        [allow],
-        [
+      const bounded = yield* service.snapshot(allow, {
+        exposure: [allow],
+        ceilings: [
           ceiling([{ action: "insert", resource: "*", effect: "deny" }]),
           // A narrower exception keeps the tool listed; its calls answer to the ceiling when the tool asserts.
           ceiling([
@@ -162,7 +160,7 @@ describe("Tool", () => {
             { action: "remove", resource: "drafts/*", effect: "allow" },
           ]),
         ],
-      )
+      })
 
       expect(bounded.definitions.map((tool) => tool.name)).toEqual(["remove", "execute"])
       expect(codeModeListings(bounded.codeModeCatalog!).map((tool) => tool.path)).toEqual(["lookup"])
@@ -170,12 +168,10 @@ describe("Tool", () => {
         message: 'No tool named "insert" is currently available. Please use a tool from the available tool list.',
       })
 
-      const closed = yield* service.snapshot(
-        allow,
-        undefined,
-        [allow],
-        [ceiling([{ action: "execute", resource: "*", effect: "deny" }])],
-      )
+      const closed = yield* service.snapshot(allow, {
+        exposure: [allow],
+        ceilings: [ceiling([{ action: "execute", resource: "*", effect: "deny" }])],
+      })
       // Without Code Mode its tools are exposed directly, still bound by the ceiling.
       expect(closed.definitions.map((tool) => tool.name)).toEqual(["insert", "lookup", "remove", "write_note"])
       expect(closed.codeModeCatalog).toBeUndefined()

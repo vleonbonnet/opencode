@@ -6,7 +6,13 @@ import { Context, Effect, Layer } from "effect"
 import { Agent } from "../agent.js"
 import type { SessionRequestKind } from "@opencode/plugin/effect/session"
 import { CodeModeInstructions } from "../codemode/instructions.js"
+import { CodeModeTool } from "../codemode/tool.js"
 import { Database } from "../database/database.js"
+import { Environment } from "../environment/index.js"
+import { FileAccess } from "../file-access.js"
+import { FileMutation } from "../file-mutation.js"
+import { FileWrite } from "../file-write.js"
+import { Flag } from "../flag.js"
 import { makeLocationNode } from "@opencode/util/effect/app-node"
 import { InstructionDiscovery } from "../instruction-discovery.js"
 import { Instructions } from "../instructions/index.js"
@@ -17,6 +23,8 @@ import { McpTool } from "../tool/mcp.js"
 import { ReferenceInstructions } from "../reference/instructions.js"
 import { SkillInstructions } from "../skill/instructions.js"
 import { Tool } from "../tool.js"
+import { modelTools } from "../tool/model-policy.js"
+import { WebSearch } from "../websearch.js"
 import { AgentNotFoundError } from "./error.js"
 import { SessionHistory } from "./history.js"
 import { InstructionEntry } from "./instruction-entry.js"
@@ -92,17 +100,20 @@ const layer = Layer.effect(
     const db = (yield* Database.Service).db
     const discovery = yield* InstructionDiscovery.Service
     const entries = yield* InstructionEntry.Service
+    const flags = yield* Flag.Service
     const location = yield* Location.Service
     const mcpInstructions = yield* McpInstructions.Service
     const mcpTools = yield* McpTool.Service
     const permission = yield* Permission.Service
+    const cache = Option.getOrUndefined(yield* Effect.serviceOption(SessionCache.Service))
     const models = yield* SessionRunnerModel.Service
     const request = yield* SessionModelRequest.Service
     const referenceInstructions = yield* ReferenceInstructions.Service
     const skillInstructions = yield* SkillInstructions.Service
     const store = yield* SessionStore.Service
     const registry = yield* Tool.Service
-    const cache = Option.getOrUndefined(yield* Effect.serviceOption(SessionCache.Service))
+    const services = yield* CodeModeTool.services
+    const websearch = yield* WebSearch.Service
 
     const resolveModel = (
       session: SessionSchema.Info,
@@ -162,20 +173,35 @@ const layer = Layer.effect(
       if (!agent.info) return yield* new AgentNotFoundError({ sessionID: session.id, agent: session.agent ?? agent.id })
       // Session permissions narrow discovery the same way they narrow the tool snapshot.
       const permissions = Permission.merge(agent.info.permissions, session.permissions ?? [])
+      const [selected, hasWebSearch, fullCodeMode] = yield* Effect.all(
+        [
+          models.select(session, model.available).pipe(Effect.orElseSucceed(() => undefined)),
+          websearch.available(),
+          flags.enabled("full_codemode"),
+        ],
+        { concurrency: "unbounded" },
+      )
+      const fallbackRef = session.model ?? agent.info.model
+      const policyModel = selected?.info ?? (fallbackRef && Model.Info.default(fallbackRef.providerID, fallbackRef.id))
       // Agents the user switches between expose the same tools and guidance, so a switch keeps the prompt cache.
       const exposure = Agent.exposure(agent.info, yield* agents.list(), session).map((rules) =>
         Permission.merge(rules, session.permissions ?? []),
       )
       // What a delegator may not do is neither listed nor allowed for any agent of the Session.
       const ceilings = yield* permission.ceilings(session)
+      const tools = yield* registry.snapshot(permissions, {
+        services,
+        tools: modelTools({ model: policyModel, websearch: hasWebSearch, fullCodeMode }),
+        exposure,
+        ceilings,
+      })
       const loaded = yield* Effect.all(
         {
-          tools: registry.snapshot(permissions, location, exposure, ceilings),
           builtins: builtins.load(),
           discovery: discovery.load(),
           skills: skillInstructions.load(permissions, exposure, ceilings),
           references: referenceInstructions.load(),
-          mcp: mcpInstructions.load(permissions, exposure, ceilings),
+          mcp: mcpInstructions.load(tools),
           entries: entries.load(sessionID),
         },
         { concurrency: "unbounded" },
@@ -187,7 +213,7 @@ const layer = Layer.effect(
         // prompt-cache prefix: user-level catalog and guidance, then project instructions, then
         // the date and environment, which vary by day and directory.
         instructions: Instructions.combine([
-          CodeModeInstructions.make(loaded.tools.codeModeCatalog),
+          CodeModeInstructions.make(tools.codeModeCatalog),
           loaded.mcp,
           loaded.references,
           loaded.skills,
@@ -195,7 +221,7 @@ const layer = Layer.effect(
           loaded.builtins,
           loaded.entries,
         ]),
-        tools: loaded.tools,
+        tools,
       }
     })
 
@@ -244,6 +270,11 @@ export const node = makeLocationNode({
     Agent.node,
     Model.node,
     Database.node,
+    Environment.node,
+    FileAccess.node,
+    FileMutation.node,
+    FileWrite.node,
+    Flag.node,
     InstructionBuiltIns.node,
     InstructionDiscovery.node,
     InstructionEntry.node,
@@ -258,5 +289,6 @@ export const node = makeLocationNode({
     SessionStore.node,
     SkillInstructions.node,
     Tool.node,
+    WebSearch.node,
   ],
 })
