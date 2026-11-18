@@ -878,6 +878,7 @@ export type Project = {
 export type PermissionSavedInfo = {
   id: PermissionSavedID
   projectID: ProjectID
+  sessionID: SessionID
   action: string
   resource: string
   time: { created: number; updated: number }
@@ -4571,7 +4572,10 @@ export type PermissionRequestListInput = { readonly location?: { readonly direct
 
 export type PermissionRequestListOutput = { location: LocationPublicRef; data: Array<PermissionRequest> }
 
-export type PermissionSavedListInput = { readonly projectID?: string | undefined }
+export type PermissionSavedListInput = {
+  readonly projectID?: string | undefined
+  readonly sessionID?: string | undefined
+}
 
 export type PermissionSavedListOutput = { data: Array<PermissionSavedInfo> }["data"]
 

@@ -91,6 +91,7 @@ export const PermissionHandler = HttpApiBuilder.group(Api, "server.permission", 
           return {
             data: yield* saved.list({
               projectID: ctx.query.projectID ?? location.project.id,
+              ...(ctx.query.sessionID ? { sessionIDs: [ctx.query.sessionID] } : {}),
             }),
           }
         }),

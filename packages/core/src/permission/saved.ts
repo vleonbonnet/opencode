@@ -1,6 +1,6 @@
 export * as PermissionSaved from "./saved.js"
 
-import { eq } from "drizzle-orm"
+import { and, eq, inArray } from "drizzle-orm"
 import { Cause, Context, DateTime, Effect, Layer, Schema } from "effect"
 import { isSqlError } from "effect/sql/SqlError"
 import type { EffectDrizzleQueryError } from "drizzle-orm/effect-core/errors"
@@ -10,6 +10,8 @@ import { makeGlobalNode } from "@opencode/util/effect/app-node"
 import { PermissionTable } from "./sql.js"
 import { PermissionSaved } from "@opencode/schema/permission-saved"
 
+import type { SessionSchema } from "../session/schema.js"
+
 export const ID = PermissionSaved.ID
 export type ID = typeof ID.Type
 
@@ -18,10 +20,13 @@ export type Info = typeof Info.Type
 
 export interface ListInput {
   readonly projectID?: Project.ID
+  // The approvals saved in any of these Sessions.
+  readonly sessionIDs?: readonly SessionSchema.ID[]
 }
 
 export interface AddInput {
   readonly projectID: Project.ID
+  readonly sessionID: SessionSchema.ID
   readonly action: string
   readonly resources: readonly string[]
 }
@@ -60,7 +65,12 @@ const layer = Layer.effect(
       const rows = yield* db
         .select()
         .from(PermissionTable)
-        .where(input?.projectID ? eq(PermissionTable.project_id, input.projectID) : undefined)
+        .where(
+          and(
+            input?.projectID ? eq(PermissionTable.project_id, input.projectID) : undefined,
+            input?.sessionIDs ? inArray(PermissionTable.session_id, [...input.sessionIDs]) : undefined,
+          ),
+        )
         .all()
         .pipe(Effect.orDie)
       return rows.map(info)
@@ -74,6 +84,7 @@ const layer = Layer.effect(
           input.resources.map((resource) => ({
             id: ID.create(),
             project_id: input.projectID,
+            session_id: input.sessionID,
             action: input.action,
             resource,
           })),
@@ -93,7 +104,7 @@ const layer = Layer.effect(
       if (!current) return yield* new NotFoundError({ id: input.id })
       const action = input.action ?? current.action
       const resource = input.resource ?? current.resource
-      // The unique index rejects an edit that duplicates another saved permission in the project.
+      // The unique index rejects an edit that duplicates another saved permission in the Session.
       const updated = yield* db
         .update(PermissionTable)
         .set({ action, resource })
@@ -129,6 +140,7 @@ const isUniqueViolation = (error: EffectDrizzleQueryError) => {
 const info = (row: typeof PermissionTable.$inferSelect): Info => ({
   id: row.id,
   projectID: row.project_id,
+  sessionID: row.session_id,
   action: row.action,
   resource: row.resource,
   time: {

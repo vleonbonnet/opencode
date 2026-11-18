@@ -154,9 +154,9 @@ function wildcardDirectory(value: string) {
 export function permissionAlwaysLines(input: { action: string; save?: ReadonlyArray<string> }): string[] {
   const save = input.save ?? []
   if (save.length === 1 && save[0] === "*") {
-    return [`This will always allow ${input.action} for this project.`]
+    return [`This will always allow ${input.action} in this session.`]
   }
-  return ["This will always allow the following patterns for this project.", ...save.map((item) => `- ${item}`)]
+  return ["This will always allow the following patterns in this session.", ...save.map((item) => `- ${item}`)]
 }
 
 export function permissionOptionLabel(option: "once" | "always" | "reject" | "confirm" | "cancel") {

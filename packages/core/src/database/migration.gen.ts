@@ -64,6 +64,7 @@ import m61 from "./migration/20261103200500_session_search_index.js"
 import m62 from "./migration/20261116043204_automation.js"
 import m63 from "./migration/20261116181958_automation_event_position.js"
 import m64 from "./migration/20261116213417_automation_active_index.js"
+import m65 from "./migration/20261118134050_session_permission.js"
 
 export const migrations = [
   m00,
@@ -131,4 +132,5 @@ export const migrations = [
   m62,
   m63,
   m64,
+  m65,
 ] satisfies DatabaseMigration.Migration[]

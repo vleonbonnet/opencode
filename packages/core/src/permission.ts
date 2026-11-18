@@ -191,8 +191,9 @@ const layer = Layer.effect(
     }).pipe(Effect.uninterruptible)
     yield* Effect.addFinalizer(() => close)
 
-    const savedRules = Effect.fnUntraced(function* () {
-      return (yield* saved.list({ projectID: location.project.id })).map(
+    // An approval saved with "always" answers the Session that gave it and the Sessions it starts.
+    const savedRules = Effect.fnUntraced(function* (sessionIDs: ReadonlyArray<SessionSchema.ID>) {
+      return (yield* saved.list({ projectID: location.project.id, sessionIDs })).map(
         (item): Permission.Rule => ({
           action: item.action,
           resource: item.resource,
@@ -201,16 +202,20 @@ const layer = Layer.effect(
       )
     })
 
-    const ceilings = Effect.fn("Permission.ceilings")(function* (session: SessionSchema.Info) {
-      // Descendants answer to every delegator recorded up their ancestry, including ones added after they started.
+    // SESSION and its ancestors, by ID.
+    const ancestry = Effect.fnUntraced(function* (session: SessionSchema.Info) {
       const lineage = new Map<SessionSchema.ID, SessionSchema.Info>()
-      const delegators: SessionSchema.Delegator[] = []
       let current: SessionSchema.Info | undefined = session
       while (current !== undefined && !lineage.has(current.id)) {
         lineage.set(current.id, current)
-        delegators.push(...(current.delegators ?? []))
         current = current.parentID === undefined ? undefined : yield* sessions.get(current.parentID)
       }
+      return lineage
+    })
+
+    const ceilingsOf = Effect.fnUntraced(function* (lineage: ReadonlyMap<SessionSchema.ID, SessionSchema.Info>) {
+      // Descendants answer to every delegator recorded up their ancestry, including ones added after they started.
+      const delegators = Array.from(lineage.values()).flatMap((item) => item.delegators ?? [])
       return yield* Effect.forEach(PermissionDelegation.distinct(delegators), (delegator) =>
         Effect.gen(function* () {
           return PermissionDelegation.ceiling({
@@ -222,13 +227,19 @@ const layer = Layer.effect(
       )
     })
 
+    const ceilings = Effect.fn("Permission.ceilings")(function* (session: SessionSchema.Info) {
+      return yield* ceilingsOf(yield* ancestry(session))
+    })
+
     const configured = Effect.fnUntraced(function* (sessionID: SessionSchema.ID, agentID?: Agent.ID) {
       const session = yield* sessions.get(sessionID)
       if (!session) return yield* new SessionErrors.NotFoundError({ sessionID })
       const agent = yield* agents.resolve(agentID ?? session.agent)
+      const lineage = yield* ancestry(session)
       return {
         rules: merge(agent?.permissions ?? missingAgentPermissions, session.permissions ?? []),
-        ceilings: yield* ceilings(session),
+        ceilings: yield* ceilingsOf(lineage),
+        lineage: Array.from(lineage.keys()),
       }
     })
 
@@ -248,7 +259,7 @@ const layer = Layer.effect(
     }
 
     const evaluateInput = Effect.fnUntraced(function* (input: AssertInput) {
-      const { rules, ceilings } = yield* configured(input.sessionID, input.agent)
+      const { rules, ceilings, lineage } = yield* configured(input.sessionID, input.agent)
       // A resource is denied when the configured rule deciding any of its spellings denies it.
       const denial = PermissionMatch.denial(input, rules)
       if (denial) {
@@ -267,7 +278,7 @@ const layer = Layer.effect(
             .join(" "),
           reasons: [],
         }
-      const saved = yield* savedRules()
+      const saved = yield* savedRules(lineage)
       const all = [...rules, ...saved]
       // Saved approvals answer a delegator's ask as they answer the delegator's own; no deny remains to override. A
       // resource asks when, under its own rules or any ceiling, the rule deciding it across its spellings asks or no
@@ -457,6 +468,7 @@ const layer = Layer.effect(
           if (input.reply === "always" && existing.request.save?.length) {
             yield* saved.add({
               projectID: location.project.id,
+              sessionID: existing.request.sessionID,
               action: existing.request.action,
               resources: existing.request.save,
             })

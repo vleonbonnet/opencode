@@ -357,7 +357,7 @@ describe("ShellTool scanner permissions", () => {
       Effect.gen(function* () {
         const saved = yield* PermissionSaved.Service
         const location = yield* Location.Service
-        yield* saved.add({ projectID: location.project.id, action: "shell", resources: ["printf *"] })
+        yield* saved.add({ projectID: location.project.id, sessionID, action: "shell", resources: ["printf *"] })
         const marker = path.join(fixture.active, "marker")
         const declarations = "export SCAN_TEST=hello; unset SCAN_TEST; printf hello > marker"
         const asked = yield* runPermissionCommand(registry, declarations, marker, ["always"])
@@ -440,7 +440,12 @@ describe("ShellTool scanner permissions", () => {
       Effect.gen(function* () {
         const saved = yield* PermissionSaved.Service
         const location = yield* Location.Service
-        yield* saved.add({ projectID: location.project.id, action: "shell", resources: ["printf hello", "cat"] })
+        yield* saved.add({
+          projectID: location.project.id,
+          sessionID,
+          action: "shell",
+          resources: ["printf hello", "cat"],
+        })
         const marker = path.join(fixture.active, "marker")
         const command = "printf hello | cat > marker"
         const unapprovedRedirect = yield* runPermissionCommand(registry, command, marker, ["reject"])
@@ -449,13 +454,18 @@ describe("ShellTool scanner permissions", () => {
         ])
         expect(yield* Effect.promise(() => Bun.file(marker).exists())).toBe(false)
 
-        yield* saved.add({ projectID: location.project.id, action: "shell", resources: ["cat > marker"] })
+        yield* saved.add({ projectID: location.project.id, sessionID, action: "shell", resources: ["cat > marker"] })
         const exact = yield* runPermissionCommand(registry, command, marker, [])
         expect(exact.requests).toEqual([])
         expect(exact.exit).toMatchObject({ _tag: "Success", value: { status: "completed", metadata: { exit: 0 } } })
         expect(yield* Effect.promise(() => Bun.file(marker).text())).toBe("hello")
 
-        yield* saved.add({ projectID: location.project.id, action: "shell", resources: ["printf *", "cat *"] })
+        yield* saved.add({
+          projectID: location.project.id,
+          sessionID,
+          action: "shell",
+          resources: ["printf *", "cat *"],
+        })
         yield* Effect.promise(() => fs.rm(marker))
         const broad = yield* runPermissionCommand(registry, command, marker, [])
         expect(broad.requests).toEqual([])
@@ -618,7 +628,7 @@ describe("ShellTool conditional process substitution", () => {
           Effect.gen(function* () {
             const saved = yield* PermissionSaved.Service
             const location = yield* Location.Service
-            yield* saved.add({ projectID: location.project.id, action: "shell", resources: ["wait *"] })
+            yield* saved.add({ projectID: location.project.id, sessionID, action: "shell", resources: ["wait *"] })
             const marker = path.join(directory.active, "marker")
             const command = '[[ -n <(printf reached > marker) ]]; wait "$!"'
             const result = yield* runPermissionCommand(registry, command, marker, [reply])
@@ -685,7 +695,7 @@ describe("ShellTool compound syntax approval compatibility", () => {
           Effect.gen(function* () {
             const saved = yield* PermissionSaved.Service
             const location = yield* Location.Service
-            yield* saved.add({ projectID: location.project.id, action: "shell", resources: fixture.saved })
+            yield* saved.add({ projectID: location.project.id, sessionID, action: "shell", resources: fixture.saved })
             const result = yield* runPermissionCommand(
               registry,
               fixture.command,
@@ -750,7 +760,7 @@ describe("ShellTool ordinary shell syntax", () => {
             Effect.gen(function* () {
               const saved = yield* PermissionSaved.Service
               const location = yield* Location.Service
-              yield* saved.add({ projectID: location.project.id, action: "shell", resources: fixture.saved })
+              yield* saved.add({ projectID: location.project.id, sessionID, action: "shell", resources: fixture.saved })
               const result = yield* runPermissionCommand(
                 registry,
                 fixture.command,
@@ -821,6 +831,7 @@ describe("ShellTool ordinary shell syntax", () => {
             const location = yield* Location.Service
             yield* saved.add({
               projectID: location.project.id,
+              sessionID,
               action: "shell",
               resources: ["Write-Output *", "Show-Value *"],
             })

@@ -276,7 +276,7 @@ When a rule resolves to `ask`, clients can reply with:
 | Choice       | Reply      | Result                                                               |
 | ------------ | ---------- | -------------------------------------------------------------------- |
 | Allow once   | `once`     | Approve only the pending request                                     |
-| Allow always | `always`   | Approve it and save the tool's proposed patterns for the project     |
+| Allow always | `always`   | Approve it and save the tool's proposed patterns for the session     |
 | Reject       | `reject`   | Reject it and every other pending permission request in that session |
 
 For example, choosing **Allow always** for `git status --short` may save a
@@ -286,8 +286,10 @@ shell prefix that covers later `git status` commands:
 shell: git status * → allow
 ```
 
-Saved approvals are durable, project-scoped `allow` rules. They never override
-a configured `deny`. Tools choose the proposed saved pattern: some propose `*`,
+Saved approvals are durable `allow` rules for the session that saved them and
+the subagent sessions it starts. Other sessions in the project still ask, and
+deleting the session deletes its approvals. They never override a configured
+`deny`. Tools choose the proposed saved pattern: some propose `*`,
 shell proposes command prefixes, and skills and subagents propose their IDs.
 Review broad approvals and remove those no longer needed.
 

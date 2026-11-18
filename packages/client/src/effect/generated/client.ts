@@ -1394,7 +1394,7 @@ const EndpointPermissionRequestList = (raw: RawClient["server.permission"]) => (
 
 const EndpointPermissionSavedList = (raw: RawClient["server.permission"]) => (input?: PermissionSavedListInput) =>
   preserveEffect<PermissionSavedListOutput>()(
-    raw["permission.saved.list"]({ query: { projectID: input?.["projectID"] } }).pipe(
+    raw["permission.saved.list"]({ query: { projectID: input?.["projectID"], sessionID: input?.["sessionID"] } }).pipe(
       Effect.mapError(mapClientError),
       Effect.map((value) => value.data),
     ),

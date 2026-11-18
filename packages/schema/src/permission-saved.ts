@@ -5,6 +5,8 @@ import { ascending } from "./identifier.js"
 import { ProjectID } from "./project-id.js"
 import { DateTimeUtcFromMillis, statics } from "./schema.js"
 
+import { SessionID } from "./session-id.js"
+
 export const ID = Schema.String.pipe(
   Schema.brand("PermissionSaved.ID"),
   Schema.annotate({ identifier: "PermissionSaved.ID" }),
@@ -15,6 +17,8 @@ export type ID = typeof ID.Type
 export const Info = Schema.Struct({
   id: ID,
   projectID: ProjectID,
+  // The approval answers this Session and its descendants, not the rest of the project.
+  sessionID: SessionID,
   action: Schema.String,
   resource: Schema.String,
   time: Schema.Struct({

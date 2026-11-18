@@ -2014,7 +2014,10 @@ export type PermissionRequestListOperation<E = never> = (
   input?: PermissionRequestListInput,
 ) => Effect.Effect<PermissionRequestListOutput, E>
 
-export type PermissionSavedListInput = { readonly projectID?: Project.ID | undefined }
+export type PermissionSavedListInput = {
+  readonly projectID?: Project.ID | undefined
+  readonly sessionID?: Session.ID | undefined
+}
 export type PermissionSavedListOutput = ReadonlyArray<PermissionSaved.Info>
 export type PermissionSavedListOperation<E = never> = (
   input?: PermissionSavedListInput,

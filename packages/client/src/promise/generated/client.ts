@@ -2254,7 +2254,7 @@ export function make(options: ClientOptions) {
             {
               method: "GET",
               path: `/api/permission/saved`,
-              query: { projectID: input?.["projectID"] },
+              query: { projectID: input?.["projectID"], sessionID: input?.["sessionID"] },
               successStatus: 200,
               declaredStatuses: [400, 401, 404],
               empty: false,

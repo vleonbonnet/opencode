@@ -42,7 +42,10 @@ export const makePermissionGroup = <
     )
     .add(
       HttpApiEndpoint.get("permission.saved.list", "/api/permission/saved", {
-        query: Schema.Struct({ projectID: Project.ID.pipe(Schema.optional) }),
+        query: Schema.Struct({
+          projectID: Project.ID.pipe(Schema.optional),
+          sessionID: Session.ID.pipe(Schema.optional),
+        }),
         success: Schema.Struct({ data: Schema.Array(PermissionSaved.Info) }),
       })
         .middleware(locationMiddleware)
@@ -50,7 +53,8 @@ export const makePermissionGroup = <
           OpenApi.annotations({
             identifier: "permission.saved.list",
             summary: "List saved permissions",
-            description: "Retrieve saved permissions, optionally filtered by project.",
+            description:
+              "Retrieve the permissions saved by an always reply, each for the Session that gave it and its descendants, optionally filtered by project or by the Session that saved them.",
           }),
         ),
     )
@@ -68,7 +72,7 @@ export const makePermissionGroup = <
           identifier: "permission.saved.update",
           summary: "Update saved permission",
           description:
-            "Change the action or resource of a saved permission. Fails with a conflict when the project already has a saved permission with the same action and resource.",
+            "Change the action or resource of a saved permission. Fails with a conflict when its Session already has a saved permission with the same action and resource.",
         }),
       ),
     )

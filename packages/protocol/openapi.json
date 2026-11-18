@@ -9181,6 +9181,14 @@
               "$ref": "#/components/schemas/Project.ID"
             },
             "required": false
+          },
+          {
+            "name": "sessionID",
+            "in": "query",
+            "schema": {
+              "$ref": "#/components/schemas/Session.ID"
+            },
+            "required": false
           }
         ],
         "security": [],
@@ -9236,7 +9244,7 @@
             }
           }
         },
-        "description": "Retrieve saved permissions, optionally filtered by project.",
+        "description": "Retrieve the permissions saved by an always reply, each for the Session that gave it and its descendants, optionally filtered by project or by the Session that saved them.",
         "summary": "List saved permissions"
       }
     },
@@ -9314,7 +9322,7 @@
             }
           }
         },
-        "description": "Change the action or resource of a saved permission. Fails with a conflict when the project already has a saved permission with the same action and resource.",
+        "description": "Change the action or resource of a saved permission. Fails with a conflict when its Session already has a saved permission with the same action and resource.",
         "summary": "Update saved permission",
         "requestBody": {
           "content": {
@@ -22372,6 +22380,9 @@
           "projectID": {
             "$ref": "#/components/schemas/Project.ID"
           },
+          "sessionID": {
+            "$ref": "#/components/schemas/Session.ID"
+          },
           "action": {
             "type": "string"
           },
@@ -22392,7 +22403,7 @@
             "additionalProperties": false
           }
         },
-        "required": ["id", "projectID", "action", "resource", "time"],
+        "required": ["id", "projectID", "sessionID", "action", "resource", "time"],
         "additionalProperties": false
       },
       "PermissionSavedNotFoundErrorEncoded": {

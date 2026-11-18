@@ -16,6 +16,7 @@ import { Session } from "@opencode/core/session"
 import { SessionTable } from "@opencode/core/session/sql"
 import { SessionStore } from "@opencode/core/session/store"
 import { ShellParse } from "@opencode/core/shell/parse"
+import { eq } from "drizzle-orm"
 import { location } from "../fixture/location"
 import { testEffect } from "../lib/effect"
 
@@ -116,7 +117,12 @@ describe("Permission", () => {
         { action: "edit", resource: "*", effect: "ask" },
       ])
       const saved = yield* PermissionSaved.Service
-      yield* saved.add({ projectID: Project.ID.global, action: "shell", resources: ["git status"] })
+      yield* saved.add({
+        projectID: Project.ID.global,
+        sessionID: Session.ID.make("ses_test"),
+        action: "shell",
+        resources: ["git status"],
+      })
       const { service, fiber, request } = yield* waitForRequest({
         action: "shell",
         resources: ["cat secret", "ls", "git push", "git status", "git log"],
@@ -323,6 +329,99 @@ describe("shell command spellings", () => {
       expect(asked.filter((item) => item.id === first.request.id)).toHaveLength(1)
       yield* first.service.reply({ requestID: first.request.id, reply: "once" })
       yield* Fiber.join(first.fiber)
+    }),
+  )
+})
+
+describe("Session-scoped approvals", () => {
+  const parent = Session.ID.make("ses_test")
+  const child = Session.ID.make("ses_child")
+  const sibling = Session.ID.make("ses_sibling")
+  const rules: Permission.Ruleset = [{ action: "shell", resource: "*", effect: "ask" }]
+  // Adds a Session of the test project, started by PARENT when given.
+  const addSession = (id: Session.ID, parentID?: Session.ID) =>
+    Effect.gen(function* () {
+      const { db } = yield* Database.Service
+      yield* db
+        .insert(SessionTable)
+        .values({
+          id,
+          project_id: Project.ID.global,
+          ...(parentID ? { parent_id: parentID } : {}),
+          slug: id,
+          directory: "/project",
+          title: id,
+          version: "test",
+          agent: Agent.ID.make("test"),
+        })
+        .run()
+        .pipe(Effect.orDie)
+    })
+  const ask = (sessionID: Session.ID, id: string) =>
+    Effect.gen(function* () {
+      const service = yield* Permission.Service
+      return yield* service.ask(
+        assertion({ id: Permission.ID.create(id), sessionID, action: "shell", resources: ["ls"], save: ["ls *"] }),
+      )
+    })
+
+  it.effect("an always reply allows the request again in its Session and its descendants only", () =>
+    Effect.gen(function* () {
+      yield* setup(rules)
+      yield* addSession(child, parent)
+      yield* addSession(sibling)
+      const service = yield* Permission.Service
+      const first = yield* ask(parent, "per_first")
+      expect(first.effect).toBe("ask")
+      yield* service.reply({ requestID: first.id, reply: "always" })
+      const saved = yield* PermissionSaved.Service
+      expect(yield* saved.list()).toMatchObject([{ sessionID: parent, action: "shell", resource: "ls *" }])
+      expect((yield* ask(parent, "per_again")).effect).toBe("allow")
+      expect((yield* ask(child, "per_child")).effect).toBe("allow")
+      const other = yield* ask(sibling, "per_sibling")
+      expect(other.effect).toBe("ask")
+      yield* service.reply({ requestID: other.id, reply: "once" })
+    }),
+  )
+
+  it.effect("a descendant's always reply does not answer the Session that started it", () =>
+    Effect.gen(function* () {
+      yield* setup(rules)
+      yield* addSession(child, parent)
+      const service = yield* Permission.Service
+      const first = yield* ask(child, "per_child")
+      yield* service.reply({ requestID: first.id, reply: "always" })
+      expect((yield* ask(child, "per_child_again")).effect).toBe("allow")
+      const asked = yield* ask(parent, "per_parent")
+      expect(asked.effect).toBe("ask")
+      yield* service.reply({ requestID: asked.id, reply: "once" })
+    }),
+  )
+
+  it.effect("an always reply leaves another Session's pending request asking", () =>
+    Effect.gen(function* () {
+      yield* setup(rules)
+      yield* addSession(sibling)
+      const service = yield* Permission.Service
+      const waiting = yield* ask(sibling, "per_sibling")
+      const first = yield* ask(parent, "per_first")
+      yield* service.reply({ requestID: first.id, reply: "always" })
+      expect((yield* service.list()).map((item) => item.id)).toEqual([waiting.id])
+      yield* service.reply({ requestID: waiting.id, reply: "once" })
+    }),
+  )
+
+  it.effect("removing a Session removes its approvals", () =>
+    Effect.gen(function* () {
+      yield* setup(rules)
+      yield* addSession(sibling)
+      const saved = yield* PermissionSaved.Service
+      yield* saved.add({ projectID: Project.ID.global, sessionID: parent, action: "shell", resources: ["ls *"] })
+      yield* saved.add({ projectID: Project.ID.global, sessionID: sibling, action: "shell", resources: ["pwd *"] })
+      expect(yield* saved.list({ sessionIDs: [sibling] })).toMatchObject([{ sessionID: sibling, resource: "pwd *" }])
+      const { db } = yield* Database.Service
+      yield* db.delete(SessionTable).where(eq(SessionTable.id, parent)).run().pipe(Effect.orDie)
+      expect(yield* saved.list()).toMatchObject([{ sessionID: sibling, resource: "pwd *" }])
     }),
   )
 })

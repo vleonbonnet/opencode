@@ -277,7 +277,12 @@ describe("Permission", () => {
 
       yield* setRules([])
       const saved = yield* PermissionSaved.Service
-      yield* saved.add({ projectID: Project.ID.global, action: "bash", resources: ["pwd"] })
+      yield* saved.add({
+        projectID: Project.ID.global,
+        sessionID: Session.ID.make("ses_test"),
+        action: "bash",
+        resources: ["pwd"],
+      })
       yield* setSession([{ action: "bash", resource: "*", effect: "deny" }])
       expect(yield* service.ask(assertion({ action: "bash", resources: ["pwd"] }))).toMatchObject({ effect: "deny" })
       yield* setSession([{ action: "bash", resource: "*", effect: "ask" }])
@@ -289,7 +294,12 @@ describe("Permission", () => {
     Effect.gen(function* () {
       yield* setup()
       const saved = yield* PermissionSaved.Service
-      yield* saved.add({ projectID: Project.ID.global, action: "bash", resources: ["pwd"] })
+      yield* saved.add({
+        projectID: Project.ID.global,
+        sessionID: Session.ID.make("ses_test"),
+        action: "bash",
+        resources: ["pwd"],
+      })
 
       const service = yield* Permission.Service
       expect(yield* service.ask(assertion({ action: "bash", resources: ["pwd"] }))).toEqual({
@@ -401,7 +411,7 @@ describe("Permission", () => {
     }),
   )
 
-  it.effect("stores and removes saved resources for a project", () =>
+  it.effect("stores and removes saved resources for a Session", () =>
     Effect.gen(function* () {
       yield* setup()
       const service = yield* Permission.Service
@@ -421,11 +431,11 @@ describe("Permission", () => {
       const { db } = yield* Database.Service
       expect(
         yield* db.select().from(PermissionTable).where(eq(PermissionTable.project_id, Project.ID.global)).all(),
-      ).toMatchObject([{ action: "read", resource: "src/*" }])
+      ).toMatchObject([{ session_id: Session.ID.make("ses_test"), action: "read", resource: "src/*" }])
       const saved = yield* PermissionSaved.Service
       const id = (yield* saved.list())[0]!.id
       expect(yield* saved.list()).toMatchObject([
-        { id, projectID: Project.ID.global, action: "read", resource: "src/*" },
+        { id, projectID: Project.ID.global, sessionID: Session.ID.make("ses_test"), action: "read", resource: "src/*" },
       ])
       yield* service.assert(assertion({ id: Permission.ID.create("per_next"), resources: ["src/next.ts"] }))
       yield* saved.remove(id)
@@ -438,7 +448,12 @@ describe("Permission", () => {
       yield* setup()
       const saved = yield* PermissionSaved.Service
       const service = yield* Permission.Service
-      yield* saved.add({ projectID: Project.ID.global, action: "read", resources: ["src/*", "docs/*"] })
+      yield* saved.add({
+        projectID: Project.ID.global,
+        sessionID: Session.ID.make("ses_test"),
+        action: "read",
+        resources: ["src/*", "docs/*"],
+      })
       const src = (yield* saved.list()).find((item) => item.resource === "src/*")
 
       expect(yield* saved.update({ id: src!.id, resource: "src/allowed.ts" })).toMatchObject({
@@ -739,7 +754,12 @@ describe("shell scanner permission impact", () => {
         Effect.gen(function* () {
           yield* setup(scenario.rules)
           const saved = yield* PermissionSaved.Service
-          yield* saved.add({ projectID: Project.ID.global, action: "shell", resources: scenario.saved })
+          yield* saved.add({
+            projectID: Project.ID.global,
+            sessionID: Session.ID.make("ses_test"),
+            action: "shell",
+            resources: scenario.saved,
+          })
           const service = yield* Permission.Service
 
           const parsed = yield* ShellParse.scan(fixture.command, fixture.shell, "/project")

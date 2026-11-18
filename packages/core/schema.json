@@ -1,8 +1,8 @@
 {
   "version": "7",
   "dialect": "sqlite",
-  "id": "ab8fea18-0d95-48a1-b631-c112235dc492",
-  "prevIds": ["0709c7fb-3e7c-4bec-a6c5-0dd42ae64919"],
+  "id": "f29ae882-ce0c-4700-b93c-5fee49a4ea13",
+  "prevIds": ["ab8fea18-0d95-48a1-b631-c112235dc492"],
   "ddl": [
     {
       "name": "account_state",
@@ -871,6 +871,16 @@
       "default": null,
       "generated": null,
       "name": "project_id",
+      "entityType": "columns",
+      "table": "permission"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "session_id",
       "entityType": "columns",
       "table": "permission"
     },
@@ -2178,6 +2188,17 @@
       "table": "permission"
     },
     {
+      "columns": ["session_id"],
+      "tableTo": "session_v2",
+      "columnsTo": ["id"],
+      "onUpdate": "NO ACTION",
+      "onDelete": "CASCADE",
+      "nameExplicit": false,
+      "name": "fk_permission_session_id_session_v2_id_fk",
+      "entityType": "fks",
+      "table": "permission"
+    },
+    {
       "columns": ["project_id"],
       "tableTo": "project",
       "columnsTo": ["id"],
@@ -2600,7 +2621,7 @@
     {
       "columns": [
         {
-          "value": "project_id",
+          "value": "session_id",
           "isExpression": false
         },
         {
@@ -2615,7 +2636,7 @@
       "isUnique": true,
       "where": null,
       "origin": "manual",
-      "name": "permission_project_action_resource_idx",
+      "name": "permission_session_action_resource_idx",
       "entityType": "indexes",
       "table": "permission"
     },

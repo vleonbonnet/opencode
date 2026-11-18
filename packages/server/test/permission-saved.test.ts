@@ -53,6 +53,16 @@ it.live("edits saved permissions through PATCH", () =>
     }
     const saved = Schema.decodeUnknownSync(SavedList)((yield* request("/api/permission/saved", "GET")).body)
     const src = saved.data.find((item) => item.resource === "src/*")!
+    expect(saved.data.map((item) => item.sessionID)).toEqual([session.data.id, session.data.id])
+    const other = Schema.decodeUnknownSync(SessionResponse)((yield* request("/api/session", "POST", {})).body)
+    const bySession = (id: string) =>
+      Effect.map(request(`/api/permission/saved?sessionID=${id}`, "GET"), (response) =>
+        Schema.decodeUnknownSync(SavedList)(response.body)
+          .data.map((item) => item.resource)
+          .toSorted(),
+      )
+    expect(yield* bySession(session.data.id)).toEqual(["docs/*", "src/*"])
+    expect(yield* bySession(other.data.id)).toEqual([])
 
     const updated = yield* request(`/api/permission/saved/${src.id}`, "PATCH", { resource: "src/allowed.ts" })
     expect(updated.status).toBe(200)
