@@ -68,7 +68,8 @@ const entries = (
   await Promise.all(
     files.map(async (file) => {
       const source = await Bun.file(path.join(repo(), file)).text()
-      const exception = EXCEPTIONS.find(([re]) => re.test(file))?.[1]
+      // Bun.Glob gives Windows paths with backslashes; the exemptions are written with forward slashes.
+      const exception = EXCEPTIONS.find(([re]) => re.test(file.replaceAll(path.sep, "/")))?.[1]
       const allowed = allowedRanges(source)
       return declarations(source).flatMap((decl) =>
         neutrals(decl.value).map((hex) => ({
