@@ -17,8 +17,6 @@ import { SessionHistory } from "../history.js"
 import { SessionRecentText } from "../recent-text.js"
 import type { FileAttachment } from "@opencode/schema/prompt"
 
-import { CacheModel } from "../cache/model.js"
-
 const imageMimes = new Set(["image/png", "image/jpeg", "image/gif", "image/webp"])
 
 const media = (file: FileAttachment): MediaPart => ({
@@ -141,37 +139,11 @@ const toolResult = (tool: SessionMessage.AssistantTool, providerMetadata: Provid
   }
 }
 
-/**
- * Reasoning replayed as plain text when its signed form cannot be: its signature no longer matches the conversation
- * and the user consented to drop it. The tag keeps the model from reading it as something it told the user.
- */
-export const earlierReasoning = (text: string) => `<earlier-reasoning>\n${text}\n</earlier-reasoning>`
-
-/** A reasoning block later requests leave out, named by its assistant message and reasoning ordinal. */
-export interface DroppedReasoning {
-  readonly messageID: string
-  readonly ordinal: number
-  /** Replay its text as `<earlier-reasoning>`; otherwise omit it. */
-  readonly asText: boolean
-  readonly reason?: string
-}
-
-export interface Options {
-  readonly dropped?: ReadonlyArray<DroppedReasoning>
-}
-
-const droppedKey = (messageID: string, ordinal: number) => `${messageID}#${ordinal}`
-
 // Sessions migrated from V1 never recorded `time.ran`, so a completed call also counts as run.
 const ranTool = (item: SessionMessage.AssistantContent) =>
   item.type === "tool" && (item.time.ran !== undefined || item.state.status === "completed")
 
-const assistant = (
-  message: SessionMessage.Assistant,
-  model: Model.Ref,
-  providerMetadataKey: string,
-  dropped: ReadonlyMap<string, DroppedReasoning>,
-) => {
+const assistant = (message: SessionMessage.Assistant, model: Model.Ref, providerMetadataKey: string) => {
   const sameProvider = message.model.providerID === model.providerID
   const sameModel = sameProvider && message.model.id === model.id
   // A failed stream is retried from what had already happened: the local calls that ran and everything
@@ -197,23 +169,7 @@ const assistant = (
           (item.state.status === "error" && item.state.error.type.startsWith("tool.input")),
       )
     : kept
-  // A dropped block is named by its ordinal among the message's reasoning, whatever the cut leaves out.
-  const ordinals = new Map(
-    message.content.filter((item) => item.type === "reasoning").map((item, ordinal) => [item, ordinal] as const),
-  )
   const content = items.flatMap((item, index): Array<AssistantMessage["content"][number]> => {
-    if (item.type === "reasoning") {
-      // Thinking the provider no longer accepts stays out of every later request. Anthropic blocks requests that replay
-      // reasoning text (`reasoning_extraction`), so Claude turns omit consented blocks while non-Claude models still
-      // read them as `<earlier-reasoning>` text.
-      const marker = dropped.get(droppedKey(message.id, ordinals.get(item) ?? -1))
-      if (marker) {
-        const replayAsText =
-          !CacheModel.isClaudeModel(model.id) &&
-          (marker.asText || Boolean(marker.reason?.startsWith("dropped with consent")))
-        return replayAsText && item.text.trim().length > 0 ? [{ type: "text", text: earlierReasoning(item.text) }] : []
-      }
-    }
     if (item.type === "text")
       return [
         {
@@ -286,12 +242,7 @@ const modelSwitched = (message: SessionMessage.ModelSelected, model: Model.Ref):
   return [Message.effort({ effort: to.effort, previous: from.effort })]
 }
 
-function toLLMMessage(
-  message: SessionMessage.Info,
-  model: Model.Ref,
-  providerMetadataKey: string,
-  dropped: ReadonlyMap<string, DroppedReasoning>,
-): Message[] {
+function toLLMMessage(message: SessionMessage.Info, model: Model.Ref, providerMetadataKey: string): Message[] {
   switch (message.type) {
     case "agent-switched":
     case "idle":
@@ -337,7 +288,7 @@ function toLLMMessage(
         }),
       ]
     case "assistant":
-      return assistant(message, model, providerMetadataKey, dropped)
+      return assistant(message, model, providerMetadataKey)
     case "compaction": {
       if (message.status !== "completed") return []
       // History selection only keeps native windows the target model can replay.
@@ -366,8 +317,4 @@ export const toLLMMessages = (
   messages: readonly SessionMessage.Info[],
   model: Model.Ref,
   providerMetadataKey: string = model.providerID,
-  options: Options = {},
-) => {
-  const dropped = new Map((options.dropped ?? []).map((block) => [droppedKey(block.messageID, block.ordinal), block]))
-  return messages.flatMap((message) => toLLMMessage(message, model, providerMetadataKey, dropped))
-}
+) => messages.flatMap((message) => toLLMMessage(message, model, providerMetadataKey))

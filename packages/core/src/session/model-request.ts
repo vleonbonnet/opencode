@@ -58,7 +58,7 @@ import type { CacheLedger } from "./cache/ledger.js"
 import { CacheModel } from "./cache/model.js"
 import { SessionCache } from "./cache/service.js"
 import { CacheWire } from "./cache/wire.js"
-import type { DroppedReasoning } from "./runner/to-llm-message.js"
+import { CacheReplay } from "./cache/replay.js"
 
 const IMAGE_BYTES_TRIGGER = 25 * 1024 * 1024 // 25 MiB
 const IMAGE_BYTES_TARGET = 15 * 1024 * 1024 // 15 MiB
@@ -133,10 +133,11 @@ export const baseTranscript = (input: {
   readonly initial: ReadonlyArray<Instructions.Rendered>
   readonly messages: ReadonlyArray<SessionMessage.Info>
   /** Reasoning that later requests leave out or replay as text (the Session's dropped-thinking markers). */
-  readonly dropped?: ReadonlyArray<DroppedReasoning>
+  readonly dropped?: ReadonlyArray<CacheReplay.DroppedReasoning>
 }) => {
+  // Dropped reasoning leaves the history before the request builder converts it.
+  input = { ...input, messages: CacheReplay.apply(input.messages, input.model.ref, input.dropped) }
   const providerMetadataKey = input.model.model.route.providerMetadataKey ?? input.model.model.provider
-  const dropped = { dropped: input.dropped }
   return {
     providerMetadataKey,
     system: [
@@ -152,7 +153,7 @@ export const baseTranscript = (input: {
     ].filter((part) => part.text.length > 0),
     // Hooks read each stored message's metadata on the messages built from it; `prepare` strips it before the request.
     messages: input.messages.flatMap((message) =>
-      toLLMMessages([message], input.model.ref, providerMetadataKey, dropped).map(
+      toLLMMessages([message], input.model.ref, providerMetadataKey).map(
         (item): SessionRequestMessage =>
           message.metadata === undefined || item.id !== message.id
             ? item
