@@ -33,6 +33,8 @@ import { Cause, Context, Deferred, Effect, Exit, Fiber, Layer, LayerMap, Logger,
 import { eq } from "drizzle-orm"
 import { testEffect } from "./lib/effect"
 
+import { forkTests } from "./fork/hosted/session-execution"
+
 const it = testEffect(
   AppNodeBuilder.build(
     LayerNode.group([Database.node, Bus.node, SessionStore.node, SessionInbox.node, Job.node, KV.node, Session.node]),
@@ -186,45 +188,6 @@ describe("SessionExecution lifecycle", () => {
       expect(yield* execution.interrupt(sessionID)).toBeTrue()
       yield* execution.awaitIdle(sessionID)
       expect((yield* claims(database))[sessionID]).toBe(false)
-    }),
-  )
-
-  it.effect("settles a declined tool call as a user stop that never resurrects", () =>
-    Effect.gen(function* () {
-      const database = yield* Database.Service
-      const bus = yield* Bus.Service
-      const sessionID = Session.ID.make("ses_claim_declined")
-      yield* seedSessions(database, [sessionID])
-
-      const draining = yield* Deferred.make<void>()
-      const drained: Session.ID[] = []
-      const interrupted: SessionEvent.Execution.Interrupted[] = []
-      const scope = yield* Scope.make()
-      yield* Effect.addFinalizer(() => Scope.close(scope, Exit.void))
-      // The runner names the stop and then interrupts itself, as a declined Step does.
-      const context = yield* buildExecution(scope, (input) =>
-        Effect.suspend(() => {
-          drained.push(input.sessionID)
-          const report = input.reportDeclined ?? (() => Effect.void)
-          return Deferred.succeed(draining, undefined).pipe(Effect.andThen(report()), Effect.andThen(Effect.interrupt))
-        }),
-      )
-      const execution = Context.get(context, SessionExecution.Service)
-      const restart = Context.get(context, SessionRestart.Service)
-      yield* bus.project(SessionEvent.Execution.Interrupted, (event) => Effect.sync(() => void interrupted.push(event)))
-
-      yield* execution.resume(sessionID).pipe(Effect.forkScoped)
-      yield* Deferred.await(draining)
-      yield* execution.awaitIdle(sessionID)
-
-      // A decline is the user's own stop: it settles as "user" and releases the claim, where an
-      // unnamed interrupt reads as "shutdown" and holds the claim for the next server start.
-      expect(interrupted.map((event) => event.data.reason)).toEqual(["user"])
-      expect((yield* claims(database))[sessionID]).toBe(false)
-
-      // The recovery sweep finds nothing left to resume.
-      yield* restart.resumeSuspendedSessions
-      expect(drained).toEqual([sessionID])
     }),
   )
 
@@ -2267,3 +2230,5 @@ function shellNotices(store: SessionStore.Interface, sessionID: Session.ID) {
       ),
     )
 }
+
+forkTests({ it, seedSessions, claims, buildExecution })

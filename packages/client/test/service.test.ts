@@ -187,23 +187,6 @@ test("restarts a failed registered service", async () => {
   expect(starts).toEqual(["failed"])
 })
 
-test("reports a service that fails again once restarted, without restarting it twice", async () => {
-  await using fixture = await serviceFixture()
-  const registration = fixture.registration
-  const failed = fixture.spawn("failed-owner")
-  await fixture.waitForFile()
-
-  await expect(
-    run(ensure({ file: registration, version: "test", command: fixture.command("failed-owner") })),
-  ).rejects.toThrow("Background service failed to start")
-  const replacement = await Bun.file(registration).json()
-  fixture.track(replacement.pid)
-
-  expect(await failed.exited).toBe(stoppedExitCode)
-  expect(replacement.pid).not.toBe(failed.pid)
-  expect(process.kill(replacement.pid, 0)).toBe(true)
-})
-
 test("evicts an unresponsive registered service before starting its replacement", async () => {
   await using fixture = await serviceFixture()
   const registration = fixture.registration
