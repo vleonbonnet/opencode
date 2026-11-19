@@ -16,6 +16,7 @@ import { Session } from "@opencode/core/session"
 import { SessionTable } from "@opencode/core/session/sql"
 import { SessionStore } from "@opencode/core/session/store"
 import { ShellParse } from "@opencode/core/shell/parse"
+import { Tool } from "@opencode/core/tool"
 import { eq } from "drizzle-orm"
 import { location } from "../fixture/location"
 import { testEffect } from "../lib/effect"
@@ -160,6 +161,29 @@ describe("Permission", () => {
       )
       const { service, fiber, request } = yield* waitForRequest({ action: "shell", resources: ["ls"] })
       expect(request).not.toHaveProperty("reasons")
+      yield* service.reply({ requestID: request.id, reply: "once" })
+      yield* Fiber.join(fiber)
+    }),
+  )
+
+  // Plugins match a call's execute.before event to its permission checks by the call's ID, so a Code Mode call keeps
+  // its own ID in the evaluate hook while its request shows on the execute call's row.
+  it.effect("gives the evaluate hook a nested call's own source and its request the parent's row", () =>
+    Effect.gen(function* () {
+      yield* setup([{ action: "shell", resource: "*", effect: "ask" }])
+      const hooks = yield* PluginHooks.Service
+      const seen: Array<Permission.AssertInput["source"]> = []
+      yield* hooks.register("permission", "evaluate", (event) =>
+        Effect.sync(() => {
+          seen.push(event.source)
+        }),
+      )
+      const source = { type: "tool" as const, messageID: "msg_test", id: "call_child" }
+      const service = yield* Permission.Service
+      yield* service.nested(Tool.CallID.make("call_child"), Tool.CallID.make("call_parent"))
+      const { fiber, request } = yield* waitForRequest({ action: "shell", resources: ["ls"], source })
+      expect(seen).toEqual([source])
+      expect(request.source).toEqual({ ...source, id: "call_parent" })
       yield* service.reply({ requestID: request.id, reply: "once" })
       yield* Fiber.join(fiber)
     }),

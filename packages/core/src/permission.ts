@@ -312,7 +312,7 @@ const layer = Layer.effect(
         resources: input.resources,
         ...(input.alternates ? { alternates: input.alternates } : {}),
         metadata: input.metadata,
-        source: row(input.source),
+        source: input.source,
         effect,
       })
       const unattended = yield* Unattended
