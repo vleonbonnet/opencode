@@ -164,6 +164,8 @@ export class ConnectError extends Schema.TaggedError<ConnectError>()("MCP.Connec
   message: Schema.String,
   /** The server was reached but refused or broke the handshake, so different connect options might succeed. */
   answered: Schema.optional(Schema.Boolean),
+  /** Connecting again can't succeed until the config or the credentials change, so nothing retries it. */
+  lasting: Schema.optional(Schema.Boolean),
 }) {}
 
 /** A legacy Streamable HTTP server no longer recognizes this connection's session; the lifecycle reconnects. */
@@ -774,8 +776,14 @@ export const connect = Effect.fnUntraced(function* (options: ConnectOptions) {
     return yield* new ConnectError({
       server,
       message: `${error.message}; the server supports ${error.supported.join(", ")}. Set "protocol" for this server to one of those or to "legacy".`,
+      lasting: true,
     })
-  return yield* new ConnectError({ server, message: explain(error), answered: !repeats(error) })
+  return yield* new ConnectError({
+    server,
+    message: explain(error),
+    answered: !repeats(error),
+    lasting: refused(error),
+  })
 })
 
 // Connecting again would fail the same way: the server could not be spawned or reached, did not answer in
@@ -831,4 +839,12 @@ function toCallToolResult(result: SdkCallToolResult): CallToolResult {
       return []
     }),
   }
+}
+
+// Fork: the server refused these credentials or this client's access, so it refuses every retry the same way until
+// the config or the credentials change. A failed auto probe wraps the error it hit.
+function refused(error: unknown): boolean {
+  if (error instanceof SdkError && error.code === SdkErrorCode.EraNegotiationFailed && error.cause !== undefined)
+    return refused(error.cause)
+  return error instanceof SdkHttpError && (error.status === 401 || error.status === 403)
 }

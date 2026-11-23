@@ -590,6 +590,7 @@ export const layer = (options?: Options) =>
             directory: location.directory,
             clientInfo: options?.clientInfo,
             mcpEvents,
+            retry: true,
             authProvider: Effect.suspend(() =>
               selectCredential(entry).pipe(Effect.flatMap((credential) => connectProvider(name, entry, credential))),
             ),
@@ -611,8 +612,11 @@ export const layer = (options?: Options) =>
                 yield* bus.publish(McpEvent.StatusChanged, { server: name })
               }),
               connected: Effect.gen(function* () {
+                // A retry, or a shared connection another Location's start brought back, logs once for its connection.
+                const announced = entry.status.status === "pending"
                 entry.status = { status: "connected" }
-                yield* Effect.logInfo("mcp connected", { server: name, tools: entry.connection.tools?.length })
+                if (announced)
+                  yield* Effect.logInfo("mcp connected", { server: name, tools: entry.connection.tools?.length })
                 // Announce every list a consumer may read, since each reads them only on these events. A
                 // connection another Location already holds has loaded its prompts, and no later change
                 // would tell this one; prompts still loading read empty now and announce themselves later.
@@ -623,9 +627,13 @@ export const layer = (options?: Options) =>
               }),
               failed: (failure) =>
                 Effect.gen(function* () {
+                  // Retries keep the status failed while they run and log once for their connection.
+                  const previous = entry.status
                   entry.status = failure
-                  yield* Effect.logWarning("mcp connect failed", { server: name, status: entry.status })
-                  yield* bus.publish(McpEvent.StatusChanged, { server: name })
+                  if (previous.status === "pending")
+                    yield* Effect.logWarning("mcp connect failed", { server: name, status: entry.status })
+                  if (!isDeepStrictEqual(previous, failure))
+                    yield* bus.publish(McpEvent.StatusChanged, { server: name })
                 }),
               // Every start runs under the server lock, so the attempt read here is the one it began.
               settled: Effect.suspend(() => {

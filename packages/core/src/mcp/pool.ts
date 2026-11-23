@@ -13,6 +13,8 @@ import { SharedCache } from "../shared-cache.js"
 import type { McpClient } from "./client.js"
 import { McpConnection } from "./connection.js"
 
+import { McpRetry } from "./retry.js"
+
 export interface Input extends McpConnection.Input {
   /**
    * Run once per start: what tells this connection apart from every other one to the same server (see `key`),
@@ -34,6 +36,10 @@ export interface Interface {
    * closes it. A server that negotiates the legacy protocol, or that answers but refuses or breaks the
    * pooled handshake, is never shared: the Location connects on its own, exactly as it would unpooled,
    * and every later start for that key skips straight to that.
+   *
+   * A refusal counts only when a connection like a Location's own gets through where the shared one did not.
+   * Otherwise, and for any other failure or a close, the connection stays shared: it retries on McpRetry's delays
+   * for every holder at once, and a start that finds it failed tries again right away.
    */
   readonly connection: (input: Input) => McpConnection.Connection
 }
@@ -91,19 +97,38 @@ function fingerprint(secret: string | Record<string, string> | undefined) {
 interface Holder {
   readonly authProvider: Effect.Effect<AuthProvider | undefined>
   readonly elicitation: McpClient.ElicitationHandler["create"]
-  readonly closed: (reason: string) => void
   readonly changed: (kind: McpConnection.Kind) => void
+  // Fork: how the slot's later attempts went, told to a holder once it has seen how the one it joined went.
+  readonly connected: (connection: McpConnection.Connection) => void
+  readonly failed: (failed: Failed) => void
+  /** The server turned out not to be shareable, so the holder connects on its own. */
+  readonly unshared: () => void
+  observing: boolean
 }
 
-type Outcome = "connected" | "private" | McpConnection.Failure
+// Fork: a failure of the shared connection, which it retries for all its holders when `retryable`.
+interface Failed {
+  readonly failure: McpConnection.Failure
+  readonly retryable: boolean
+}
+
+// What the slot keeps of the Location that opened it.
+type Opening = Pick<Input, "name" | "config" | "directory" | "clientInfo" | "mcpEvents">
 
 interface Slot {
   readonly connection: McpConnection.Connection
   readonly holders: Set<Holder>
   readonly lock: Semaphore.Semaphore
-  readonly outcome: Deferred.Deferred<Outcome>
+  readonly input: Opening
+  readonly retry: McpRetry.Retrier
+  // The attempt in flight, settled when it ends however it ends.
+  attempt?: Deferred.Deferred<void>
   start?: Fiber.Fiber<void>
   connected: boolean
+  // Why the last attempt failed, until one connects.
+  failed?: Failed
+  // The server can't be shared after all; its holders connect on their own.
+  unshared: boolean
 }
 
 export const layer = Layer.effect(
@@ -124,12 +149,14 @@ export const layer = Layer.effect(
     const unfixed = new Set<string>()
 
     // Takes only data from the Location that opens it: the connection outlives that Location's claim.
-    const open = (key: string, input: Pick<Input, "name" | "config" | "directory" | "clientInfo" | "mcpEvents">) => {
+    const open = (key: string, input: Opening) => {
       const slot: Slot = {
         holders: new Set(),
         lock: Semaphore.makeUnsafe(1),
-        outcome: Deferred.makeUnsafe(),
+        input,
+        retry: McpRetry.make({ server: input.name, scope, attempt: Effect.suspend(() => begin(key, slot)) }),
         connected: false,
+        unshared: false,
         connection: McpConnection.make({
           name: input.name,
           config: input.config,
@@ -159,21 +186,13 @@ export const layer = Layer.effect(
           fork: run,
           events: {
             connecting: Effect.void,
-            connected: Effect.void,
-            // A server that answered but refused the pooled handshake, such as one that wants roots, may
-            // still accept the Location's own connection; anything unreachable would only fail again.
-            failed: (failure, answered) =>
-              Effect.gen(function* () {
-                detach(key, slot)
-                if (answered) {
-                  unpoolable.add(key)
-                  yield* Effect.logWarning("mcp pool ignored: server refused the shared connection", {
-                    server: input.name,
-                    error: failure.error,
-                  })
-                }
-                yield* Deferred.succeed(slot.outcome, answered ? "private" : failure)
-              }),
+            connected: Effect.suspend(() => {
+              slot.connected = true
+              slot.failed = undefined
+              notify(slot, (holder) => holder.connected(slot.connection))
+              return slot.retry.connected
+            }),
+            failed: (failure, answered, retryable) => fail(key, slot, { failure, retryable }, answered),
             legacy: (version) =>
               Effect.gen(function* () {
                 detach(key, slot)
@@ -183,16 +202,18 @@ export const layer = Layer.effect(
                   server: input.name,
                   version,
                 })
-                yield* Deferred.succeed(slot.outcome, "private")
+                unshare(slot)
               }),
             settled: Effect.void,
+            // Stopped while it still counts as connected, so every holder hears its catalogs emptied.
             closed: (reason) =>
               Effect.gen(function* () {
-                detach(key, slot)
-                const holders = Array.from(slot.holders)
-                slot.holders.clear()
                 yield* slot.connection.stop
-                for (const holder of holders) holder.closed(reason)
+                slot.connected = false
+                const failed: Failed = { failure: { status: "failed", error: reason }, retryable: true }
+                slot.failed = failed
+                notify(slot, (holder) => holder.failed(failed))
+                yield* slot.retry.closed(reason)
               }),
             changed: (kind) =>
               Effect.sync(() => {
@@ -205,23 +226,94 @@ export const layer = Layer.effect(
       return slot
     }
 
+    // The attempt's events record how it went on the slot and tell the holders.
     const connect = (key: string, slot: Slot) =>
-      Effect.gen(function* () {
-        yield* slot.connection.start
-        // A failed or legacy start already settled the outcome.
-        if (!slot.connection.client) return
-        slot.connected = true
-        yield* Deferred.succeed(slot.outcome, "connected")
-      }).pipe(
+      slot.connection.start.pipe(
         slot.lock.withPermit,
-        // Holders wait on the outcome, so an attempt that dies still settles it.
+        // An attempt that dies still fails every holder; one interrupted has no holder left to tell.
         Effect.onError((cause) =>
+          Cause.hasInterruptsOnly(cause)
+            ? Effect.void
+            : fail(key, slot, { failure: { status: "failed", error: String(Cause.squash(cause)) }, retryable: true }),
+        ),
+      )
+
+    // Marks an attempt in flight at once, so a start meanwhile waits for it rather than begin another.
+    const begin = (key: string, slot: Slot) => {
+      const settled = Deferred.makeUnsafe<void>()
+      slot.attempt = settled
+      return connect(key, slot).pipe(
+        Effect.ensuring(
           Effect.suspend(() => {
-            detach(key, slot)
-            return Deferred.succeed(slot.outcome, { status: "failed", error: String(Cause.squash(cause)) })
+            if (slot.attempt === settled) slot.attempt = undefined
+            return Deferred.succeed(settled, undefined)
           }),
         ),
       )
+    }
+
+    // A server that answered but refused the pooled handshake, such as one that wants roots, may still accept the
+    // Location's own connection. Only a connection like that getting through shows the refusal is about sharing.
+    // Otherwise the server failed for everyone, as one that is unreachable does, and the slot retries for them all.
+    const fail = (key: string, slot: Slot, failed: Failed, answered = false) =>
+      Effect.gen(function* () {
+        if (answered && (yield* acceptsOwn(slot))) {
+          detach(key, slot)
+          unpoolable.add(key)
+          yield* Effect.logWarning("mcp pool ignored: server refused the shared connection", {
+            server: slot.input.name,
+            error: failed.failure.error,
+          })
+          return unshare(slot)
+        }
+        slot.failed = failed
+        notify(slot, (holder) => holder.failed(failed))
+        yield* slot.retry.failed(failed.failure.error, failed.retryable)
+      })
+
+    // Connects once the way a Location's own connection would, declaring roots, and lets go again.
+    const acceptsOwn = (slot: Slot) =>
+      Effect.suspend(() => {
+        const own = McpConnection.make({
+          name: slot.input.name,
+          config: slot.input.config,
+          directory: slot.input.directory,
+          clientInfo: slot.input.clientInfo,
+          mcpEvents: slot.input.mcpEvents,
+          authProvider: Effect.suspend(() => slot.holders.values().next().value?.authProvider ?? Effect.undefined),
+          // No one asked for this connection, so no one is asked for input on it.
+          elicitation: { create: () => Effect.succeed({ action: "cancel" as const }), complete: () => Effect.void },
+          environment: host,
+          fetch,
+          scope,
+          lock: Semaphore.makeUnsafe(1).withPermit,
+          callbacks: run,
+          fork: run,
+          events: {
+            connecting: Effect.void,
+            connected: Effect.void,
+            failed: () => Effect.void,
+            settled: Effect.void,
+            closed: () => Effect.void,
+            changed: () => Effect.void,
+          },
+        })
+        // Stopped however the attempt ends: an interrupted one would otherwise leave its process running.
+        return own.start.pipe(
+          Effect.map(() => own.client !== undefined),
+          Effect.ensuring(own.stop),
+        )
+      })
+
+    // Tells the holders that have seen how their own attempt went.
+    const notify = (slot: Slot, tell: (holder: Holder) => void) => {
+      for (const holder of slot.holders) if (holder.observing) tell(holder)
+    }
+
+    const unshare = (slot: Slot) => {
+      slot.unshared = true
+      notify(slot, (holder) => holder.unshared())
+    }
 
     const detach = (key: string, slot: Slot) => {
       if (slots.get(key) === slot) slots.delete(key)
@@ -234,6 +326,7 @@ export const layer = Layer.effect(
         if (slot.holders.size > 0) return Effect.void
         detach(key, slot)
         return Effect.gen(function* () {
+          yield* slot.retry.reset
           if (slot.start) yield* Fiber.interrupt(slot.start)
           yield* slot.connection.stop.pipe(slot.lock.withPermit)
         })
@@ -254,10 +347,21 @@ export const layer = Layer.effect(
         Effect.sync(() => slot.holders.add(holder)),
         () => release(key, slot, holder),
       )
-      // Started once a holder is registered: the attempt reads its OAuth provider from the holders.
-      slot.start ??= run(connect(key, slot))
-      const outcome = yield* Deferred.await(slot.outcome)
-      return outcome === "connected" ? slot.connection : outcome
+      // Started once a holder is registered: the attempt reads its OAuth provider from the holders. A start that
+      // finds the shared connection failed tries again now, instead of waiting for its retry.
+      if (!slot.connected && !slot.attempt) {
+        slot.start = run(begin(key, slot))
+        yield* slot.retry.reset
+      }
+      if (slot.attempt) yield* Deferred.await(slot.attempt)
+      holder.observing = true
+      if (slot.unshared) return "private" as const
+      if (slot.connected) return slot.connection
+      const stopped: Failed = {
+        failure: { status: "failed", error: "The shared connection stopped" },
+        retryable: false,
+      }
+      return slot.failed ?? stopped
     })
 
     const connection = (input: Input): McpConnection.Connection => {
@@ -279,6 +383,11 @@ export const layer = Layer.effect(
       const configured = privately(input.config)
       const older = privately({ ...input.config, protocol: "legacy" })
       const live = () => state.shared ?? state.own ?? configured
+      const alone = (key: string) =>
+        Effect.suspend(() => {
+          state.own = legacy.has(key) ? older : configured
+          return state.own.start
+        })
       // The shared connection carries the name of the Location that opened it; forms show this Location's.
       const elicit: McpClient.ElicitationHandler["create"] = (request) =>
         input.elicitation.create({ ...request, server: input.name })
@@ -306,8 +415,23 @@ export const layer = Layer.effect(
           const holder: Holder = {
             authProvider: selected.authProvider,
             elicitation: elicit,
-            closed: (reason) => current(holder, () => input.events.closed(reason)),
             changed: (kind) => current(holder, () => input.events.changed(kind)),
+            connected: (connection) =>
+              current(holder, () =>
+                Effect.suspend(() => {
+                  state.shared = connection
+                  return input.events.connected
+                }),
+              ),
+            failed: (failed) =>
+              current(holder, () =>
+                Effect.suspend(() => {
+                  state.shared = undefined
+                  return input.events.failed(failed.failure, false, failed.retryable)
+                }),
+              ),
+            unshared: () => current(holder, () => clear.pipe(Effect.andThen(alone(selected.key)))),
+            observing: false,
           }
           state.claim = claim
           state.holder = holder
@@ -319,9 +443,9 @@ export const layer = Layer.effect(
             yield* clear
             return false
           }
-          if ("status" in outcome) {
-            yield* clear
-            yield* input.events.failed(outcome, false)
+          // The claim stays: the shared connection retries for every holder and tells each how it went.
+          if ("failure" in outcome) {
+            yield* input.events.failed(outcome.failure, false, outcome.retryable)
             return true
           }
           state.shared = outcome
@@ -360,8 +484,7 @@ export const layer = Layer.effect(
           const selected = yield* input.select
           state.selected = selected
           if (!unpoolable.has(selected.key) && (yield* join(selected))) return
-          state.own = legacy.has(selected.key) ? older : configured
-          yield* state.own.start
+          yield* alone(selected.key)
         }),
         stop: Effect.gen(function* () {
           if (!state.claim) return yield* (state.own ?? configured).stop

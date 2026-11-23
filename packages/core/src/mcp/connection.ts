@@ -8,6 +8,8 @@ import { Environment } from "../environment/index.js"
 import { KeyedMutex } from "../effect/keyed-mutex.js"
 import type { McpClient } from "./client.js"
 
+import { McpRetry } from "./retry.js"
+
 export type Failure = Extract<Mcp.Status, { readonly status: "failed" | "needs_auth" }>
 
 /** A catalog the server can change: its tools, prompts or resources. */
@@ -26,8 +28,11 @@ export interface Events {
   readonly connecting: Effect.Effect<void>
   /** The attempt connected and listed its tools. */
   readonly connected: Effect.Effect<void>
-  /** `answered` is true when the server was reached but refused or broke the handshake. */
-  readonly failed: (failure: Failure, answered: boolean) => Effect.Effect<void>
+  /**
+   * `answered` is true when the server was reached but refused or broke the handshake. `retryable` is false when the
+   * failure can't pass without a config or credential change.
+   */
+  readonly failed: (failure: Failure, answered: boolean, retryable: boolean) => Effect.Effect<void>
   /** The attempt ended, however it ended. */
   readonly settled: Effect.Effect<void>
   /** The live connection closed on its own. Runs under the lock; the owner decides how to stop. */
@@ -103,6 +108,15 @@ export function make(input: Input): Connection {
     tools?: ReadonlyArray<McpClient.Tool>
     prompts?: ReadonlyArray<McpClient.Prompt>
   } = {}
+  // A retry first tears down whatever a close left behind. It doesn't announce itself, so the owner keeps reporting
+  // the failure until the retry connects.
+  const retry = input.retry
+    ? McpRetry.make({
+        server: input.name,
+        scope: input.scope,
+        attempt: Effect.suspend(() => stop.pipe(Effect.andThen(start), input.lock)),
+      })
+    : McpRetry.disabled
 
   // Runs a connection callback under the lock, dropping it if the connection is no longer the live
   // client, so late SDK callbacks cannot commit obsolete state.
@@ -152,7 +166,7 @@ export function make(input: Input): Connection {
 
   const watch = (client: McpClient.Connection) => {
     const live = whenLive(client)
-    client.onClose((reason) => live(input.events.closed(reason)))
+    client.onClose((reason) => live(input.events.closed(reason).pipe(Effect.andThen(retry.closed(reason)))))
     // Background refreshes (list-changed) can observe the expiry too; they do not retry, so
     // reconnect here for them. Foreground calls reconnect through `recovering`.
     client.onSessionExpired(() => input.fork(recover(client)))
@@ -163,11 +177,12 @@ export function make(input: Input): Connection {
 
   const start: Effect.Effect<void> = Effect.suspend(() =>
     Effect.gen(function* () {
-      yield* input.events.connecting
+      if (!retry.retrying) yield* input.events.connecting
       // Checked before the OAuth provider is built, which parses the URL too.
       if (input.config.type === "remote" && !URL.canParse(input.config.url))
         return yield* input.events.failed(
           { status: "failed", error: `Invalid MCP server URL: ${input.config.url}` },
+          false,
           false,
         )
       const scope = yield* Scope.fork(input.scope)
@@ -211,18 +226,24 @@ export function make(input: Input): Connection {
         state.prompts = []
         watch(result.value.client)
         yield* input.events.connected
+        yield* retry.connected
         whenLive(result.value.client)(refreshPrompts(result.value.client))
         return
       }
       yield* Scope.close(scope, Exit.void)
       state.scope = undefined
       const error = Cause.squash(result.cause)
+      const retryable =
+        !(error instanceof McpClient.NeedsAuthError) &&
+        !(error instanceof McpClient.ConnectError && error.lasting === true)
       yield* input.events.failed(
         error instanceof McpClient.NeedsAuthError
           ? { status: "needs_auth", error: error.message }
           : { status: "failed", error: error instanceof Error ? error.message : String(error) },
         error instanceof McpClient.ConnectError && error.answered === true,
+        retryable,
       )
+      yield* retry.failed(error instanceof Error ? error.message : String(error), retryable)
     }).pipe(
       Effect.ensuring(input.events.settled),
       Effect.annotateLogs({ server: input.name, directory: input.directory, connectionID: crypto.randomUUID() }),
@@ -252,8 +273,8 @@ export function make(input: Input): Connection {
     get prompts() {
       return state.prompts
     },
-    start,
-    stop,
+    start: retry.reset.pipe(Effect.andThen(start)),
+    stop: retry.reset.pipe(Effect.andThen(stop)),
     recovering,
     catalog: (client) =>
       recovering(client, (client) =>
@@ -267,4 +288,13 @@ export function make(input: Input): Connection {
         ),
       ),
   }
+}
+
+// Fork: a connection that retries on its own.
+export interface Input {
+  /**
+   * Retries a failed or closed connection on McpRetry's delays until it connects, starts again or stops. Off for a
+   * connection whose owner retries it.
+   */
+  readonly retry?: boolean
 }

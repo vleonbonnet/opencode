@@ -8,6 +8,7 @@ import { toSessionError } from "@opencode/core/session/to-session-error"
 import { Tool } from "@opencode/core/tool"
 import { McpTool } from "@opencode/core/tool/mcp"
 import { codeModeListings, toolIdentity } from "../../lib/tool"
+import { type RetryHarness, retryTests } from "./mcp-retry"
 
 // The upstream layers provide what these effects need. Their service types are local to the upstream file, so the
 // hand-off leaves the requirements unchecked, and a missing service fails the test when it runs.
@@ -15,7 +16,7 @@ import { codeModeListings, toolIdentity } from "../../lib/tool"
 type Provided = any
 
 /** The MCP harness of the upstream MCP tests, which host these. */
-export interface Harness {
+export interface Harness extends RetryHarness {
   readonly it: { readonly effect: (name: string, body: () => Effect.Effect<unknown, unknown, Provided>) => void }
   /** Starts a test with a fresh permission assertion, no permission decision and no MCP tool invocation. */
   readonly reset: Effect.Effect<void>
@@ -23,7 +24,8 @@ export interface Harness {
   readonly invocations: () => ReadonlyArray<Parameters<Mcp.Interface["callTool"]>[0]>
 }
 
-export const forkTests = ({ it, reset, invocations }: Harness) =>
+export const forkTests = ({ it, reset, invocations, ...harness }: Harness) => {
+  retryTests({ it, ...harness })
   describe("MCP tools (fork)", () => {
     it.effect("lists MCP tools another selectable agent allows and refuses them to an agent that disables them", () =>
       Effect.gen(function* () {
@@ -66,3 +68,4 @@ export const forkTests = ({ it, reset, invocations }: Harness) =>
       }),
     )
   })
+}

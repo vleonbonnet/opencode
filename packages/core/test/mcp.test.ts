@@ -3455,7 +3455,8 @@ describe("MCP pool", () => {
       expect(yield* status(a.mcp)).toEqual({ status: "connected" })
       const b = yield* open(config, pool, directories[0], { environment: recordingEnvironmentLayer(spawns) })
       expect(yield* status(b.mcp)).toEqual({ status: "connected" })
-      expect(probes).toHaveLength(1)
+      // The shared attempt, then one connection with roots through the pool, which shows the refusal is about sharing.
+      expect(probes).toHaveLength(2)
       expect(spawns).toHaveLength(2)
       expect(captured.logs).toEqual([
         [
@@ -3537,10 +3538,10 @@ describe("MCP pool", () => {
       const config = new ConfigMCP.Local({ type: "local", command: ["opencode-missing-mcp-server"], pool: true })
       const a = yield* open(config, pool, directories[0], { environment: recordingEnvironmentLayer(spawns) })
       expect((yield* status(a.mcp))?.status).toBe("failed")
-      expect(probes).toHaveLength(1)
       // On Windows the spawn succeeds through the shell and the missing command shows up only as an exit
       // during the handshake, which can't be told apart from a server refusing it, so it tries once more.
-      expect(spawns).toHaveLength(process.platform === "win32" ? 1 : 0)
+      expect(probes).toHaveLength(process.platform === "win32" ? 2 : 1)
+      expect(spawns).toHaveLength(0)
     }),
   )
 
@@ -3895,9 +3896,10 @@ describe("MCP pool", () => {
 
       process.kill(first!, "SIGKILL")
       for (const location of [a, b]) yield* until(status(location.mcp), (status) => status?.status === "failed")
+      // One Location's start brings the shared connection back for every holder.
       yield* a.mcp.connect("resources")
       expect(yield* status(a.mcp)).toEqual({ status: "connected" })
-      expect((yield* status(b.mcp))?.status).toBe("failed")
+      yield* until(status(b.mcp), (status) => status?.status === "connected")
       yield* b.mcp.connect("resources")
       expect(yield* status(b.mcp)).toEqual({ status: "connected" })
       const [, second] = yield* started()
@@ -4339,4 +4341,7 @@ forkTests({
     invocations = []
   }),
   invocations: () => invocations,
+  resourceServer,
+  resourceMcpLayer,
+  poolLayer,
 })
