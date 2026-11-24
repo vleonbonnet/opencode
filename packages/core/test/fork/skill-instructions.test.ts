@@ -1,3 +1,4 @@
+import { PermissionPolicy } from "@opencode/core/permission/policy"
 import path from "path"
 import { describe, expect } from "bun:test"
 import { Effect, Layer } from "effect"
@@ -41,13 +42,13 @@ describe("SkillInstructions", () => {
     ]
     return Effect.gen(function* () {
       const instructions = yield* SkillInstructions.Service
-      const shared = (yield* instructions.load(plan, [plan, build]).pipe(Effect.flatMap(readInitial))).text
+      const shared = (yield* instructions.load(PermissionPolicy.fromRules(plan), [plan, build]).pipe(Effect.flatMap(readInitial))).text
 
       // Listed because plan allows it, although build alone would hide it; hidden because both deny it.
       expect(shared).toContain("<id>effect</id>")
       expect(shared).not.toContain("<id>denied</id>")
-      expect((yield* instructions.load(build, [build, plan]).pipe(Effect.flatMap(readInitial))).text).toBe(shared)
-      expect((yield* instructions.load(build).pipe(Effect.flatMap(readInitial))).text).toBe("")
+      expect((yield* instructions.load(PermissionPolicy.fromRules(build), [build, plan]).pipe(Effect.flatMap(readInitial))).text).toBe(shared)
+      expect((yield* instructions.load(PermissionPolicy.fromRules(build)).pipe(Effect.flatMap(readInitial))).text).toBe("")
     }).pipe(Effect.provide(layer(() => [denied, effect])))
   })
 
@@ -61,7 +62,7 @@ describe("SkillInstructions", () => {
     }
     return Effect.gen(function* () {
       const instructions = yield* SkillInstructions.Service
-      const bounded = (yield* instructions.load([], [[]], [ceiling]).pipe(Effect.flatMap(readInitial))).text
+      const bounded = (yield* instructions.load(PermissionPolicy.empty, [[]], [ceiling]).pipe(Effect.flatMap(readInitial))).text
 
       expect(bounded).toContain("<id>denied</id>")
       expect(bounded).not.toContain("<id>effect</id>")

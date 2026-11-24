@@ -1,3 +1,4 @@
+import { PermissionPolicy } from "@opencode/core/permission/policy"
 import { describe, expect } from "bun:test"
 import { Effect, Layer } from "effect"
 import { Agent } from "@opencode/core/agent"
@@ -43,7 +44,7 @@ const load = (permissions: Permission.Ruleset, options?: Tool.SnapshotOptions) =
     const registry = yield* Tool.Service
     const service = yield* McpInstructions.Service
     yield* mcpTools.flush
-    return (yield* service.load(yield* registry.snapshot(permissions, options)).pipe(Effect.flatMap(readInitial))).text
+    return (yield* service.load(yield* registry.snapshot(PermissionPolicy.fromRules(permissions), options)).pipe(Effect.flatMap(readInitial))).text
   })
 
 describe("McpInstructions", () => {

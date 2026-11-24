@@ -52,12 +52,13 @@ export const root = Effect.fn("Project.root")(
     fs: { readonly exists: (path: string) => Effect.Effect<boolean, unknown> },
     input: AbsolutePath,
     markers: readonly string[] = [".git", ".hg"],
+    paths: typeof path.posix = path,
   ) {
-    for (let current: string = input; ; current = path.dirname(current)) {
+    for (let current: string = input; ; current = paths.dirname(current)) {
       for (const marker of markers) {
-        if (yield* fs.exists(path.join(current, marker))) return AbsolutePath.make(current)
+        if (yield* fs.exists(paths.join(current, marker))) return AbsolutePath.make(current)
       }
-      if (path.dirname(current) === current) return undefined
+      if (paths.dirname(current) === current) return undefined
     }
   },
   Effect.orElseSucceed(() => undefined),

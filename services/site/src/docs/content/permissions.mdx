@@ -290,7 +290,8 @@ Saved approvals are durable `allow` rules for the session that saved them and
 the subagent sessions it starts. Other sessions in the project still ask, and
 deleting the session deletes its approvals. They never override a configured
 `deny`. Tools choose the proposed saved pattern: some propose `*`,
-shell proposes command prefixes, and skills and subagents propose their IDs.
+shell proposes command prefixes, web fetches propose the URL's site (such as
+`https://opencode.ai/*`), and skills and subagents propose their IDs.
 Review broad approvals and remove those no longer needed.
 
 Clients may attach feedback when rejecting. Non-interactive clients must decide

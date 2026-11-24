@@ -15,6 +15,7 @@ import { CodeModeTool } from "./codemode/tool.js"
 import { Flag } from "./flag.js"
 import { Image } from "./image.js"
 import { Permission } from "./permission.js"
+import { PermissionPolicy } from "./permission/policy.js"
 import { PluginHooks } from "./plugin/hooks.js"
 import { SessionMessage } from "./session/message.js"
 import { SessionSchema } from "./session/schema.js"
@@ -28,7 +29,7 @@ import {
   normalizeContent,
 } from "./tool/runtime.js"
 
-import { Wildcard } from "./util/wildcard.js"
+import { PermissionExposure } from "./permission/exposure.js"
 
 export class RegistrationError extends Schema.TaggedError<RegistrationError>()("Tool.RegistrationError", {
   name: Schema.String,
@@ -80,7 +81,7 @@ export interface SnapshotOptions {
 export interface Interface extends State.Transformable<Editor> {
   readonly list: () => Effect.Effect<ReadonlyArray<RegisteredTool>>
   readonly codeModeTools: (paths: ReadonlyArray<string>) => Effect.Effect<ReadonlyMap<string, RegisteredTool>>
-  readonly snapshot: (permissions?: Permission.Ruleset, options?: SnapshotOptions) => Effect.Effect<Snapshot>
+  readonly snapshot: (policy?: PermissionPolicy.Policy, options?: SnapshotOptions) => Effect.Effect<Snapshot>
   /**
    * Runs a Code Mode program with no model step over only the Code Mode tools named in `tools` (still subject to
    * whole-tool permission filtering and each tool's own executor policy).
@@ -92,7 +93,7 @@ export interface CheckInput {
   readonly code: string
   readonly tools: ReadonlyArray<string>
   readonly bindings: Readonly<Record<string, CodeMode.DataValue>>
-  readonly permissions: Permission.Ruleset
+  readonly policy: PermissionPolicy.Policy
   readonly limits: CodeMode.ExecutionLimits
   readonly services?: Context.Context<CodeModeTool.Services>
   readonly context: Omit<Tool.Context, "id">
@@ -308,12 +309,12 @@ const layer = Layer.effect(
       reload: state.reload,
       list: () => Effect.sync(() => Array.from(state.get().tools.values())),
       codeModeTools: (paths) => Effect.sync(() => new Map(codeModeTools(state.get().tools, paths))),
-      snapshot: Effect.fn("Tool.snapshot")((permissions, options) =>
+      snapshot: Effect.fn("Tool.snapshot")((input, options) =>
         Effect.gen(function* () {
-          const rules = permissions ?? []
-          const exposure = exposed(rules, options)
+          const policy = input ?? PermissionPolicy.empty
+          const exposure = exposed(policy, options)
           // Without Code Mode its tools would be unreachable, so expose them as direct tools instead.
-          const codeModeEnabled = codeModeAvailable(rules, options)
+          const codeModeEnabled = codeModeAvailable(policy, options)
           const full = codeModeEnabled && options?.services !== undefined && (yield* flags.enabled("full_codemode"))
           const data = state.get()
           if (catalogData !== data) {
@@ -444,7 +445,7 @@ const layer = Layer.effect(
         }),
       ),
       check: Effect.fn("Tool.check")(function* (input) {
-        if (Permission.isActionDenied("execute", input.permissions)) {
+        if (PermissionPolicy.isActionDenied(input.policy, "execute")) {
           return {
             ok: false,
             error: { kind: "ExecutionFailure", message: "Code Mode is disabled for this agent" },
@@ -454,7 +455,7 @@ const layer = Layer.effect(
         const data = state.get()
         const tools = new Map(
           codeModeTools(data.tools, input.tools)
-            .filter(([, tool]) => !Permission.isActionDenied(tool.options?.permission ?? tool.id, input.permissions))
+            .filter(([, tool]) => !PermissionPolicy.isActionDenied(input.policy, tool.options?.permission ?? tool.id))
             .map(([, tool]) => [tool.id, tool] as const),
         )
         const callSeq = yield* Ref.make(0)
@@ -518,9 +519,9 @@ function* codeModeTools(registered: Data["tools"], paths: ReadonlyArray<string>)
   }
 }
 
-/** Whether the rules leave Code Mode's `execute` reachable, as `snapshot` decides it. */
-export const codeModeAvailable = (rules: Permission.Ruleset, options?: SnapshotOptions) =>
-  !exposed(rules, options).unlisted("execute")
+/** Whether the policy leaves Code Mode's `execute` reachable, as `snapshot` decides it. */
+export const codeModeAvailable = (policy: PermissionPolicy.Policy, options?: SnapshotOptions) =>
+  !exposed(policy, options).unlisted("execute")
 
 const CATALOG_CACHE_LIMIT = 5
 
@@ -609,24 +610,24 @@ export interface SnapshotOptions {
 }
 
 /** What a snapshot under the acting agent's RULES lists and refuses, given the exposure and ceilings of OPTIONS. */
-const exposed = (rules: Permission.Ruleset, options: SnapshotOptions | undefined) => {
-  const listing = options?.exposure?.length ? options.exposure : [rules]
+const exposed = (policy: PermissionPolicy.Policy, options: SnapshotOptions | undefined) => {
+  const listing = PermissionExposure.policies(policy, options?.exposure)
   const ceilings = options?.ceilings ?? []
   return {
     unlisted: (action: string) =>
-      listing.every((ruleset) => Permission.isActionDenied(action, ruleset)) ||
+      listing.every((item) => PermissionPolicy.isActionDenied(item, action)) ||
       ceilings.some((ceiling) => Permission.isActionDenied(action, ceiling.rules)),
     // A tool listed for another agent of the Session still answers to the acting agent's rules.
     refused: (name: string, action: string, agent: Agent.ID) =>
-      Permission.isActionDenied(action, rules) ? refusal(name, action, agent, rules) : undefined,
+      PermissionPolicy.isActionDenied(policy, action) ? refusal(name, action, agent, policy) : undefined,
   }
 }
 
-const refusal = (name: string, action: string, agent: Agent.ID, rules: Permission.Ruleset) =>
+const refusal = (name: string, action: string, agent: Agent.ID, policy: PermissionPolicy.Policy) =>
   new Tool.Error({
     message: `The ${agent} agent is not permitted to use ${name}`,
     error: new Permission.BlockedError({
-      rules: rules.filter((rule) => Wildcard.match(action, rule.action)),
+      rules: PermissionPolicy.relevant(policy, action),
       permission: action,
       resources: ["*"],
       reason: `The ${agent} agent is not permitted to use ${name}.`,

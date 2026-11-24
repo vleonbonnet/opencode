@@ -1,3 +1,4 @@
+import { PermissionPolicy } from "@opencode/core/permission/policy"
 import { describe, expect } from "bun:test"
 import { Effect } from "effect"
 import { Agent } from "@opencode/core/agent"
@@ -39,10 +40,10 @@ export const forkTests = ({ it, reset, invocations, ...harness }: Harness) => {
           { action: McpTool.name("direct", "lookup"), resource: "*", effect: "deny" },
           { action: McpTool.name("demo", "search"), resource: "*", effect: "deny" },
         ]
-        const planned = yield* registry.snapshot(plan, { exposure: [plan, build] })
+        const planned = yield* registry.snapshot(PermissionPolicy.fromRules(plan), { exposure: [plan, build] })
 
         // Alone, plan would leave both tools out; build's rules keep them listed for plan too.
-        expect((yield* registry.snapshot(plan)).definitions.map((tool) => tool.name)).not.toContain("direct_lookup")
+        expect((yield* registry.snapshot(PermissionPolicy.fromRules(plan))).definitions.map((tool) => tool.name)).not.toContain("direct_lookup")
         expect(planned.definitions.map((tool) => tool.name)).toContain("direct_lookup")
         expect(codeModeListings(planned.codeModeCatalog!).map((tool) => tool.path)).toContain("demo.search")
 

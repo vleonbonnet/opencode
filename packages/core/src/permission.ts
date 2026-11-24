@@ -10,13 +10,14 @@ import { Agent } from "./agent.js"
 import { SessionErrors } from "./session/error.js"
 import { SessionSchema } from "./session/schema.js"
 import { SessionStore } from "./session/store.js"
-import { Wildcard } from "./util/wildcard.js"
+import { PermissionPolicy } from "./permission/policy.js"
 import { PermissionSaved } from "./permission/saved.js"
 import { PluginHooks } from "./plugin/hooks.js"
 
 import { PermissionDelegation } from "./permission/delegation.js"
 import { PermissionMatch } from "./permission/match.js"
 
+export * as Policy from "./permission/policy.js"
 const PermissionEffect = Permission.Effect
 export { PermissionEffect as Effect }
 export { Reason, Rule, Ruleset } from "@opencode/schema/permission"
@@ -98,20 +99,30 @@ export type Error = BlockedError | CorrectedError
 // Rule matching lives in permission/match.ts, which the shell policy bundle shares: port upstream's changes there.
 export const pathActions = PermissionMatch.pathActions
 export const ignoresCase = PermissionMatch.ignoresCase
-export const evaluate = PermissionMatch.evaluate
 export const deciding = PermissionMatch.deciding
 export const spellings = PermissionMatch.spellings
 export const decidingAny = PermissionMatch.decidingAny
 
+/**
+ * What "Allow always" saves for a web URL: its site, so approving one page doesn't allow every URL. Rules match the URL
+ * as written, so the site is kept as written, with and without a path. The site ends where URL parsing ends it,
+ * including at `\`, which parsers treat as `/`. A URL with credentials or whitespace in its site
+ * (`https://opencode.ai@evil.com` goes to evil.com) saves only itself. Rules treat `*` and `?` as wildcards, so a site
+ * with either, such as `https://*`, gets no pattern, and neither does an unusual URL with either: no "Allow always".
+ */
+export function site(url: string) {
+  const origin = /^https?:\/\/[^/\\?#@\s*]+(?=[/\\?#]|$)/i.exec(url)?.[0]
+  if (origin) return [origin, `${origin}/*`]
+  return /[*?]/.test(url) ? [] : [url]
+}
+
+export function evaluate(action: string, resource: string, ...rulesets: Permission.Ruleset[]): Permission.Rule {
+  return PermissionPolicy.evaluate(PermissionPolicy.fromRules(...rulesets), action, resource)
+}
+
 /** True when every resource for `action` is denied; trailing narrow denies preserve a blanket deny while any `allow` or `ask` keeps the action reachable. */
 export function isActionDenied(action: string, ...rulesets: Permission.Ruleset[]): boolean {
-  return rulesets
-    .flat()
-    .filter((rule) => Wildcard.match(action, rule.action))
-    .reduce((denied, rule) => {
-      if (rule.resource === "*") return rule.effect === "deny"
-      return rule.effect === "deny" ? denied : false
-    }, false)
+  return PermissionPolicy.isActionDenied(PermissionPolicy.fromRules(...rulesets), action)
 }
 
 export function merge(...rulesets: Permission.Ruleset[]): Permission.Ruleset {
@@ -142,9 +153,6 @@ export function decide(
   )
 }
 
-const delegatedDenial = (action: string, ceiling: Ceiling) =>
-  `Permission denied: ${action}. The ${ceiling.delegator.agent} agent that delegated this task does not permit it.`
-
 export interface Interface {
   readonly close: Effect.Effect<void>
   readonly ask: (input: AssertInput) => Effect.Effect<AskResult, SessionErrors.NotFoundError>
@@ -172,6 +180,7 @@ export interface Interface {
 export class Service extends Context.Service<Service, Interface>()("@opencode/Permission") {}
 
 interface Pending {
+  readonly source: AssertInput["source"]
   request: Request
   readonly agent?: Agent.ID
   readonly deferred: Deferred.Deferred<void, DeclinedError | CorrectedError>
@@ -205,14 +214,15 @@ const layer = Layer.effect(
     }).pipe(Effect.uninterruptible)
     yield* Effect.addFinalizer(() => close)
 
-    // An approval saved with "always" answers the Session that gave it and the Sessions it starts.
-    const savedRules = Effect.fnUntraced(function* (sessionIDs: ReadonlyArray<SessionSchema.ID>) {
-      return (yield* saved.list({ projectID: location.project.id, sessionIDs })).map(
-        (item): Permission.Rule => ({
-          action: item.action,
-          resource: item.resource,
-          effect: "allow",
-        }),
+    const savedPolicy = Effect.fnUntraced(function* (sessionIDs: ReadonlyArray<SessionSchema.ID>) {
+      return PermissionPolicy.fromRules(
+        (yield* saved.list({ projectID: location.project.id, sessionIDs })).map(
+          (item): Permission.Rule => ({
+            action: item.action,
+            resource: item.resource,
+            effect: "allow",
+          }),
+        ),
       )
     })
 
@@ -251,15 +261,11 @@ const layer = Layer.effect(
       const agent = yield* agents.resolve(agentID ?? session.agent)
       const lineage = yield* ancestry(session)
       return {
-        rules: merge(agent?.permissions ?? missingAgentPermissions, session.permissions ?? []),
+        policy: PermissionPolicy.fromRules(agent?.permissions ?? missingAgentPermissions, session.permissions ?? []),
         ceilings: yield* ceilingsOf(lineage),
         lineage: Array.from(lineage.keys()),
       }
     })
-
-    function relevant(input: AssertInput, rules: Permission.Ruleset) {
-      return rules.filter((rule) => Wildcard.match(input.action, rule.action))
-    }
 
     const nested: Interface["nested"] = (call, parent) =>
       Effect.acquireRelease(
@@ -273,49 +279,14 @@ const layer = Layer.effect(
     }
 
     const evaluateInput = Effect.fnUntraced(function* (input: AssertInput) {
-      const { rules, ceilings, lineage } = yield* configured(input.sessionID, input.agent)
-      // A resource is denied when the configured rule deciding any of its spellings denies it.
-      const denial = PermissionMatch.denial(input, rules)
-      if (denial) {
-        const message = PermissionMatch.reason(input.action, denial.rule)
-        return { effect: "deny" as const, rules, reasons: [], ...(message === undefined ? {} : { message }) }
-      }
-      const ceiling = ceilings
-        .map((item) => ({ item, denial: PermissionMatch.denial(input, item.rules) }))
-        .find((found) => found.denial !== undefined)
-      if (ceiling)
-        return {
-          effect: "deny" as const,
-          rules: ceiling.item.rules,
-          message: [delegatedDenial(input.action, ceiling.item), ceiling.denial?.rule.message]
-            .filter((text) => text !== undefined)
-            .join(" "),
-          reasons: [],
-        }
-      const saved = yield* savedRules(lineage)
-      const all = [...rules, ...saved]
-      // Saved approvals answer a delegator's ask as they answer the delegator's own; no deny remains to override. A
-      // resource asks when, under its own rules or any ceiling, the rule deciding it across its spellings asks or no
-      // rule does; the first ruleset that asks gives the reason.
-      const rulesets = [all, ...ceilings.map((item) => [...item.rules, ...saved])]
-      const reasonsUnder = (rulesets: ReadonlyArray<Permission.Ruleset>) =>
-        input.resources.flatMap((resource, index): Permission.Reason[] => {
-          for (const ruleset of rulesets) {
-            const decided = decidingAny(input.action, spellings(input, index), ruleset)
-            if (!decided) return [{ resource }]
-            if (decided.rule.effect !== "ask") continue
-            return [
-              {
-                resource,
-                ...(decided.spelling !== resource ? { spelling: decided.spelling } : {}),
-                rule: decided.rule,
-              },
-            ]
-          }
-          return []
-        })
-      const reasons = reasonsUnder(rulesets)
-      const effect: Permission.Effect = reasons.length > 0 ? "ask" : "allow"
+      const { policy, ceilings, lineage } = yield* configured(input.sessionID, input.agent)
+      const bounds = [policy, ...ceilings.map((item) => PermissionPolicy.fromRules(item.rules))]
+      const denied = PermissionDelegation.denied(input, bounds, ceilings)
+      if (denied) return denied
+      const saved = yield* savedPolicy(lineage)
+      const effective = bounds.map((bound) => PermissionPolicy.fallback(bound, saved))
+      const reasons = PermissionMatch.reasons(input, effective)
+      const effect = reasons.length ? "ask" : "allow"
       const event = yield* hooks.trigger("permission", "evaluate", {
         sessionID: input.sessionID,
         agent: input.agent,
@@ -328,22 +299,23 @@ const layer = Layer.effect(
       })
       const unattended = yield* Unattended
       if (event.effect !== "ask" || unattended === undefined)
-        return { effect: event.effect, message: event.message, rules: all, reasons }
-      // Unattended rules answer every ask they decide, under the resource's own rules and each ceiling alike. A rule
-      // that denies, as an automation's does, leaves the ask denied.
-      const settled = rulesets.map((ruleset) => [...ruleset, ...unattended])
-      const allowed = input.resources.every((_, index) =>
-        settled.every(
-          (ruleset) =>
-            PermissionMatch.decidingResource(input.action, spellings(input, index), ruleset)?.rule.effect === "allow",
-        ),
+        return { effect: event.effect, message: event.message, reasons, policy: effective[0] }
+      // When an evaluate hook downgraded `allow` to `ask`, unattended rules must explicitly allow the request
+      // rather than inheriting the pre-hook `allow` from `effective`.
+      const settled =
+        effect === "ask"
+          ? effective.map((bound) => PermissionPolicy.override(bound, unattended))
+          : [PermissionPolicy.fromRules(unattended)]
+      if (
+        (effect === "ask" || input.resources.length > 0) &&
+        settled.every((bound) => PermissionMatch.assess(input, bound).effect === "allow")
       )
-      if (allowed) return { effect: "allow" as const, rules: all, reasons: [] }
+        return { effect: "allow" as const, reasons, policy: effective[0] }
       return {
         effect: "deny" as const,
         message: `Permission ${input.action} needs approval, and nobody is present to give it`,
-        rules: all,
         reasons,
+        policy: effective[0],
       }
     })
 
@@ -367,11 +339,11 @@ const layer = Layer.effect(
       }
     }
 
-    const create = (request: Request, agent?: Agent.ID) =>
+    const create = (request: Request, input: AssertInput) =>
       Effect.uninterruptible(
         Effect.gen(function* () {
           const deferred = yield* Deferred.make<void, DeclinedError | CorrectedError>()
-          const item = { request, agent, deferred }
+          const item = { request, agent: input.agent, source: input.source, deferred }
           if (closed) {
             yield* Deferred.fail(deferred, new DeclinedError())
             return item
@@ -390,7 +362,7 @@ const layer = Layer.effect(
       if (closed) return { id: input.id ?? ID.create(), effect: "deny" as const }
       const result = yield* evaluateInput(input)
       const value = request(input, result)
-      if (result.effect === "ask") yield* create(value, input.agent)
+      if (result.effect === "ask") yield* create(value, input)
       return { id: value.id, effect: result.effect }
     })
 
@@ -402,14 +374,14 @@ const layer = Layer.effect(
           Effect.gen(function* () {
             if (result.effect === "deny") {
               return yield* new BlockedError({
-                rules: relevant(input, result.rules),
+                rules: PermissionPolicy.relevant(result.policy, input.action),
                 permission: input.action,
                 resources: input.resources,
                 reason: result.message,
               })
             }
             if (result.effect === "allow") return
-            const item = yield* create(request(input, result), input.agent)
+            const item = yield* create(request(input, result), input)
             return yield* restore(Deferred.await(item.deferred)).pipe(
               // Deliberate defect tunnel: leaves wrap execution in blanket `mapError`, which
               // must not convert a user's decline into model-facing tool output. The decline
@@ -432,7 +404,7 @@ const layer = Layer.effect(
       const result = yield* evaluateInput(input)
       if (result.effect !== "deny") return
       return yield* new BlockedError({
-        rules: relevant(input, result.rules),
+        rules: PermissionPolicy.relevant(result.policy, input.action),
         permission: input.action,
         resources: input.resources,
         reason: result.message,
@@ -492,7 +464,7 @@ const layer = Layer.effect(
           if (input.reply !== "always" || !existing.request.save?.length) return
 
           for (const [id, item] of pending) {
-            const result = yield* evaluateInput({ ...item.request, agent: item.agent }).pipe(
+            const result = yield* evaluateInput({ ...item.request, source: item.source, agent: item.agent }).pipe(
               Effect.catchTag("Session.NotFoundError", () => Effect.undefined),
             )
             if (!result) continue

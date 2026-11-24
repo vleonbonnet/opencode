@@ -1,6 +1,7 @@
 export * as PermissionMatch from "./match.js"
 
 import type { Permission } from "@opencode/schema/permission"
+import type { PermissionPolicy } from "./policy.js"
 import { Wildcard } from "../util/wildcard.js"
 
 // How rules decide a request, without the services that collect them, so agents other than OpenCode can bundle it.
@@ -74,4 +75,57 @@ export function denial(
 // Why RULE denies ACTION, as the agent is told: its message after the permission, none when it has no message.
 export function reason(action: string, rule: Permission.Rule) {
   return rule.message === undefined ? undefined : `Permission denied: ${action}. ${rule.message}`
+}
+
+type Match = { rule: Permission.Rule; spelling: string }
+type Input = Pick<Permission.Request, "action" | "resources" | "alternates">
+
+export function policyMatch(policy: PermissionPolicy.Policy, action: string, names: readonly string[]): Match | undefined {
+  switch (policy._tag) {
+    case "rules":
+      return decidingAny(action, names, policy.rules)
+    case "override":
+      return decidingAny(action, names, policy.next) ?? policyMatch(policy.base, action, names)
+    case "restrict": {
+      const denies = policy.denies.map((rule) => ({ ...rule, effect: "deny" as const }))
+      return decidingAny(action, names, denies) ?? policyMatch(policy.base, action, names)
+    }
+    case "fallback": {
+      const primary = policyMatch(policy.base, action, names)
+      if (primary && primary.rule.effect !== "ask") return primary
+      return policyMatch(policy.secondary, action, names) ?? primary
+    }
+  }
+}
+
+function matchResource(policy: PermissionPolicy.Policy, action: string, names: readonly string[]) {
+  if (policy._tag === "rules") return decidingResource(action, names, policy.rules)
+  for (const name of names) {
+    const decision = policyMatch(policy, action, [name])
+    if (decision?.rule.effect === "deny") return decision
+  }
+  return policyMatch(policy, action, names)
+}
+
+export function reasons(input: Input, policies: ReadonlyArray<PermissionPolicy.Policy>) {
+  return input.resources.flatMap((resource, index): Permission.Reason[] => {
+    const names = spellings(input, index)
+    for (const policy of policies) {
+      const decided = matchResource(policy, input.action, names)
+      if (!decided) return [{ resource }]
+      if (decided.rule.effect === "ask")
+        return [{ resource, ...(decided.spelling === resource ? {} : { spelling: decided.spelling }), rule: decided.rule }]
+    }
+    return []
+  })
+}
+
+export function assess(input: Input, policy: PermissionPolicy.Policy) {
+  let effect: Permission.Effect = "allow"
+  for (const index of input.resources.keys()) {
+    const decided = matchResource(policy, input.action, spellings(input, index))
+    if (decided?.rule.effect === "deny") return { effect: "deny", denial: decided.rule } as const
+    if (!decided || decided.rule.effect === "ask") effect = "ask"
+  }
+  return { effect }
 }

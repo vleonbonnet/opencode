@@ -2,6 +2,8 @@ export * as PermissionDelegation from "./delegation.js"
 
 import { Agent } from "@opencode/schema/agent"
 import type { Permission } from "@opencode/schema/permission"
+import { PermissionMatch } from "./match.js"
+import type { PermissionPolicy } from "./policy.js"
 import type { Session } from "@opencode/schema/session"
 
 /** The delegating agent whose own rules bind what it delegates, as v1 bound plan-launched subagents. */
@@ -48,4 +50,23 @@ export function distinct(delegators: ReadonlyArray<Session.Delegator>) {
     seen.add(key)
     return true
   })
+}
+
+const delegatedDenial = (action: string, ceiling: Ceiling) =>
+  `Permission denied: ${action}. The ${ceiling.delegator.agent} agent that delegated this task does not permit it.`
+
+// Report the first denying policy, so BlockedError lists the rules of the agent that refused.
+export function denied(
+  input: Pick<Permission.Request, "action" | "resources" | "alternates">,
+  bounds: ReadonlyArray<PermissionPolicy.Policy>,
+  ceilings: ReadonlyArray<Ceiling>,
+) {
+  for (const [index, policy] of bounds.entries()) {
+    const { denial } = PermissionMatch.assess(input, policy)
+    if (!denial) continue
+    const message = index === 0
+      ? PermissionMatch.reason(input.action, denial)
+      : [delegatedDenial(input.action, ceilings[index - 1]), denial.message].filter(Boolean).join(" ")
+    return { effect: "deny" as const, policy, message, reasons: [] }
+  }
 }

@@ -1,3 +1,4 @@
+import { PermissionPolicy } from "@opencode/core/permission/policy"
 import { describe, expect } from "bun:test"
 import { Agent } from "@opencode/core/agent"
 import { Permission } from "@opencode/core/permission"
@@ -60,8 +61,8 @@ describe("Tool", () => {
         { action: "*", resource: "*", effect: "allow" },
         { action: "remove", resource: "*", effect: "deny" },
       ]
-      const planned = yield* service.snapshot(plan, { exposure: [plan, build] })
-      const built = yield* service.snapshot(build, { exposure: [build, plan] })
+      const planned = yield* service.snapshot(PermissionPolicy.fromRules(plan), { exposure: [plan, build] })
+      const built = yield* service.snapshot(PermissionPolicy.fromRules(build), { exposure: [build, plan] })
 
       // Only a tool every ruleset disables is left out, so both agents list the same tools and catalog.
       expect(planned.definitions.map((tool) => tool.name)).toEqual(["insert", "execute"])
@@ -110,8 +111,8 @@ describe("Tool", () => {
         { action: "execute", resource: "*", effect: "deny" },
       ]
       const build: Permission.Ruleset = [{ action: "*", resource: "*", effect: "allow" }]
-      const planned = yield* service.snapshot(plan, { exposure: [plan, build] })
-      const built = yield* service.snapshot(build, { exposure: [build, plan] })
+      const planned = yield* service.snapshot(PermissionPolicy.fromRules(plan), { exposure: [plan, build] })
+      const built = yield* service.snapshot(PermissionPolicy.fromRules(build), { exposure: [build, plan] })
       const asPlan = (input: Parameters<Tool.Snapshot["execute"]>[0]) => ({ ...input, agent: Agent.ID.make("plan") })
       const script = {
         ...call("execute", "call-script"),
@@ -149,7 +150,7 @@ describe("Tool", () => {
       const allow: Permission.Ruleset = [{ action: "*", resource: "*", effect: "allow" }]
       const delegator = { sessionID: Session.ID.make("ses_parent"), agent: Agent.ID.make("plan") }
       const ceiling = (rules: Permission.Ruleset): Permission.Ceiling => ({ delegator, rules: [...allow, ...rules] })
-      const bounded = yield* service.snapshot(allow, {
+      const bounded = yield* service.snapshot(PermissionPolicy.fromRules(allow), {
         exposure: [allow],
         ceilings: [
           ceiling([{ action: "insert", resource: "*", effect: "deny" }]),
@@ -168,7 +169,7 @@ describe("Tool", () => {
         message: 'No tool named "insert" is currently available. Please use a tool from the available tool list.',
       })
 
-      const closed = yield* service.snapshot(allow, {
+      const closed = yield* service.snapshot(PermissionPolicy.fromRules(allow), {
         exposure: [allow],
         ceilings: [ceiling([{ action: "execute", resource: "*", effect: "deny" }])],
       })

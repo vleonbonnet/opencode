@@ -184,6 +184,9 @@ describe("Permission", () => {
       const { fiber, request } = yield* waitForRequest({ action: "shell", resources: ["ls"], source })
       expect(seen).toEqual([source])
       expect(request.source).toEqual({ ...source, id: "call_parent" })
+      const other = yield* service.ask(assertion({ id: Permission.ID.create(), action: "shell", resources: ["pwd"], save: ["pwd"] }))
+      yield* service.reply({ requestID: other.id, reply: "always" })
+      expect(seen).toEqual([source, undefined, source])
       yield* service.reply({ requestID: request.id, reply: "once" })
       yield* Fiber.join(fiber)
     }),

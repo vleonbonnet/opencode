@@ -2,9 +2,12 @@ export * as SkillInstructions from "./instructions.js"
 
 import { makeLocationNode } from "@opencode/util/effect/app-node"
 import { Context, Effect, Layer, Schema } from "effect"
-import { Permission } from "../permission.js"
+import type { PermissionPolicy } from "../permission/policy.js"
 import { Skill } from "../skill.js"
 import { Instructions } from "../instructions/index.js"
+
+import { PermissionExposure } from "../permission/exposure.js"
+import type { Permission } from "../permission.js"
 
 const Summary = Schema.Struct({
   id: Skill.ID,
@@ -46,9 +49,9 @@ const update = Instructions.listUpdate<Summary>({
 })
 
 export interface Interface {
-  /** Lists skills the given ruleset does not deny; callers pass the merged agent and Session permissions. */
+  /** Lists skills the given policy does not deny; callers pass the session's effective permission policy. */
   readonly load: (
-    permissions: Permission.Ruleset,
+    policy: PermissionPolicy.Policy,
     /** The merged permissions of every agent sharing the request's exposure; a skill any of them allows is listed. */
     exposure?: ReadonlyArray<Permission.Ruleset>,
     /** The Session's delegation ceilings, which bind every ruleset of the exposure. */
@@ -64,11 +67,8 @@ const layer = Layer.effect(
     const skills = yield* Skill.Service
 
     return Service.of({
-      load: Effect.fn("SkillInstructions.load")(function* (permissions, exposure = [permissions], ceilings = []) {
-        const listed = yield* skills.list()
-        const shown = new Set(exposure.flatMap((permissions) => Skill.available(listed, permissions, ceilings)))
-        const available = listed
-          .filter((skill) => shown.has(skill))
+      load: Effect.fn("SkillInstructions.load")(function* (policy, exposure, ceilings = []) {
+        const available = PermissionExposure.skills(yield* skills.list(), policy, Skill.available, exposure, ceilings)
           .flatMap((skill) =>
             skill.description === undefined || skill.autoinvoke === false
               ? []
