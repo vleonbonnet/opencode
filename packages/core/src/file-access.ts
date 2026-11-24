@@ -128,7 +128,6 @@ const layer = Layer.effect(
   Service,
   Effect.gen(function* () {
     const environment = yield* Environment.Service
-    const paths = environment.path ?? path
     const exists = (file: string) => Environment.exists(environment.files, file)
     const location = yield* Location.Service
     const currentWorkingDirectory = yield* Environment.workingDirectoryResolver
@@ -160,7 +159,7 @@ const layer = Layer.effect(
         const written = parsed?.path ?? text
         const origin = parsed ? location.directory : from.absolute
         return {
-          absolute: AbsolutePath.make(environment.path ? paths.resolve(origin, written) : resolvePath(origin, written)),
+          absolute: AbsolutePath.make(resolvePath(origin, written)),
           environment: { id },
         } satisfies Environment.Place
       }
@@ -219,17 +218,17 @@ const layer = Layer.effect(
         return yield* machineTarget(located, input.kind, inside)
       }
       const absolute = located.absolute
-      const worktree = paths.resolve(location.project.directory)
+      const worktree = path.resolve(location.project.directory)
       // A path that is textually under a cwd on another machine is still this server's own.
       const internal =
         (located.environment.id === workingDirectory.environment.id &&
-          contains(workingDirectory.absolute, absolute, paths)) ||
-        (worktree !== paths.parse(worktree).root && contains(worktree, absolute, paths))
+          FSUtil.contains(workingDirectory.absolute, absolute)) ||
+        (worktree !== path.parse(worktree).root && FSUtil.contains(worktree, absolute))
       if (internal) {
         // The resource stays relative to the directory the path was written in; a cwd on another machine cannot name one.
         const base =
           located.environment.id === workingDirectory.environment.id ? workingDirectory.absolute : location.directory
-        const relative = slash(paths.relative(base, absolute) || ".")
+        const relative = slash(path.relative(base, absolute) || ".")
         return {
           absolute,
           // With cross-environment prefixes on, a local folder can be named like an environment path, so keep it local.
@@ -242,15 +241,15 @@ const layer = Layer.effect(
         (yield* Environment.typeFollowing(environment.files, absolute).pipe(
           Effect.catchTag("Environment.NotFound", () => Effect.undefined),
         ))
-      const directory = AbsolutePath.make(type === "directory" ? absolute : paths.dirname(absolute))
+      const directory = AbsolutePath.make(type === "directory" ? absolute : path.dirname(absolute))
       return {
         absolute,
         resource: slash(absolute),
         externalDirectory: {
           action: "external_directory",
           directory,
-          resource: slash(paths.join(directory, "*")),
-          save: slash(paths.join((yield* Project.root({ exists }, directory, undefined, paths)) ?? directory, "*")),
+          resource: slash(path.join(directory, "*")),
+          save: slash(path.join((yield* Project.root({ exists }, directory)) ?? directory, "*")),
         },
         environment,
       } satisfies Target
@@ -353,9 +352,3 @@ export const node = makeLocationNode({
   layer,
   deps: [Environment.node, Environments.node, Flag.node, Location.node, Machines.node, Permission.node],
 })
-
-// A workspace uses its own separator and case rules, even on a Windows server.
-function contains(parent: string, child: string, paths: typeof path.posix) {
-  const relative = paths.relative(parent, child)
-  return relative !== ".." && !relative.startsWith(`..${paths.sep}`) && !paths.isAbsolute(relative)
-}
