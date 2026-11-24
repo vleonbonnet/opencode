@@ -2701,17 +2701,15 @@ describe("SessionRunnerLLM", () => {
       request?.system.map((part) => part.text).find((text) => text.includes("# Code Mode")) ?? ""
     const updates = (request: LLMRequest | undefined) =>
       request ? systemTexts(request).filter((text) => text.startsWith("The Code Mode tool catalog has changed")) : []
-    const signature = (name: string, index: number) =>
-      `  - tools.${name}.${name}_${index}({\n  id: string,\n}): Promise<string> // ${name} tool ${index}`
 
     yield* register("alpha", 12)
     yield* s.runPrompt("First")
-    expect(catalogOf(s.requests.at(-1))).toContain(`- alpha (12 tools)\n${signature("alpha", 0)}`)
+    expect(catalogOf(s.requests.at(-1))).toContain("- alpha (12 tools, none shown)")
 
     const beta = yield* register("beta", 1)
     yield* s.runPrompt("Second")
     expect(updates(s.requests.at(-1))).toEqual([
-      `The Code Mode tool catalog has changed.\n\nNew tools are available:\n- beta (1 tool)\n${signature("beta", 0)}`,
+      "The Code Mode tool catalog has changed.\n\nNew tools are available:\n- beta (1 tool, none shown)",
     ])
     // The next step rebuilds the same catalog and has nothing to say.
     yield* s.runPrompt("Again")
@@ -2726,7 +2724,7 @@ describe("SessionRunnerLLM", () => {
     yield* register("alpha", 1, 12)
     yield* s.runPrompt("Fourth")
     expect(updates(s.requests.at(-1)).at(-1)).toBe(
-      `The Code Mode tool catalog has changed.\n\nNew tools are available in addition to those previously listed:\n${signature("alpha", 12)}`,
+      "The Code Mode tool catalog has changed.\n\nNew tools are available in addition to those previously listed:\n  - 1 more; search for them",
     )
 
     // Compaction restates the current catalog as the new baseline and has no update to send.
@@ -2734,7 +2732,7 @@ describe("SessionRunnerLLM", () => {
     yield* s.session.compact({ sessionID })
     yield* s.resume
     const latest = yield* s.runPrompt("Fifth")
-    expect(catalogOf(s.requests.at(-1))).toContain(signature("alpha", 12))
+    expect(catalogOf(s.requests.at(-1))).toContain("- alpha (13 tools, none shown)")
     expect(catalogOf(s.requests.at(-1))).not.toContain("- beta")
     expect(updates(s.requests.at(-1))).toEqual([])
 
@@ -2742,7 +2740,7 @@ describe("SessionRunnerLLM", () => {
     const forked = yield* s.session.fork({ sessionID, before: latest.id })
     yield* s.session.prompt({ sessionID: forked.id, text: "Forked", resume: false })
     yield* s.session.resume(forked.id)
-    expect(catalogOf(s.requests.at(-1))).toContain(signature("alpha", 12))
+    expect(catalogOf(s.requests.at(-1))).toContain("- alpha (13 tools, none shown)")
     expect(updates(s.requests.at(-1))).toEqual([])
   })
 
