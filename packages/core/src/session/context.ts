@@ -42,6 +42,7 @@ import { SessionStore } from "./store.js"
 
 import { Option } from "effect"
 import { SessionCache } from "./cache/service.js"
+import { ForkCodeModeCatalog } from "../codemode/fork-catalog.js"
 
 export interface Selection {
   readonly session: SessionSchema.Info
@@ -236,7 +237,10 @@ const layer = Layer.effect(
         // prompt-cache prefix: user-level catalog and guidance, then project instructions, then
         // the date and environment, which vary by day and directory.
         instructions: Instructions.combine([
-          CodeModeInstructions.make(tools.codeModeCatalog),
+          CodeModeInstructions.make(
+            ForkCodeModeCatalog.adapt(tools.codeModeCatalog),
+            ForkCodeModeCatalog.signatureBudget,
+          ),
           loaded.mcp,
           loaded.references,
           loaded.skills,

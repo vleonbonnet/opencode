@@ -44,6 +44,7 @@ export function update(
   previous: CodeModeCatalog.Summary,
   current: CodeModeCatalog.Summary,
   lookup: (path: string) => CodeModeCatalog.Listing | undefined,
+  signatures = UPDATE_BUDGET,
 ) {
   const replacement = `The Code Mode tool catalog has changed. This catalog supersedes the previous Code Mode tool catalog.
 
@@ -75,7 +76,7 @@ ${render(current)}`
       const listing = lookup(entry.path)
       return listing === undefined || listing.line === entry.line ? [] : [listing]
     })
-  const budget = complete(current) ? Infinity : UPDATE_BUDGET / (restated.length + (added.length > 0 ? 1 : 0) || 1)
+  const budget = complete(current) ? Infinity : signatures / (restated.length + (added.length > 0 ? 1 : 0) || 1)
 
   const parts = ["The Code Mode tool catalog has changed."]
   if (restated.length > 0) {
@@ -147,8 +148,8 @@ function fit(listings: ReadonlyArray<CodeModeCatalog.Listing>, budget: number) {
 const key = Instructions.Key.make("core/codemode")
 const codec = Schema.toCodecJson(CodeModeCatalog.Summary)
 
-export const make = (inventory?: CodeModeCatalog.Inventory): Instructions.List => {
-  const catalog = inventory === undefined ? Instructions.removed : CodeModeCatalog.summarize(inventory)
+export const make = (inventory?: CodeModeCatalog.Inventory, budget?: number): Instructions.List => {
+  const catalog = inventory === undefined ? Instructions.removed : CodeModeCatalog.summarize(inventory, { budget })
   return Instructions.make({
     key,
     codec,
@@ -157,7 +158,12 @@ export const make = (inventory?: CodeModeCatalog.Inventory): Instructions.List =
       initial: render,
       // Rendered once, against the inventory that produced `current`, and stored with the update.
       changed: (previous, current) =>
-        update(previous, current, inventory === undefined ? () => undefined : CodeModeCatalog.lookup(inventory)),
+        update(
+          previous,
+          current,
+          inventory === undefined ? () => undefined : CodeModeCatalog.lookup(inventory),
+          budget,
+        ),
       removed: () =>
         "The `execute` tool is no longer available. Permitted tools are now available as direct tool calls.",
     },
