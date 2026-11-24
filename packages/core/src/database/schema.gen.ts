@@ -119,6 +119,13 @@ const schema: Omit<DatabaseMigration.Migration, "id"> = {
         );
       `)
       yield* tx.run(`
+        CREATE TABLE \`machine\` (
+          \`id\` text PRIMARY KEY,
+          \`key\` text,
+          \`time_created\` integer NOT NULL
+        );
+      `)
+      yield* tx.run(`
         CREATE TABLE \`permission\` (
           \`id\` text PRIMARY KEY,
           \`project_id\` text NOT NULL,
@@ -158,25 +165,6 @@ const schema: Omit<DatabaseMigration.Migration, "id"> = {
           \`time_archived\` integer,
           \`sandboxes\` text NOT NULL,
           \`commands\` text
-        );
-      `)
-      yield* tx.run(`
-        CREATE TABLE \`session_search_backfill\` (
-          \`id\` integer PRIMARY KEY,
-          \`cursor\` text NOT NULL,
-          \`processed\` integer NOT NULL,
-          \`total\` integer NOT NULL,
-          \`time_started\` integer NOT NULL
-        );
-      `)
-      yield* tx.run(`
-        CREATE TABLE \`session_search\` (
-          \`id\` integer PRIMARY KEY,
-          \`message_id\` text NOT NULL,
-          \`session_id\` text NOT NULL,
-          \`role\` text NOT NULL,
-          \`time_created\` integer NOT NULL,
-          \`text\` text NOT NULL
         );
       `)
       yield* tx.run(`
@@ -340,10 +328,10 @@ const schema: Omit<DatabaseMigration.Migration, "id"> = {
       yield* tx.run(`CREATE INDEX \`job_session_idx\` ON \`job\` (\`session_id\`);`)
       yield* tx.run(`CREATE INDEX \`job_child_session_idx\` ON \`job\` (\`child_session_id\`);`)
       yield* tx.run(`CREATE INDEX \`job_id_idx\` ON \`job\` (\`id\`);`)
+      yield* tx.run(`CREATE UNIQUE INDEX \`machine_key_idx\` ON \`machine\` (\`key\`);`)
       yield* tx.run(
         `CREATE UNIQUE INDEX \`permission_session_action_resource_idx\` ON \`permission\` (\`session_id\`,\`action\`,\`resource\`);`,
       )
-      yield* tx.run(`CREATE UNIQUE INDEX \`session_search_message_idx\` ON \`session_search\` (\`message_id\`);`)
       yield* tx.run(`CREATE INDEX \`blob_ref_hash_idx\` ON \`blob_ref\` (\`hash\`);`)
       yield* tx.run(`CREATE INDEX \`blob_ref_session_seq_idx\` ON \`blob_ref\` (\`session_id\`,\`seq\`);`)
       yield* tx.run(

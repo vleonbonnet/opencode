@@ -1,7 +1,11 @@
 export * as SessionSearchQuery from "./query.js"
 
 import { SessionSearch } from "@opencode/schema/session-search"
-import { MARK_END, MARK_START } from "./ddl.js"
+import { SessionSearchIndex } from "../search-index.js"
+
+/** Marks the start and end of each match in highlighted text: private-use characters, removed from the text first. */
+export const MARK_START = "\uE000"
+export const MARK_END = "\uE001"
 
 /** A query term: a word or a quoted phrase, matched whole, or a word ending in `*`, matched as a prefix. */
 export type Term = { readonly text: string; readonly prefix: boolean }
@@ -42,7 +46,9 @@ export function anyOf(input: ReadonlyArray<Term>) {
   return input.map(quote).join(" OR ")
 }
 
-const quote = (term: Term) => `"${term.text.replaceAll('"', '""')}"${term.prefix ? "*" : ""}`
+// Folded as the index folds the text it holds, so `đ`, `ß` and the like match their ASCII spellings.
+const quote = (term: Term) =>
+  `"${SessionSearchIndex.foldText(term.text).replaceAll('"', '""')}"${term.prefix ? "*" : ""}`
 
 /** A query over whole sessions: terms combined by AND, OR and NOT. */
 export type Expression =
@@ -184,9 +190,9 @@ const ELLIPSIS = "…"
 const CONTEXT_BEFORE = 60
 
 /**
- * Turns an FTS5 snippet, whose matches are wrapped in {@link MARK_START} and {@link MARK_END}, into one line of at
- * most {@link SessionSearch.MAX_SNIPPET_LENGTH} characters with the matches located. Runs of whitespace become one
- * space. A longer line keeps the context before its first match and is cut with an ellipsis.
+ * Turns text whose matches are wrapped in {@link MARK_START} and {@link MARK_END} into one line of at most
+ * {@link SessionSearch.MAX_SNIPPET_LENGTH} characters with the matches located. Runs of whitespace become one space.
+ * A longer line keeps the context before its first match and is cut with an ellipsis.
  */
 export function snippet(raw: string): SessionSearch.Snippet {
   const characters: string[] = []

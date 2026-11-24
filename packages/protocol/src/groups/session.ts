@@ -7,7 +7,7 @@ import { TokenUsage } from "@opencode/schema/token-usage"
 import { Money } from "@opencode/schema/money"
 import { InstructionEntry } from "@opencode/schema/instruction-entry"
 import { Project } from "@opencode/schema/project"
-import { DateTimeUtcFromMillis, NonNegativeInt, PositiveInt } from "@opencode/schema/schema"
+import { DateTimeUtcFromMillis, NonNegativeInt, optional, PositiveInt } from "@opencode/schema/schema"
 import { Event } from "@opencode/schema/event"
 import { SessionLegacy } from "@opencode/schema/session-legacy"
 import { Context, Schema, SchemaGetter, Struct } from "effect"
@@ -40,7 +40,6 @@ import { FileDiff } from "@opencode/schema/file-diff"
 import { Form } from "@opencode/schema/form"
 import { PublicSessionMessage } from "./message.js"
 
-import { optional } from "@opencode/schema/schema"
 import { SessionCache } from "@opencode/schema/session-cache"
 import { SessionSearch } from "@opencode/schema/session-search"
 
@@ -120,13 +119,29 @@ export const SessionsQuery = Schema.Struct({
     description: "Maximum number of sessions to return. Defaults to the newest 50 sessions.",
   }),
   ...Session.ListFilter.fields,
-  cursor: Session.ListCursor.pipe(Schema.optional),
+  search: Session.ListFilter.fields.search.annotateKey({
+    description: "Only sessions whose title contains this text, ignoring case. % and _ act as wildcards.",
+  }),
+  archived: Session.ListFilter.fields.archived.annotateKey({
+    description:
+      "Filter by archive state. Use true to return only archived sessions or false to exclude them. Omit to include both.",
+  }),
+  directory: Session.ListFilter.fields.directory.annotateKey({
+    description: "Only sessions whose directory is exactly this absolute path.",
+  }),
+  subpath: Session.ListFilter.fields.subpath.annotateKey({
+    description: "With project, only sessions at this path relative to the project directory.",
+  }),
+  cursor: Session.ListCursor.pipe(Schema.optional).annotateKey({
+    description:
+      "Opaque cursor from a previous page's cursor.next or cursor.previous. It carries that page's filters and order, so other filters are ignored.",
+  }),
 }).annotate({ identifier: "SessionsQuery" })
 
 export const SessionSearchQuery = Schema.Struct({
   q: Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(SessionSearch.MAX_QUERY_LENGTH)).annotate({
     description:
-      "The words to find. Whitespace separates words, double quotes group a phrase, and a word ending in * matches as a prefix (at least two characters before it). Every term must match; nothing else is query syntax.",
+      "The words to find. Whitespace separates words, double quotes group a phrase, and a word ending in * matches as a prefix (at least two characters before it). Every term must match; nothing else is query syntax. Words match ignoring case, diacritics and English inflections.",
   }),
   limit: Schema.NumberFromString.pipe(
     Schema.decodeTo(PositiveInt.check(Schema.isLessThanOrEqualTo(SessionSearch.MAX_LIMIT))),
@@ -180,11 +195,21 @@ export const makeSessionGroup = <I extends HttpApiMiddleware.AnyId, S, FormI ext
     .add(
       HttpApiEndpoint.get("session.stats", "/api/experimental/session/stats", {
         query: Schema.Struct({
-          from: Schema.NumberFromString.pipe(Schema.optional),
-          to: Schema.NumberFromString.pipe(Schema.optional),
+          from: Schema.NumberFromString.pipe(Schema.optional).annotateKey({
+            description:
+              "Start of the range in Unix milliseconds, inclusive. Defaults to the earliest recorded message.",
+          }),
+          to: Schema.NumberFromString.pipe(Schema.optional).annotateKey({
+            description: "End of the range in Unix milliseconds, exclusive. Defaults to now.",
+          }),
           project: Project.ID.pipe(Schema.optional),
-          timezone: Schema.String.pipe(Schema.optional),
-          tools: SessionStats.ToolMode.pipe(Schema.optional),
+          timezone: Schema.String.pipe(Schema.optional).annotateKey({
+            description: "IANA time zone used to group activity by day. Defaults to UTC.",
+          }),
+          tools: SessionStats.ToolMode.pipe(Schema.optional).annotateKey({
+            description:
+              "How much tool usage to report: none, summary totals, or per-tool detail. Defaults to summary.",
+          }),
         }),
         success: Schema.Struct({ data: SessionStats.Info }),
         error: InvalidRequestError,
@@ -199,17 +224,26 @@ export const makeSessionGroup = <I extends HttpApiMiddleware.AnyId, S, FormI ext
     .add(
       HttpApiEndpoint.post("session.create", "/api/session", {
         payload: Schema.Struct({
-          id: Session.ID.pipe(Schema.optional),
+          id: Session.ID.pipe(Schema.optional).annotate({
+            description: "If a session with this ID already exists, it is returned unchanged, so retries are safe.",
+          }),
           parentID: Session.ID.pipe(Schema.optional).annotate({
             description:
-              "Set parentID to create a subagent session at the parent's location; set agent to choose its agent (otherwise it uses the default) and start it with session.prompt. After each completed round, the child sends a `<subagent>` report to the parent's inbox and wakes the parent unless it has a staged revert.",
+              'Creates a child session at the parent\'s location. Each time the child finishes running, it sends its last reply to the parent as a `<background-result kind="subagent">` message and wakes the parent, unless the parent has a staged revert.',
           }),
           title: Schema.String.pipe(Schema.optional),
           agent: Agent.ID.pipe(Schema.optional),
           model: Model.Ref.pipe(Schema.optional),
-          location: Location.PublicRef.pipe(Schema.optional),
-          metadata: Session.Metadata.pipe(Schema.optional),
-          permissions: Permission.Ruleset.pipe(Schema.optional),
+          location: Location.PublicRef.pipe(Schema.optional).annotate({
+            description: "Defaults to the server's working directory. Ignored when parentID is set.",
+          }),
+          metadata: Session.Metadata.pipe(Schema.optional).annotate({
+            description: "Opaque to OpenCode. Child sessions inherit the parent's metadata unless you pass your own.",
+          }),
+          permissions: Permission.Ruleset.pipe(Schema.optional).annotate({
+            description:
+              "Applied on top of the agent's rules. Child sessions inherit the parent's rules unless you pass your own.",
+          }),
         }),
         success: Schema.Struct({ data: PublicSessionInfo }),
         error: SessionNotFoundError,
@@ -243,7 +277,11 @@ export const makeSessionGroup = <I extends HttpApiMiddleware.AnyId, S, FormI ext
     .add(
       HttpApiEndpoint.get("session.export", "/api/experimental/session/:sessionID/export", {
         params: { sessionID: Session.ID },
-        query: Schema.Struct({ sanitize: BooleanFromString.pipe(Schema.optional) }),
+        query: Schema.Struct({
+          sanitize: BooleanFromString.pipe(Schema.optional).annotateKey({
+            description: "Set to true to redact titles, message text, file data, paths and metadata from the export.",
+          }),
+        }),
         success: Schema.Struct({ data: PublicSessionTransfer }),
         error: [SessionNotFoundError, UnknownError],
       }).annotateMerge(
@@ -262,7 +300,7 @@ export const makeSessionGroup = <I extends HttpApiMiddleware.AnyId, S, FormI ext
           identifier: "session.active",
           summary: "List active sessions",
           description:
-            "Retrieve foreground Session drains currently owned by this OpenCode process. Sessions absent from the result are inactive.",
+            "List the sessions whose agent is running right now in this server process. Sessions missing from the result are idle.",
         }),
       ),
     )
@@ -284,12 +322,12 @@ export const makeSessionGroup = <I extends HttpApiMiddleware.AnyId, S, FormI ext
       HttpApiEndpoint.get("session.search", "/api/experimental/session/search", {
         query: SessionSearchQuery,
         success: SessionSearch.Response,
-        error: [InvalidCursorError, InvalidRequestError],
+        error: [InvalidCursorError, InvalidRequestError, ServiceUnavailableError],
       }).annotateMerge(
         OpenApi.annotations({
           identifier: "experimental.session.search",
           summary: "Search session messages",
-          description: `Full-text search over user prompts and the visible text of assistant messages (not tool calls, tool output or reasoning) across sessions. Each match names its session and message, with a one-line snippet of at most ${SessionSearch.MAX_SNIPPET_LENGTH} characters whose matches are located by character offsets. Matches are ranked by relevance (BM25), newer first among equal ranks; use cursor.next for the following page. Filters narrow the sessions searched as session.list's do. Messages written before the index existed are indexed in the background after the server starts: until index.complete, results come only from the messages indexed so far, and index.processed of index.total says how far it is.`,
+          description: `Full-text search over user prompts and the visible text of finished assistant messages (not tool calls, tool output or reasoning) across sessions. Words match ignoring case, diacritics and English inflections, so run also finds running. Each match names its session and message, with a one-line snippet of at most ${SessionSearch.MAX_SNIPPET_LENGTH} characters whose matches are located by character offsets. Matches are ranked by relevance (BM25), newer first among equal ranks; use cursor.next for the following page. Filters narrow the sessions searched as session.list's do. Messages written before the index existed are indexed in the background after the server starts: until index.complete, results come only from the messages indexed so far, and index.processed of index.total says how far it is. A 503 means this server's SQLite cannot hold the index.`,
         }),
       ),
     )
@@ -297,12 +335,12 @@ export const makeSessionGroup = <I extends HttpApiMiddleware.AnyId, S, FormI ext
       HttpApiEndpoint.get("session.searchSessions", "/api/experimental/session/search/sessions", {
         query: SessionSearchSessionsQuery,
         success: SessionSearch.SessionsResponse,
-        error: [InvalidCursorError, InvalidRequestError],
+        error: [InvalidCursorError, InvalidRequestError, ServiceUnavailableError],
       }).annotateMerge(
         OpenApi.annotations({
           identifier: "experimental.session.searchSessions",
           summary: "Search whole sessions",
-          description: `Finds the sessions whose messages, taken together, match a query of terms combined by AND, OR, exclusion and parentheses: a term holds when any one of the session's messages matches it, searching what session.search searches. Each session comes once, with its message best matching the terms it holds and that message's snippet; a session matching only by what it lacks has none. Sessions are ranked by the sum of each held term's best relevance (BM25), then the most recently updated; use cursor.next for the following page. Filters narrow the sessions searched as session.list's do, and the index catches up with older messages as for session.search.`,
+          description: `Finds the sessions whose messages, taken together, match a query of terms combined by AND, OR, exclusion and parentheses: a term holds when any one of the session's messages matches it, searching what session.search searches. Each session comes once, with its message best matching the terms it holds and that message's snippet; a session matching only by what it lacks has none. Sessions are ranked by the sum of each held term's best relevance (BM25), then the most recently updated; use cursor.next for the following page. Filters narrow the sessions searched as session.list's do, and the index catches up with older messages as for session.search, which it shares.`,
         }),
       ),
     )
@@ -343,7 +381,7 @@ export const makeSessionGroup = <I extends HttpApiMiddleware.AnyId, S, FormI ext
           identifier: "session.fork",
           summary: "Fork session",
           description:
-            "Create a child session by copying projected history before a message. Omit before to copy the full history.",
+            "Create a child session with this session's history before a message. Omit before to copy the full history.",
         }),
       ),
     )
@@ -357,7 +395,7 @@ export const makeSessionGroup = <I extends HttpApiMiddleware.AnyId, S, FormI ext
         OpenApi.annotations({
           identifier: "session.switchAgent",
           summary: "Switch session agent",
-          description: "Switch the agent used by subsequent provider turns.",
+          description: "Change the agent the session uses from its next model call on.",
         }),
       ),
     )
@@ -371,7 +409,7 @@ export const makeSessionGroup = <I extends HttpApiMiddleware.AnyId, S, FormI ext
         OpenApi.annotations({
           identifier: "session.switchModel",
           summary: "Switch session model",
-          description: "Switch the model used by subsequent provider turns.",
+          description: "Change the model the session uses from its next model call on.",
         }),
       ),
     )
@@ -415,12 +453,20 @@ export const makeSessionGroup = <I extends HttpApiMiddleware.AnyId, S, FormI ext
       HttpApiEndpoint.post("session.prompt", "/api/session/:sessionID/prompt", {
         params: { sessionID: Session.ID },
         payload: Schema.Struct({
-          id: SessionMessage.ID.pipe(Schema.optional),
+          id: SessionMessage.ID.pipe(Schema.optional).annotate({
+            description:
+              "Sending the same ID again returns the original item instead of adding a second one, so retries are safe. Reusing it in another session or for another kind of item fails with 409.",
+          }),
           ...PromptInput.Prompt.fields,
-          /** Client metadata kept on the message; `thinkingLoss` decides what the turn does with stale thinking. */
-          metadata: SessionCache.PromptMetadata.pipe(optional),
+          metadata: SessionCache.PromptMetadata.pipe(optional).annotateKey({
+            description:
+              "Stored on the message. The model doesn't see it. Its thinkingLoss decides what the turn does with stale thinking.",
+          }),
           delivery: SessionInbox.Delivery.pipe(Schema.optional),
-          resume: Schema.Boolean.pipe(Schema.optional),
+          resume: Schema.Boolean.pipe(Schema.optional).annotate({
+            description:
+              "false adds the message to the inbox without starting the agent; it is delivered the next time the session runs.",
+          }),
         }),
         success: Schema.Struct({ data: SessionInbox.User }),
         error: [ConflictError, InvalidRequestError, SessionNotFoundError],
@@ -430,7 +476,8 @@ export const makeSessionGroup = <I extends HttpApiMiddleware.AnyId, S, FormI ext
           OpenApi.annotations({
             identifier: "session.prompt",
             summary: "Send message",
-            description: "Durably admit one session input and schedule agent-loop execution unless resume is false.",
+            description:
+              "Send a user message and start the agent unless resume is false. Returns once the message is queued, not when the agent finishes: wait with experimental.session.wait or the session.execution.* events, then read the reply with session.message.list.",
           }),
         ),
     )
@@ -440,8 +487,12 @@ export const makeSessionGroup = <I extends HttpApiMiddleware.AnyId, S, FormI ext
         payload: Schema.Struct({
           name: Schema.String,
           ...PromptInput.Prompt.fields,
-          /** Forwarded to the prompt the command sends, like the prompt route's `metadata`. */
-          metadata: SessionCache.PromptMetadata.pipe(optional),
+          text: PromptInput.Prompt.fields.text.annotate({
+            description: "The command's arguments.",
+          }),
+          metadata: SessionCache.PromptMetadata.pipe(optional).annotateKey({
+            description: "Forwarded to the prompt the command sends, as the prompt route's metadata.",
+          }),
           delivery: SessionInbox.Delivery.pipe(Schema.optional),
         }),
         success: HttpApiSchema.NoContent,
@@ -452,7 +503,8 @@ export const makeSessionGroup = <I extends HttpApiMiddleware.AnyId, S, FormI ext
           OpenApi.annotations({
             identifier: "session.command",
             summary: "Run command",
-            description: "Execute a slash command callback immediately.",
+            description:
+              "Run a named command in the session. Most commands send a prompt, so like session.prompt this returns before the agent finishes.",
           }),
         ),
     )
@@ -514,12 +566,24 @@ export const makeSessionGroup = <I extends HttpApiMiddleware.AnyId, S, FormI ext
       HttpApiEndpoint.post("session.synthetic", "/api/session/:sessionID/synthetic", {
         params: { sessionID: Session.ID },
         payload: Schema.Struct({
-          id: SessionMessage.ID.pipe(Schema.optional),
+          id: SessionMessage.ID.pipe(Schema.optional).annotate({
+            description:
+              "Sending the same ID again returns the original item instead of adding a second one, so retries are safe. Reusing it in another session or for another kind of item fails with 409.",
+          }),
           text: Schema.String,
-          description: Schema.String.pipe(Schema.optional),
-          metadata: SessionMessage.Synthetic.fields.metadata,
+          description: Schema.String.pipe(Schema.optional).annotate({
+            description: "Short label shown in the transcript instead of the full text.",
+          }),
+          metadata: Schema.Record(Schema.String, Schema.Unknown)
+            .annotate({
+              description: "Stored on the message. The model doesn't see it.",
+            })
+            .pipe(optional),
           delivery: SessionInbox.Delivery.pipe(Schema.optional),
-          resume: Schema.Boolean.pipe(Schema.optional),
+          resume: Schema.Boolean.pipe(Schema.optional).annotate({
+            description:
+              "false adds the message to the inbox without starting the agent; it is delivered the next time the session runs.",
+          }),
         }),
         success: Schema.Struct({ data: SessionInbox.Synthetic }),
         error: [ConflictError, SessionNotFoundError],
@@ -527,7 +591,8 @@ export const makeSessionGroup = <I extends HttpApiMiddleware.AnyId, S, FormI ext
         OpenApi.annotations({
           identifier: "session.synthetic",
           summary: "Add synthetic message",
-          description: "Durably admit synthetic session input and schedule execution unless resume is false.",
+          description:
+            "Add a message the model reads as user input but the user didn't type, such as a notification. Starts the agent unless resume is false or the session has a staged revert.",
         }),
       ),
     )
@@ -565,7 +630,7 @@ export const makeSessionGroup = <I extends HttpApiMiddleware.AnyId, S, FormI ext
           identifier: "session.compact",
           summary: "Compact session",
           description:
-            "Durably admit a session compaction request. Steers by default: it runs at the next step boundary instead of waiting behind queued prompts.",
+            "Queue a summary of the session's history. Steers by default: it runs before the next model call, ahead of queued messages.",
         }),
       ),
     )
@@ -578,7 +643,8 @@ export const makeSessionGroup = <I extends HttpApiMiddleware.AnyId, S, FormI ext
         OpenApi.annotations({
           identifier: "experimental.session.wait",
           summary: "Wait for session",
-          description: "Wait for a session agent loop to become idle.",
+          description:
+            "Wait until the session's agent stops running in this server process. Returns at once when idle. Experimental: may change without compatibility guarantees.",
         }),
       ),
     )
@@ -662,7 +728,7 @@ export const makeSessionGroup = <I extends HttpApiMiddleware.AnyId, S, FormI ext
           identifier: "session.inbox.list",
           summary: "List session inbox",
           description:
-            "List durable enqueued session work not yet delivered, ordered by enqueue sequence. Includes user, synthetic, compaction, and move items.",
+            "List user, synthetic, compaction and move items not yet delivered to the agent, oldest first. Delivered user and synthetic items move to session.message.list.",
         }),
       ),
     )
@@ -770,8 +836,12 @@ export const makeSessionGroup = <I extends HttpApiMiddleware.AnyId, S, FormI ext
       HttpApiEndpoint.get("session.log", "/api/experimental/session/:sessionID/log", {
         params: { sessionID: Session.ID },
         query: {
-          after: Schema.NumberFromString.pipe(Schema.decodeTo(Event.Seq), Schema.optional),
-          follow: BooleanFromString.pipe(Schema.optional),
+          after: Schema.NumberFromString.pipe(Schema.decodeTo(Event.Seq), Schema.optional).annotateKey({
+            description: "Only return events after this sequence number.",
+          }),
+          follow: BooleanFromString.pipe(Schema.optional).annotateKey({
+            description: "Set to true to keep the stream open and send live events after the stored ones.",
+          }),
         },
         success: HttpApiSchema.StreamSse({
           data: Schema.Union([SessionEvent.Durable, EventLog.Synced]).annotate({ identifier: "SessionLogItem" }),
@@ -789,7 +859,12 @@ export const makeSessionGroup = <I extends HttpApiMiddleware.AnyId, S, FormI ext
     .add(
       HttpApiEndpoint.post("session.interrupt", "/api/session/:sessionID/interrupt", {
         params: { sessionID: Session.ID },
-        query: { resume: BooleanFromString.pipe(Schema.optional) },
+        query: {
+          resume: BooleanFromString.pipe(Schema.optional).annotateKey({
+            description:
+              "Set to true to resume pending steering input and next-in-line control items after interrupting.",
+          }),
+        },
         success: Schema.Struct({
           interrupted: Schema.Boolean.annotate({
             description: "Whether an active execution owned by this OpenCode process was interrupted.",
@@ -801,7 +876,7 @@ export const makeSessionGroup = <I extends HttpApiMiddleware.AnyId, S, FormI ext
           identifier: "session.interrupt",
           summary: "Interrupt session execution",
           description:
-            "Interrupt active execution owned by this OpenCode process. Returns interrupted=true when an active execution was interrupted and false for the idle no-op. When resume=true, execution resumes pending steering input and next-in-line control items (manual compaction, moves) while queued prompts remain parked.",
+            "Stop the session's agent if it is running in this server process; interrupted=false means nothing was running. With resume=true it continues with pending steer items, compaction and moves, while queued messages keep waiting.",
         }),
       ),
     )
@@ -828,7 +903,7 @@ export const makeSessionGroup = <I extends HttpApiMiddleware.AnyId, S, FormI ext
         OpenApi.annotations({
           identifier: "session.message.get",
           summary: "Get session message",
-          description: "Retrieve one projected message owned by the Session.",
+          description: "Retrieve one message of the session by ID.",
         }),
       ),
     )
@@ -897,7 +972,11 @@ export const makeSessionGroup = <I extends HttpApiMiddleware.AnyId, S, FormI ext
     .add(
       HttpApiEndpoint.delete("session.form.cancel", "/api/session/:sessionID/form/:formID", {
         params: { sessionID: Schema.String, formID: Form.ID },
-        query: Schema.Struct({ message: Schema.optional(Schema.String) }),
+        query: Schema.Struct({
+          message: Schema.optional(Schema.String).annotateKey({
+            description: "Why the form was not answered, passed on to the asker.",
+          }),
+        }),
         success: HttpApiSchema.NoContent,
         error: [SessionNotFoundError, FormAlreadySettledError, FormNotFoundError],
       })

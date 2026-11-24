@@ -106,7 +106,7 @@ describe("ShellParse commands behind a prefix", () => {
     expect(await resources(nest(4))).toContain("kubectl get pods")
     expect(await Effect.runPromise(Effect.result(ShellParse.scan(nest(5), "/bin/bash", "/workspace")))).toMatchObject({
       _tag: "Failure",
-      failure: { message: "Shell command nests scripts more than 4 levels deep" },
+      failure: { message: "Portable shell scanner cannot analyze command: nests scripts more than 4 levels deep" },
     })
   })
 

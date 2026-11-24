@@ -5,7 +5,11 @@ import { and, desc, eq, inArray, sql } from "drizzle-orm"
 import { Cause, Effect, Exit, FiberMap, Layer } from "effect"
 import { Database } from "../../database/database.js"
 import { Bus } from "../../bus.js"
+import { Environment } from "../../environment/index.js"
+import { Flag } from "../../flag.js"
 import { LocationLifecycle } from "../../location-lifecycle.js"
+import { Machines } from "../../machine/machines.js"
+import { SessionCwd } from "../cwd.js"
 import { InstructionState } from "../instruction-state.js"
 import { SessionCompaction } from "../compaction.js"
 import { SessionContext } from "../context.js"
@@ -60,8 +64,10 @@ const layer = Layer.effect(
     const jobs = yield* Job.Service
     const title = yield* SessionTitle.Service
     const steps = yield* SessionStep.make
+    const cwd = yield* SessionCwd.make
     const gate = yield* CacheGate.make
-    const attempt = CacheGate.refusing(steps.attempt)
+    // The Step attempts, where a thinking block the provider refused fails as stale thinking.
+    const gated = { attempt: CacheGate.refusing(steps.attempt) }
     const pty = yield* PersistentPty.Service
     // Title generation starts once input is visible and must not delay model execution.
     const titles = yield* FiberMap.make<SessionSchema.ID, void, never>()
@@ -323,40 +329,43 @@ const layer = Layer.effect(
           initial = loaded as SessionContext.Loaded
           continue
         }
-        const outcome = yield* attempt({
-          isLocationClosed: lifecycle.isClosed,
-          interruption,
-          handoffPrepared: pty.handoffPrepared,
-          sessionID,
-          assistantMessageID,
-          agent: loaded.agent.id,
-          model: loaded.model,
-          prepared: {
-            ...prepared,
-            // A tool call can arrive during a reload; its permission check reads the session's agent.
-            executeTool: (call) => plugins.awaitActivation.pipe(Effect.andThen(prepared.executeTool(call))),
-          },
-          retryAttempt,
-          retry: (cause, error, proposed) =>
-            retry.decide({
-              cause,
-              error,
-              agent: loaded.agent.id,
-              model: loaded.model.ref,
-              hook: prepared.retry,
-              // A thinking block the provider refused needs the user's consent, not a retry.
-              retry: proposed && !CacheLedger.isThinkingRefusal(error.message),
-            }),
-          recoverContinuation,
-          recoverOverflow: Effect.suspend(() =>
-            recoverOverflow
-              ? compaction
-                  .compact({ reason: "overflow", context: loaded, estimate })
-                  .pipe(Effect.map((result) => result.status === "completed"))
-              : Effect.succeed(false),
-          ),
-          reportDeclined,
-        })
+        const activeCwd = yield* cwd.current(sessionID)
+        const outcome = yield* gated
+          .attempt({
+            isLocationClosed: lifecycle.isClosed,
+            interruption,
+            handoffPrepared: pty.handoffPrepared,
+            sessionID,
+            assistantMessageID,
+            agent: loaded.agent.id,
+            model: loaded.model,
+            prepared: {
+              ...prepared,
+              // A tool call can arrive during a reload; its permission check reads the session's agent.
+              executeTool: (call) => plugins.awaitActivation.pipe(Effect.andThen(prepared.executeTool(call))),
+            },
+            retryAttempt,
+            retry: (cause, error, proposed) =>
+              retry.decide({
+                cause,
+                error,
+                agent: loaded.agent.id,
+                model: loaded.model.ref,
+                hook: prepared.retry,
+                // A thinking block the provider refused needs the user's consent, not a retry.
+                retry: proposed && !CacheLedger.isThinkingRefusal(error.message),
+              }),
+            recoverContinuation,
+            reportDeclined,
+            recoverOverflow: Effect.suspend(() =>
+              recoverOverflow
+                ? compaction
+                    .compact({ reason: "overflow", context: loaded, estimate })
+                    .pipe(Effect.map((result) => result.status === "completed"))
+                : Effect.succeed(false),
+            ),
+          })
+          .pipe(Effect.provideService(Environment.CurrentWorkingDirectory, activeCwd))
         retryAttempt = undefined
         const completed = yield* SessionStep.Outcome.$match(outcome, {
           Completed: Effect.fnUntraced(function* (outcome) {
@@ -487,7 +496,10 @@ export const node = makeLocationNode({
   layer,
   deps: [
     Bus.node,
+    Environment.node,
+    Flag.node,
     LocationLifecycle.node,
+    Machines.node,
     llmClient,
     SessionContext.node,
     SessionModelTransport.node,

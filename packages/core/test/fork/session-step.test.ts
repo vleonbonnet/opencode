@@ -12,6 +12,7 @@ import { Project } from "@opencode/core/project"
 import { ProjectTable } from "@opencode/core/project/sql"
 import { AbsolutePath } from "@opencode/core/schema"
 import { Session } from "@opencode/core/session"
+import { SessionHistory } from "@opencode/core/session/history"
 import { SessionMessage } from "@opencode/core/session/message"
 import type { SessionModelRequest } from "@opencode/core/session/model-request"
 import { SessionProjector } from "@opencode/core/session/projector"
@@ -96,11 +97,10 @@ const failedToolCall = (executeTool: SessionModelRequest.Prepared["executeTool"]
         recoverOverflow: Effect.succeed(false),
       })
       .pipe(Effect.exit)
-    const stored = yield* db
-      .select()
-      .from(SessionMessageTable)
-      .where(eq(SessionMessageTable.id, assistantMessageID))
-      .get()
+    const [stored] = yield* SessionHistory.withParts(
+      db,
+      yield* db.select().from(SessionMessageTable).where(eq(SessionMessageTable.id, assistantMessageID)).all(),
+    )
     const tool = stored && "content" in stored.data ? stored.data.content[0] : undefined
     expect(tool).toMatchObject({ type: "tool", state: { status: "error" } })
     return tool?.type === "tool" && tool.state.status === "error" ? tool.state.error : undefined

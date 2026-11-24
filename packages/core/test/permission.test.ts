@@ -99,6 +99,56 @@ function waitForRequest(input: Partial<Permission.AssertInput> = {}) {
   })
 }
 
+describe("Permission.isActionDenied", () => {
+  const rule = (action: string, resource: string, effect: Permission.Rule["effect"]): Permission.Rule => ({
+    action,
+    resource,
+    effect,
+  })
+
+  test("never reports an action as denied when evaluate leaves a resource reachable", () => {
+    const cases = [
+      { action: "skill", witness: "any", rulesets: [[]] },
+      { action: "bash", witness: "abc", rulesets: [[rule("bash", "?", "deny")]] },
+      {
+        action: "skill",
+        witness: "browser",
+        rulesets: [[rule("skill", "*", "deny"), rule("skill", "browser", "ask")]],
+      },
+      {
+        action: "bash",
+        witness: "abcde",
+        rulesets: [[rule("bash", "*", "deny"), rule("bash", "ab*", "allow"), rule("bash", "ab?", "deny")]],
+      },
+      {
+        action: "skill",
+        witness: "browser",
+        rulesets: [[rule("skill", "*", "deny"), rule("skill", "browser", "deny")], [rule("skill", "browser", "allow")]],
+      },
+    ]
+
+    for (const item of cases) {
+      expect(Permission.evaluate(item.action, item.witness, ...item.rulesets).effect).not.toBe("deny")
+      expect(Permission.isActionDenied(item.action, ...item.rulesets)).toBe(false)
+    }
+  })
+
+  test("reports an action as denied when a blanket deny is only followed by narrow denies", () => {
+    const cases = [
+      {
+        action: "skill",
+        rules: [rule("skill", "*", "deny"), rule("browser", "*", "deny"), rule("skill", "browser", "deny")],
+      },
+      { action: "shell", rules: [rule("*", "*", "deny"), rule("shell", "git *", "deny")] },
+      { action: "skill", rules: [rule("skill", "browser", "allow"), rule("skill", "*", "deny")] },
+    ]
+
+    for (const item of cases) {
+      expect(Permission.isActionDenied(item.action, item.rules)).toBe(true)
+    }
+  })
+})
+
 describe("Permission", () => {
   it.effect("returns the evaluated effect and only queues prompts", () =>
     Effect.gen(function* () {
@@ -182,6 +232,31 @@ describe("Permission", () => {
     expect(Permission.evaluate("external_directory", "C:/Users/x/other/*", rules).effect).toBe("ask")
   })
 
+  test("matches machine paths with the same rules as local paths", () => {
+    const allow = (resource: string): Permission.Ruleset => [{ action: "read", resource, effect: "allow" }]
+    const files = process.platform === "darwin" || process.platform === "win32"
+    expect(Permission.evaluate("read", "gpu:/work/a", allow("*")).effect).toBe("allow")
+    expect(Permission.evaluate("read", "gpu:/work/a", allow("**/work/*")).effect).toBe("allow")
+    expect(Permission.evaluate("read", "gpu:/work/a", allow("gpu:/work/*")).effect).toBe("allow")
+    expect(Permission.evaluate("read", "gpu:/work/a", allow("gpu:*")).effect).toBe("allow")
+    expect(Permission.evaluate("read", "cpu:/work/a", allow("gpu:/work/*")).effect).toBe("ask")
+    expect(Permission.evaluate("read", "/work/a", allow("gpu:/work/*")).effect).toBe("ask")
+    // The machine's name follows the same letter-case rule as the rest of a file rule.
+    expect(Permission.evaluate("read", "gpu:/work/a", allow("GPU:/work/*")).effect).toBe(files ? "allow" : "ask")
+    // A bare deny still reaches every machine.
+    expect(Permission.evaluate("edit", "gpu:/work/a", [{ action: "*", resource: "*", effect: "deny" }]).effect).toBe(
+      "deny",
+    )
+    // Local paths, drive letters included, match as before, and resources that are not files are untouched.
+    expect(Permission.evaluate("read", "/work/a", allow("*")).effect).toBe("allow")
+    expect(Permission.evaluate("read", "C:/work/a", allow("*")).effect).toBe("allow")
+    expect(Permission.evaluate("read", "C:\\work\\a", allow("C:/work/*")).effect).toBe("allow")
+    expect(Permission.evaluate("read", "C:/work/a", allow("**/work/*")).effect).toBe("allow")
+    expect(
+      Permission.evaluate("shell", "gpu:/bin/x", [{ action: "shell", resource: "*", effect: "allow" }]).effect,
+    ).toBe("allow")
+  })
+
   test("matches file rules without case where file systems ignore it by default", () => {
     const rules: Permission.Ruleset = [
       { action: "*", resource: "*", effect: "allow" },
@@ -199,6 +274,92 @@ describe("Permission", () => {
     expect(Wildcard.match(".OPENCODE/x", ".opencode/*", true)).toBe(true)
     expect(Wildcard.match(".OPENCODE/x", ".opencode/*")).toBe(process.platform === "win32")
   })
+
+  for (const action of ["read", "edit", "external_directory"]) {
+    it.effect(`asks for machine-specific ${action} rules`, () =>
+      Effect.gen(function* () {
+        yield* setup([
+          ...Agent.Info.default(Agent.ID.make("test")).permissions,
+          { action, resource: "gpu:*", effect: "ask" },
+        ])
+        const { service, fiber, request } = yield* waitForRequest({ action, resources: ["gpu:/work/a"] })
+        expect(request.resources).toEqual(["gpu:/work/a"])
+        expect(yield* service.list()).toHaveLength(1)
+        yield* service.reply({ requestID: request.id, reply: "once" })
+        yield* Fiber.join(fiber)
+      }),
+    )
+
+    it.effect(`refuses machine-specific ${action} rules`, () =>
+      Effect.gen(function* () {
+        yield* setup([
+          ...Agent.Info.default(Agent.ID.make("test")).permissions,
+          { action, resource: "gpu:*", effect: "deny" },
+        ])
+        const service = yield* Permission.Service
+        expect(
+          yield* service.assert(assertion({ action, resources: ["gpu:/work/a"] })).pipe(Effect.flip),
+        ).toBeInstanceOf(Permission.BlockedError)
+        expect(yield* service.list()).toEqual([])
+      }),
+    )
+  }
+
+  it.effect("applies default environment-file exceptions equally to local and machine paths", () =>
+    Effect.gen(function* () {
+      yield* setup(Agent.Info.default(Agent.ID.make("test")).permissions)
+      const service = yield* Permission.Service
+      for (const prefix of ["", "gpu:/work/"]) {
+        expect(yield* service.ask(assertion({ resources: [`${prefix}.env.production`] }))).toMatchObject({
+          effect: "ask",
+        })
+        yield* service.reply({ requestID: Permission.ID.create("per_test"), reply: "once" })
+        expect(yield* service.ask(assertion({ resources: [`${prefix}.env.example`] }))).toMatchObject({
+          effect: "allow",
+        })
+      }
+      expect(yield* service.list()).toEqual([])
+    }),
+  )
+
+  for (const [action, resource] of [
+    ["edit", "gpu:/work/a"],
+    ["shell", "pwd"],
+  ])
+    it.effect(`preserves global ${action} asks and denies`, () =>
+      Effect.gen(function* () {
+        yield* setup([
+          ...Agent.Info.default(Agent.ID.make("test")).permissions,
+          { action, resource: "*", effect: "ask" },
+        ])
+        const { service, fiber, request } = yield* waitForRequest({ action, resources: [resource] })
+        expect(request.action).toBe(action)
+        yield* service.reply({ requestID: request.id, reply: "once" })
+        yield* Fiber.join(fiber)
+        yield* setRules([{ action, resource: "*", effect: "deny" }])
+        expect(yield* service.assert(assertion({ action, resources: [resource] })).pipe(Effect.flip)).toBeInstanceOf(
+          Permission.BlockedError,
+        )
+      }),
+    )
+
+  it.effect("applies saved broad approvals to machine paths with normal configured deny precedence", () =>
+    Effect.gen(function* () {
+      yield* setup([{ action: "read", resource: "gpu:*", effect: "ask" }])
+      const saved = yield* PermissionSaved.Service
+      yield* saved.add({
+        projectID: Project.ID.global,
+        sessionID: Session.ID.make("ses_test"),
+        action: "read",
+        resources: ["*"],
+      })
+      const service = yield* Permission.Service
+      expect(yield* service.ask(assertion({ resources: ["gpu:/work/a"] }))).toMatchObject({ effect: "allow" })
+      yield* setRules([{ action: "read", resource: "gpu:*", effect: "deny" }])
+      expect(yield* service.ask(assertion({ resources: ["gpu:/work/a"] }))).toMatchObject({ effect: "deny" })
+      expect(yield* service.list()).toEqual([])
+    }),
+  )
 
   it.effect("allows managed output reads without granting external directory access", () =>
     Effect.gen(function* () {

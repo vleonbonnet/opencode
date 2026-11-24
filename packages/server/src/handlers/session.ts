@@ -191,12 +191,16 @@ export const SessionHandler = HttpApiBuilder.group(Api, "server.session", (handl
             })
             .pipe(
               Effect.catchTag(
-                "SessionSearch.InvalidCursorError",
+                "SessionSearchService.InvalidCursorError",
                 (error) => new InvalidCursorError({ message: error.message }),
               ),
               Effect.catchTag(
-                "SessionSearch.InvalidQueryError",
+                "SessionSearchService.InvalidQueryError",
                 (error) => new InvalidRequestError({ message: error.message, field: "q" }),
+              ),
+              Effect.catchTag(
+                "SessionSearchService.IndexUnavailableError",
+                (error) => new ServiceUnavailableError({ message: error.message, service: "session search" }),
               ),
             )
         }),
@@ -216,12 +220,16 @@ export const SessionHandler = HttpApiBuilder.group(Api, "server.session", (handl
             })
             .pipe(
               Effect.catchTag(
-                "SessionSearch.InvalidCursorError",
+                "SessionSearchService.InvalidCursorError",
                 (error) => new InvalidCursorError({ message: error.message }),
               ),
               Effect.catchTag(
-                "SessionSearch.InvalidQueryError",
+                "SessionSearchService.InvalidQueryError",
                 (error) => new InvalidRequestError({ message: error.message, field: "q" }),
+              ),
+              Effect.catchTag(
+                "SessionSearchService.IndexUnavailableError",
+                (error) => new ServiceUnavailableError({ message: error.message, service: "session search" }),
               ),
             )
         }),

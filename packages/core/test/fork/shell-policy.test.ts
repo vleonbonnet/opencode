@@ -115,6 +115,19 @@ describe("ShellPolicy refuses what it cannot read", () => {
     const decided = await decide(command)
     expect(decided.effect).toBe("deny")
     expect(decided.reason).toStartWith("Portable shell scanner cannot analyze command")
+    expect(decided.reason).toContain("A shell deny rule is configured")
+  })
+
+  // Without a shell deny rule, the shell tool asks for the whole command, which a rule allowing it settles.
+  test.each([
+    ["allows it under a rule allowing every command", [rule("*", "allow")], "allow"],
+    ["asks under a rule asking for every command", [rule("*", "ask")], "ask"],
+    ["asks when no rule decides it", [], "ask"],
+  ] as const)("%s", async (_, given, effect) => {
+    const command = 'eval "$(cat script)"'
+    const decided = await ShellPolicy.decide({ command, shell: "/bin/bash", cwd: "/workspace", rules: [...given] })
+    expect(decided.effect).toBe(effect)
+    if (effect === "ask") expect(decided.resource).toBe(command)
   })
 })
 

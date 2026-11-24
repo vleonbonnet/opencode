@@ -396,7 +396,8 @@ const layer = Layer.effect(
         .where(and(eq(SessionMessageTable.session_id, sessionID), eq(SessionMessageTable.type, "assistant")))
         .all()
         .pipe(Effect.orDie)
-      return yield* Effect.forEach(rows, (row) =>
+      // Assistant parts live in session_part rows, apart from the message row.
+      return yield* Effect.forEach(yield* SessionHistory.withParts(db, rows), (row) =>
         SessionHistory.decodeMessageRow(row).pipe(Effect.orElseSucceed(() => undefined)),
       ).pipe(Effect.map((messages) => messages.filter((message) => message !== undefined)))
     })
@@ -410,7 +411,8 @@ const layer = Layer.effect(
         .get()
         .pipe(Effect.orDie)
       if (!row) return []
-      const message = yield* SessionHistory.decodeMessageRow(row).pipe(Effect.orElseSucceed(() => undefined))
+      const [stored] = yield* SessionHistory.withParts(db, [row])
+      const message = yield* SessionHistory.decodeMessageRow(stored).pipe(Effect.orElseSucceed(() => undefined))
       if (message?.type !== "assistant") return []
       return message.content.flatMap((item) => {
         const signature = item.type === "reasoning" ? reasoningSignature(item) : undefined

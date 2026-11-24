@@ -1,5 +1,6 @@
 export * as McpRetry from "./retry.js"
 
+import { SdkError, SdkErrorCode, SdkHttpError } from "@modelcontextprotocol/client"
 import { Duration, Effect, Fiber, type Scope } from "effect"
 
 // How long each retry of a connection that failed or closed waits, counted from the failure before it. After the
@@ -126,4 +127,14 @@ export const make = (input: {
       return running !== undefined
     },
   }
+}
+
+/**
+ * The server refused these credentials or this client's access, so it refuses every retry the same way until the
+ * config or the credentials change. A failed auto probe wraps the error it hit.
+ */
+export function refused(error: unknown): boolean {
+  if (error instanceof SdkError && error.code === SdkErrorCode.EraNegotiationFailed && error.cause !== undefined)
+    return refused(error.cause)
+  return error instanceof SdkHttpError && (error.status === 401 || error.status === 403)
 }

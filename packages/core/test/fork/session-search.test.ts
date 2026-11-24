@@ -1,5 +1,4 @@
 import { describe, expect, test } from "bun:test"
-import path from "path"
 import { DateTime, Effect, Exit, Schema } from "effect"
 import { eq, sql } from "drizzle-orm"
 import { Agent } from "@opencode/core/agent"
@@ -16,16 +15,16 @@ import { SessionEvent } from "@opencode/core/session/event"
 import { SessionInbox } from "@opencode/core/session/inbox"
 import { SessionMessage } from "@opencode/core/session/message"
 import { SessionProjector } from "@opencode/core/session/projector"
-import { SessionSearchDDL } from "@opencode/core/session/search/ddl"
+import { SessionSearchBuild } from "@opencode/core/session/search-build"
+import { SessionSearchIndex } from "@opencode/core/session/search-index"
 import { SessionSearchQuery } from "@opencode/core/session/search/query"
 import { SessionSearchService } from "@opencode/core/session/search/service"
-import { SessionSearchBackfillTable, SessionSearchTable } from "@opencode/core/session/search/sql"
 import { SessionMessageTable, SessionPartTable, SessionTable } from "@opencode/core/session/sql"
 import { SessionStore } from "@opencode/core/session/store"
 import { SessionStored } from "@opencode/core/session/stored"
+import { Money } from "@opencode/schema/money"
 import { SessionSearch } from "@opencode/schema/session-search"
 import { LayerNode } from "@opencode/util/effect/layer-node"
-import { tmpdirScoped } from "../fixture/tmpdir"
 import { testEffect } from "../lib/effect"
 
 const it = testEffect(
@@ -36,6 +35,7 @@ const it = testEffect(
       SessionProjector.node,
       SessionInbox.node,
       SessionStore.node,
+      SessionSearchBuild.node,
       SessionSearchService.node,
     ]),
     [Bus.node.replace(Bus.configured({ persist: true }))],
@@ -82,7 +82,8 @@ const assistantRow = (
       agent: Agent.defaultID,
       model,
       content,
-      time: { created: DateTime.makeUnsafe(created) },
+      // The index holds an assistant message once it is finished.
+      time: { created: DateTime.makeUnsafe(created), completed: DateTime.makeUnsafe(created) },
     }),
   )
   return { id: SessionMessage.ID.make(id), session_id: session, type, seq, time_created: created, data }
@@ -128,6 +129,8 @@ describe("SessionSearchQuery", () => {
       SessionSearchQuery.expression(SessionSearchQuery.terms('foo AND bar OR NOT "x" NEAR(a b) col:y ^z -w')),
     ).toBe('"foo" "AND" "bar" "OR" "NOT" "x" "NEAR(a" "b)" "col:y" "^z" "-w"')
     expect(SessionSearchQuery.expression(SessionSearchQuery.terms('say "hi"" there'))).toBe('"say" "hi" "there"')
+    // Folded as the index folds its text.
+    expect(SessionSearchQuery.anyOf(SessionSearchQuery.terms("Straße đơn*"))).toBe('"Strasse" OR "dơn"*')
   })
 
   test("reads phrases, prefixes and drops terms without letters or digits", () => {
@@ -185,7 +188,7 @@ describe("SessionSearchQuery", () => {
   })
 
   test("makes snippets one bounded line with located matches", () => {
-    const { MARK_START: s, MARK_END: e } = SessionSearchDDL
+    const { MARK_START: s, MARK_END: e } = SessionSearchQuery
     expect(SessionSearchQuery.snippet(`…the  ${s}quick${e}\n\n brown ${s}fox${e} jumps…`)).toEqual({
       text: "…the quick brown fox jumps…",
       matches: [
@@ -207,13 +210,13 @@ describe("SessionSearchQuery", () => {
 })
 
 describe("SessionSearch", () => {
-  it.effect("indexes user prompts and assistant text, not tool calls, tool output or reasoning", () =>
+  it.effect("indexes user prompts and finished assistant text, not tool calls, tool output or reasoning", () =>
     Effect.gen(function* () {
       const db = yield* seed
       yield* db
         .insert(SessionMessageTable)
         .values([
-          userRow(sessionID, "msg_a1", 1, "Please migrate the database"),
+          userRow(sessionID, "msg_a1", 1, "Please move the database"),
           assistantRow(sessionID, "msg_a2", 2, [
             { type: "reasoning", text: "pondering quietly" },
             text("I will migrate it now."),
@@ -232,18 +235,13 @@ describe("SessionSearch", () => {
           ]),
         ])
         .run()
-      expect((yield* ids("migrate")).toSorted()).toEqual(["msg_a1", "msg_a2"])
+      expect((yield* ids("database")).toSorted()).toEqual(["msg_a1"])
       expect(yield* ids("pondering")).toEqual([])
       expect(yield* ids("toolinput")).toEqual([])
       expect(yield* ids("tooloutput")).toEqual([])
-      const row = yield* db
-        .select({ text: SessionSearchTable.text, role: SessionSearchTable.role })
-        .from(SessionSearchTable)
-        .where(eq(SessionSearchTable.message_id, SessionMessage.ID.make("msg_a2")))
-        .get()
-      expect(row).toEqual({ text: "I will migrate it now.\n\nDone migrating.", role: "assistant" })
       const result = yield* search("migrating")
       expect(result.index).toEqual({ complete: true })
+      // English inflections match as the index's tokenizer reads them: "migrating" finds "migrate".
       expect(result.data).toEqual([
         {
           sessionID,
@@ -251,7 +249,13 @@ describe("SessionSearch", () => {
           messageID: SessionMessage.ID.make("msg_a2"),
           role: "assistant",
           time: { created: DateTime.makeUnsafe(2) },
-          snippet: { text: "I will migrate it now. Done migrating.", matches: [{ start: 28, end: 37 }] },
+          snippet: {
+            text: "I will migrate it now. Done migrating.",
+            matches: [
+              { start: 7, end: 14 },
+              { start: 28, end: 37 },
+            ],
+          },
         },
       ])
     }),
@@ -280,12 +284,20 @@ describe("SessionSearch", () => {
       yield* bus.publish(SessionEvent.Reasoning.Started, { sessionID, assistantMessageID, ordinal: 0 })
       yield* bus.publish(SessionEvent.Reasoning.Ended, { sessionID, assistantMessageID, ordinal: 0, text: "giraffe" })
       yield* bus.publish(SessionEvent.Text.Started, { sessionID, assistantMessageID, ordinal: 1 })
-      expect(yield* ids("giraffe")).toEqual([])
       yield* bus.publish(SessionEvent.Text.Ended, {
         sessionID,
         assistantMessageID,
         ordinal: 1,
         text: "The zebra is striped",
+      })
+      // A streaming reply is indexed once its Step ends.
+      expect(yield* ids("striped")).toEqual([])
+      yield* bus.publish(SessionEvent.Step.Ended, {
+        sessionID,
+        assistantMessageID,
+        finish: "stop",
+        cost: Money.USD.make(0),
+        tokens: { input: 1, output: 1, reasoning: 0, cache: { read: 0, write: 0 } },
       })
       expect(yield* ids("striped")).toEqual(["msg_reply"])
       expect(yield* ids("giraffe")).toEqual([])
@@ -304,7 +316,7 @@ describe("SessionSearch", () => {
     }),
   )
 
-  it.effect("indexes text parts stored in session_part and drops a message once it has no text", () =>
+  it.effect("reads text parts stored in session_part and drops a message once it has no text", () =>
     Effect.gen(function* () {
       const db = yield* seed
       yield* db
@@ -326,7 +338,10 @@ describe("SessionSearch", () => {
         .values([part(0, "alpha part"), part(1, "beta part")])
         .run()
       expect(yield* ids("alpha")).toEqual(["msg_parts"])
-      expect(yield* ids("beta")).toEqual(["msg_parts"])
+      const beta = yield* search("beta")
+      expect(beta.data.map((match) => match.snippet)).toEqual([
+        { text: "alpha part beta part", matches: [{ start: 11, end: 15 }] },
+      ])
       yield* db
         .update(SessionPartTable)
         .set({ data: { type: "text", text: "gamma part" } })
@@ -336,7 +351,6 @@ describe("SessionSearch", () => {
       expect(yield* ids("gamma")).toEqual(["msg_parts"])
       yield* db.delete(SessionPartTable).run()
       expect(yield* ids("part")).toEqual([])
-      expect(yield* db.select().from(SessionSearchTable).all()).toEqual([])
     }),
   )
 
@@ -350,11 +364,6 @@ describe("SessionSearch", () => {
       expect(yield* ids("ephemeral")).toHaveLength(2)
       yield* db.delete(SessionTable).where(eq(SessionTable.id, sessionID)).run()
       expect(yield* ids("ephemeral")).toEqual(["msg_d2"])
-      expect(yield* db.select({ id: SessionSearchTable.message_id }).from(SessionSearchTable).all()).toEqual([
-        { id: SessionMessage.ID.make("msg_d2") },
-      ])
-      // Fails when the FTS index and its content table disagree.
-      yield* db.run(sql`INSERT INTO session_search_fts (session_search_fts, rank) VALUES ('integrity-check', 1)`)
     }),
   )
 
@@ -384,9 +393,33 @@ describe("SessionSearch", () => {
       expect(third.cursor.next).toBeUndefined()
 
       const invalid = yield* Effect.exit(search("kiwi", { cursor: "not-a-cursor" as SessionSearch.Cursor }))
-      expect(Exit.isFailure(invalid) && JSON.stringify(invalid.cause)).toContain("SessionSearch.InvalidCursorError")
+      expect(Exit.isFailure(invalid) && JSON.stringify(invalid.cause)).toContain(
+        "SessionSearchService.InvalidCursorError",
+      )
       // Limits are clamped to what one page may return.
       expect((yield* search("kiwi", { limit: 10_000 })).data).toHaveLength(5)
+    }),
+  )
+
+  it.effect("searches messages only, not titles or compaction summaries", () =>
+    Effect.gen(function* () {
+      const db = yield* seed
+      yield* db.update(SessionTable).set({ title: "Pelican plans" }).where(eq(SessionTable.id, sessionID)).run()
+      yield* db
+        .insert(SessionMessageTable)
+        .values({
+          id: SessionMessage.ID.make("msg_c1"),
+          session_id: sessionID,
+          type: "compaction",
+          seq: 1,
+          time_created: 1,
+          data: { status: "completed", summary: "pelican summary", reason: "manual", time: { created: 1 } },
+        } as typeof SessionMessageTable.$inferInsert)
+        .run()
+      expect(yield* ids("pelican")).toEqual([])
+      expect(
+        (yield* SessionSearchService.Service.use((service) => service.searchSessions({ query: "pelican" }))).data,
+      ).toEqual([])
     }),
   )
 
@@ -427,7 +460,7 @@ describe("SessionSearch", () => {
     }),
   )
 
-  it.effect("matches phrases, prefixes and accents, and refuses too many terms", () =>
+  it.effect("matches phrases, prefixes, accents and folded letters, and refuses too many terms", () =>
     Effect.gen(function* () {
       const db = yield* seed
       yield* db
@@ -437,6 +470,7 @@ describe("SessionSearch", () => {
           userRow(sessionID, "msg_q2", 2, "smoke the service"),
           userRow(sessionID, "msg_q3", 3, "Le café est prêt"),
           userRow(sessionID, "msg_q4", 4, "the session_search table"),
+          userRow(sessionID, "msg_q5", 5, "Die Straße in Łódź"),
         ])
         .run()
       expect(yield* ids('"service smoke"')).toEqual(["msg_q1"])
@@ -445,10 +479,24 @@ describe("SessionSearch", () => {
       expect(yield* ids("cafe pret")).toEqual(["msg_q3"])
       expect(yield* ids("session_search")).toEqual(["msg_q4"])
       expect(yield* ids('NEAR(smoke "  OR * ^')).toEqual([])
+      // Letters the index folds match their ASCII spellings, and the snippet marks them as written.
+      const folded = yield* search("strasse lodz")
+      expect(folded.data.map((match) => match.snippet)).toEqual([
+        {
+          text: "Die Straße in Łódź",
+          matches: [
+            { start: 4, end: 10 },
+            { start: 14, end: 18 },
+          ],
+        },
+      ])
+      expect((yield* search("Straße")).data.map((match) => match.messageID as string)).toEqual(["msg_q5"])
       const result = yield* search("?!")
       expect(result.data).toEqual([])
       const tooMany = yield* Effect.exit(search(Array.from({ length: 33 }, (_, i) => `w${i}`).join(" ")))
-      expect(Exit.isFailure(tooMany) && JSON.stringify(tooMany.cause)).toContain("SessionSearch.InvalidQueryError")
+      expect(Exit.isFailure(tooMany) && JSON.stringify(tooMany.cause)).toContain(
+        "SessionSearchService.InvalidQueryError",
+      )
     }),
   )
 
@@ -492,7 +540,9 @@ describe("SessionSearch", () => {
       expect(yield* sorted("-aiur", { archived: true })).toEqual([])
       expect((yield* searchSessions(" ?! ")).data).toEqual([])
       const tooMany = yield* Effect.exit(searchSessions(Array.from({ length: 33 }, (_, i) => `-w${i}`).join(" ")))
-      expect(Exit.isFailure(tooMany) && JSON.stringify(tooMany.cause)).toContain("SessionSearch.InvalidQueryError")
+      expect(Exit.isFailure(tooMany) && JSON.stringify(tooMany.cause)).toContain(
+        "SessionSearchService.InvalidQueryError",
+      )
     }),
   )
 
@@ -539,90 +589,60 @@ describe("SessionSearch", () => {
       expect(second.data[0]!.message?.messageID).toBe(SessionMessage.ID.make("msg_v4"))
       expect(second.cursor.next).toBeUndefined()
       const invalid = yield* Effect.exit(searchSessions("kiwi", { cursor: "bogus" as SessionSearch.Cursor }))
-      expect(Exit.isFailure(invalid) && JSON.stringify(invalid.cause)).toContain("SessionSearch.InvalidCursorError")
+      expect(Exit.isFailure(invalid) && JSON.stringify(invalid.cause)).toContain(
+        "SessionSearchService.InvalidCursorError",
+      )
     }),
   )
 
-  it.effect("backfills existing messages step by step and reports progress meanwhile", () =>
+  it.effect("fails as unavailable without an index", () =>
+    Effect.gen(function* () {
+      yield* seed
+      const db = (yield* Database.Service).db
+      yield* dropIndex(db)
+      expect((yield* Effect.flip(search("kiwi")))._tag).toBe("SessionSearchService.IndexUnavailableError")
+      expect((yield* Effect.flip(searchSessions("kiwi")))._tag).toBe("SessionSearchService.IndexUnavailableError")
+    }),
+  )
+
+  // Live: the build pauses between chunks.
+  it.live("finds history once the build has indexed it, and reports progress meanwhile", () =>
     Effect.gen(function* () {
       const db = yield* seed
-      const rows = Array.from({ length: SessionSearchService.BACKFILL_STEP + 10 }, (_, i) =>
-        i % 2 === 0
-          ? userRow(sessionID, `msg_b${String(i).padStart(4, "0")}`, i, `papaya number ${i}`)
-          : assistantRow(sessionID, `msg_b${String(i).padStart(4, "0")}`, i, i % 3 === 0 ? [] : [text(`papaya ${i}`)]),
+      // As if written before the index existed: rows its triggers never saw.
+      yield* dropIndex(db)
+      const rows = Array.from({ length: SessionSearchIndex.ChunkLimit + 10 }, (_, i) =>
+        userRow(sessionID, `msg_b${String(i).padStart(4, "0")}`, i, `papaya number ${i}`),
       )
-      // As if written by a release without the index: rows the triggers never saw.
-      yield* db.run(sql`DROP TRIGGER session_search_message_insert`)
       yield* db.insert(SessionMessageTable).values(rows).run()
-      yield* SessionSearchDDL.install((statement) => db.run(statement))
-      yield* db.run(SessionSearchDDL.seedBackfill(1))
-      expect(yield* ids("papaya")).toEqual([])
+      const ensured = yield* SessionSearchIndex.ensure(db)
+      expect(ensured.status).toBe("ready")
       const pending = yield* search("papaya")
-      expect(pending.index).toEqual({ complete: false, processed: 0, total: rows.length })
+      expect(pending.data).toEqual([])
+      // The two sessions and every message existed when the index was created.
+      expect(pending.index).toEqual({ complete: false, processed: 0, total: rows.length + 2 })
+      yield* SessionSearchIndex.buildChunk(db)
+      expect((yield* search("papaya")).index).toMatchObject({ complete: false })
 
-      const service = yield* SessionSearchService.Service
-      // One step by hand, as the background loop does.
-      for (const statement of SessionSearchDDL.backfillStep(SessionSearchService.BACKFILL_STEP))
-        yield* db.run(statement)
-      const partial = yield* search("papaya", { limit: 100 })
-      expect(partial.index).toEqual({
-        complete: false,
-        processed: SessionSearchService.BACKFILL_STEP,
-        total: rows.length,
-      })
-      expect(partial.data.length).toBeGreaterThan(0)
-
-      yield* service.backfill
-      expect(yield* service.index).toEqual({ complete: true })
-      expect(yield* db.select().from(SessionSearchBackfillTable).all()).toEqual([])
-      const indexed = rows.filter((_, i) => i % 2 === 0 || i % 3 !== 0).length
-      expect(yield* db.get(sql`SELECT count(*) AS n FROM ${SessionSearchTable}`)).toEqual({ n: indexed })
-      expect((yield* search("papaya", { limit: 100 })).data).toHaveLength(Math.min(indexed, 100))
-      // A finished backfill does nothing more.
-      yield* service.backfill
+      // The service started the build, which the server process runs.
+      const build = yield* SessionSearchBuild.Service
+      yield* build.run
+      const done = yield* search("papaya", { limit: 100 })
+      expect(done.index).toEqual({ complete: true })
+      expect(done.data).toHaveLength(rows.length)
     }),
   )
-
-  // Outside the shared test layer, whose already built services each layer below would otherwise reuse.
-  test("puts back missing triggers at start and indexes everything again", () =>
-    Effect.gen(function* () {
-      const file = path.join((yield* tmpdirScoped("opencode-search-")).path, "search.sqlite")
-      // A fresh layer each time: each one opens the database and starts the service as a server start does.
-      const layer = () =>
-        AppNodeBuilder.build(LayerNode.group([Database.node, SessionSearchService.node]), [
-          Database.node.replace(Database.configured({ path: file })),
-        ])
-      yield* Effect.gen(function* () {
-        const db = yield* seed
-        // As a rebuild of session_message by a later migration would: its triggers are gone.
-        yield* db.run(sql`DROP TRIGGER session_search_message_insert`)
-        yield* db.run(sql`DROP TRIGGER session_search_message_delete`)
-        yield* db
-          .insert(SessionMessageTable)
-          .values([userRow(sessionID, "msg_s1", 1, "unseen lychee")])
-          .run()
-        yield* db
-          .insert(SessionMessageTable)
-          .values([userRow(sessionID, "msg_s2", 2, "stale lychee")])
-          .run()
-        yield* db.run(SessionSearchDDL.upsert("message_id = 'msg_s2'"))
-        yield* db
-          .delete(SessionMessageTable)
-          .where(eq(SessionMessageTable.id, SessionMessage.ID.make("msg_s2")))
-          .run()
-        expect(yield* db.select({ id: SessionSearchTable.message_id }).from(SessionSearchTable).all()).toEqual([
-          { id: SessionMessage.ID.make("msg_s2") },
-        ])
-      }).pipe(Effect.provide(layer()))
-      yield* Effect.gen(function* () {
-        const db = (yield* Database.Service).db
-        const service = yield* SessionSearchService.Service
-        const triggers = yield* db.all<{ name: string }>(
-          sql`SELECT name FROM sqlite_master WHERE type = 'trigger' AND name LIKE 'session_search_%' ORDER BY name`,
-        )
-        expect(triggers.map((row) => row.name)).toEqual([...SessionSearchDDL.objects.trigger].toSorted())
-        yield* service.backfill
-        expect(yield* ids("lychee")).toEqual(["msg_s1"])
-      }).pipe(Effect.provide(layer()))
-    }).pipe(Effect.scoped, Effect.runPromise))
 })
+
+/** Drops the index, its view and triggers, and its state, as a database that never had it. */
+const dropIndex = (db: Database.Interface["db"]) =>
+  Effect.gen(function* () {
+    const triggers = yield* db.all<{ name: string }>(
+      sql`SELECT name FROM sqlite_master WHERE type = 'trigger' AND name GLOB 'session_search*'`,
+    )
+    for (const row of triggers) yield* db.run(sql.raw(`DROP TRIGGER ${row.name}`))
+    yield* db.run(sql`DROP VIEW IF EXISTS session_search_source`)
+    yield* db.run(sql`DROP TABLE IF EXISTS session_search`)
+    yield* db.run(sql`DROP TABLE IF EXISTS session_search_document`)
+    yield* db.run(sql`DELETE FROM kv WHERE key = 'session.search'`)
+  })

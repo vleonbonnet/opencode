@@ -8,9 +8,8 @@ import { sql } from "drizzle-orm"
 import { DatabaseMigration } from "@opencode/core/database/migration"
 import { migrations } from "@opencode/core/database/migration.gen"
 import sessionDelegatorsMigration from "@opencode/core/database/migration/20261019044242_session_delegators"
-import sessionSearchMigration from "@opencode/core/database/migration/20261103200343_session_search"
-import sessionSearchIndexMigration from "@opencode/core/database/migration/20261103200500_session_search_index"
-import { SessionSearchDDL } from "@opencode/core/session/search/ddl"
+import dropForkSessionSearchMigration from "@opencode/core/database/migration/20261124000533_drop_fork_session_search"
+import { SessionSearchIndex } from "@opencode/core/session/search-index"
 import { Global } from "@opencode/util/global"
 
 // The in-memory database runner of the upstream migration tests.
@@ -49,76 +48,123 @@ describe("DatabaseMigration", () => {
     )
   })
 
-  test("bootstraps the session search index that the generated schema cannot declare", async () => {
+  test("creates no session search objects on a fresh database", async () => {
     await run(
       Effect.gen(function* () {
         const db = yield* makeDb
         yield* DatabaseMigration.apply(db)
-
-        const objects = yield* db.all<{ type: string; name: string }>(
-          sql`SELECT type, name FROM sqlite_master WHERE name LIKE 'session_search%' AND type IN ('table', 'view', 'trigger')`,
-        )
-        for (const [type, names] of Object.entries(SessionSearchDDL.objects))
-          for (const name of names) expect(objects).toContainEqual({ type, name })
-        // An empty database has nothing to backfill.
-        expect(yield* db.all(sql`SELECT * FROM session_search_backfill`)).toEqual([])
+        expect(yield* searchObjects(db)).toEqual([])
       }),
     )
   })
 
-  test("adds the session search index to existing history and seeds its backfill", async () => {
+  test("drops the fork's own session search index, so SessionSearchIndex can build its own", async () => {
     await run(
       Effect.gen(function* () {
         const db = yield* makeDb
-        yield* db.run(sql`PRAGMA foreign_keys = ON`)
         yield* DatabaseMigration.apply(db)
-        // Back to the schema before the index: without its tables, view, triggers and migration records.
-        for (const name of SessionSearchDDL.objects.trigger) yield* db.run(sql.raw(`DROP TRIGGER ${name}`))
-        yield* db.run(sql`DROP VIEW session_search_source`)
-        yield* db.run(sql`DROP TABLE session_search_fts`)
-        yield* db.run(sql`DROP TABLE session_search`)
-        yield* db.run(sql`DROP TABLE session_search_backfill`)
-        yield* db.run(
-          sql`DELETE FROM migration WHERE id IN (${sessionSearchMigration.id}, ${sessionSearchIndexMigration.id})`,
-        )
-        yield* db.run(
-          sql`INSERT INTO project (id, worktree, sandboxes, time_created, time_updated) VALUES ('global', '/', '[]', 1, 1)`,
-        )
-        yield* db.run(sql`
-          INSERT INTO session_v2 (id, project_id, slug, directory, version, time_created, time_updated)
-          VALUES ('ses_old', 'global', 'old', '/', 'v', 1, 1)
-        `)
-        yield* db.run(sql`
-          INSERT INTO session_message (id, session_id, type, seq, time_created, time_updated, data) VALUES
-            ('msg_1', 'ses_old', 'user', 1, 1, 1, '{"text":"old quince prompt","time":{"created":1}}'),
-            ('msg_2', 'ses_old', 'assistant', 2, 2, 2, '{"content":[{"type":"text","text":"old quince reply"}],"time":{"created":2}}'),
-            ('msg_3', 'ses_old', 'system', 3, 3, 3, '{"text":"quince system note","time":{"created":3}}'),
-            ('msg_4', 'ses_old', 'assistant', 4, 4, 4, 'not json')
-        `)
+        yield* db.run(sql`DELETE FROM migration WHERE id = ${dropForkSessionSearchMigration.id}`)
+        yield* installForkIndex(db)
+        yield* seedHistory(db)
+        expect((yield* searchObjects(db)).length).toBeGreaterThan(0)
 
         yield* DatabaseMigration.applyOnly(db, migrations)
 
-        expect(yield* db.all(sql`SELECT id, cursor, processed, total FROM session_search_backfill`)).toEqual([
-          { id: 0, cursor: "", processed: 0, total: 3 },
-        ])
-        // History waits for the backfill; new messages are indexed as they are written.
-        expect(yield* db.all(sql`SELECT message_id FROM session_search`)).toEqual([])
+        expect(yield* searchObjects(db)).toEqual([])
+        // Its triggers wrote into its table: without them, writes go through.
         yield* db.run(sql`
           INSERT INTO session_message (id, session_id, type, seq, time_created, time_updated, data)
-          VALUES ('msg_5', 'ses_old', 'user', 5, 5, 5, '{"text":"new quince","time":{"created":5}}')
+          VALUES ('msg_new', 'ses_old', 'user', 3, 3, 3, '{"text":"new quince","time":{"created":3}}')
         `)
+        expect((yield* SessionSearchIndex.ensure(db)).status).toBe("ready")
+        while (!(yield* SessionSearchIndex.buildChunk(db)).done) {}
         expect(
-          yield* db.all(sql`SELECT rowid FROM session_search_fts WHERE session_search_fts MATCH 'quince'`),
-        ).toHaveLength(1)
-        for (let step = 0; step < 3; step++)
-          for (const statement of SessionSearchDDL.backfillStep(2)) yield* db.run(sql.raw(statement))
-        expect(yield* db.all(sql`SELECT * FROM session_search_backfill`)).toEqual([])
-        expect(
-          yield* db.all(
-            sql`SELECT s.message_id AS id FROM session_search_fts f JOIN session_search s ON s.id = f.rowid WHERE session_search_fts MATCH 'quince' ORDER BY s.message_id`,
-          ),
-        ).toEqual([{ id: "msg_1" }, { id: "msg_2" }, { id: "msg_5" }])
+          yield* db.all(sql`
+            SELECT d.source_id AS id FROM session_search JOIN session_search_document AS d ON d.id = session_search.rowid
+            WHERE session_search MATCH 'quince' ORDER BY d.source_id
+          `),
+        ).toEqual([{ id: "msg_1" }, { id: "msg_new" }])
+      }),
+    )
+  })
+
+  test("keeps an index SessionSearchIndex built", async () => {
+    await run(
+      Effect.gen(function* () {
+        const db = yield* makeDb
+        yield* DatabaseMigration.apply(db)
+        yield* db.run(sql`DELETE FROM migration WHERE id = ${dropForkSessionSearchMigration.id}`)
+        yield* seedHistory(db)
+        expect((yield* SessionSearchIndex.ensure(db)).status).toBe("ready")
+        const before = yield* searchObjects(db)
+
+        yield* DatabaseMigration.applyOnly(db, migrations)
+
+        expect(yield* searchObjects(db)).toEqual(before)
       }),
     )
   })
 })
+
+type Db = Effect.Success<typeof makeDb>
+
+const searchObjects = (db: Db) =>
+  db.all<{ type: string; name: string }>(
+    sql`SELECT type, name FROM sqlite_master WHERE name GLOB 'session_search*' ORDER BY type, name`,
+  )
+
+const seedHistory = (db: Db) =>
+  Effect.gen(function* () {
+    yield* db.run(
+      sql`INSERT INTO project (id, worktree, sandboxes, time_created, time_updated) VALUES ('global', '/', '[]', 1, 1)`,
+    )
+    yield* db.run(sql`
+      INSERT INTO session_v2 (id, project_id, slug, directory, version, time_created, time_updated)
+      VALUES ('ses_old', 'global', 'old', '/', 'v', 1, 1)
+    `)
+    yield* db.run(sql`
+      INSERT INTO session_message (id, session_id, type, seq, time_created, time_updated, data) VALUES
+        ('msg_1', 'ses_old', 'user', 1, 1, 1, '{"text":"old quince prompt","time":{"created":1}}'),
+        ('msg_2', 'ses_old', 'system', 2, 2, 2, '{"text":"quince system note","time":{"created":2}}')
+    `)
+  })
+
+// The objects the fork's index (20261103200343_session_search and 20261103200500_session_search_index) installed,
+// with the trigger names it shared with SessionSearchIndex.
+const installForkIndex = (db: Db) =>
+  Effect.gen(function* () {
+    yield* db.run(sql`
+      CREATE TABLE session_search (
+        id integer PRIMARY KEY, message_id text NOT NULL, session_id text NOT NULL, role text NOT NULL,
+        time_created integer NOT NULL, text text NOT NULL
+      )
+    `)
+    yield* db.run(sql`CREATE UNIQUE INDEX session_search_message_idx ON session_search (message_id)`)
+    yield* db.run(sql`
+      CREATE TABLE session_search_backfill (
+        id integer PRIMARY KEY, cursor text NOT NULL, processed integer NOT NULL, total integer NOT NULL,
+        time_started integer NOT NULL
+      )
+    `)
+    yield* db.run(sql`
+      CREATE VIEW session_search_source AS
+      SELECT id AS message_id, session_id, type AS role, time_created, json_extract(data, '$.text') AS text
+      FROM session_message WHERE type IN ('user', 'assistant')
+    `)
+    yield* db.run(
+      sql`CREATE VIRTUAL TABLE session_search_fts USING fts5(text, content = 'session_search', content_rowid = 'id')`,
+    )
+    yield* db.run(sql`
+      CREATE TRIGGER session_search_message_insert AFTER INSERT ON session_message WHEN new.type IN ('user', 'assistant')
+      BEGIN
+        INSERT INTO session_search (message_id, session_id, role, time_created, text)
+        SELECT message_id, session_id, role, time_created, text FROM session_search_source WHERE message_id = new.id;
+      END
+    `)
+    yield* db.run(sql`
+      CREATE TRIGGER session_search_fts_insert AFTER INSERT ON session_search
+      BEGIN
+        INSERT INTO session_search_fts (rowid, text) VALUES (new.id, new.text);
+      END
+    `)
+  })

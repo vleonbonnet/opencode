@@ -1,8 +1,8 @@
 {
   "version": "7",
   "dialect": "sqlite",
-  "id": "f29ae882-ce0c-4700-b93c-5fee49a4ea13",
-  "prevIds": ["ab8fea18-0d95-48a1-b631-c112235dc492"],
+  "id": "ebc33d27-9a0f-448f-aafb-a2c9b6cd291c",
+  "prevIds": ["6fdb1fc8-74cd-4f15-8faa-e109d3030da9"],
   "ddl": [
     {
       "name": "account_state",
@@ -41,6 +41,10 @@
       "entityType": "tables"
     },
     {
+      "name": "machine",
+      "entityType": "tables"
+    },
+    {
       "name": "permission",
       "entityType": "tables"
     },
@@ -50,14 +54,6 @@
     },
     {
       "name": "project",
-      "entityType": "tables"
-    },
-    {
-      "name": "session_search_backfill",
-      "entityType": "tables"
-    },
-    {
-      "name": "session_search",
       "entityType": "tables"
     },
     {
@@ -862,6 +858,36 @@
       "generated": null,
       "name": "id",
       "entityType": "columns",
+      "table": "machine"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "key",
+      "entityType": "columns",
+      "table": "machine"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "time_created",
+      "entityType": "columns",
+      "table": "machine"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "id",
+      "entityType": "columns",
       "table": "permission"
     },
     {
@@ -1113,116 +1139,6 @@
       "name": "commands",
       "entityType": "columns",
       "table": "project"
-    },
-    {
-      "type": "integer",
-      "notNull": false,
-      "autoincrement": false,
-      "default": null,
-      "generated": null,
-      "name": "id",
-      "entityType": "columns",
-      "table": "session_search_backfill"
-    },
-    {
-      "type": "text",
-      "notNull": true,
-      "autoincrement": false,
-      "default": null,
-      "generated": null,
-      "name": "cursor",
-      "entityType": "columns",
-      "table": "session_search_backfill"
-    },
-    {
-      "type": "integer",
-      "notNull": true,
-      "autoincrement": false,
-      "default": null,
-      "generated": null,
-      "name": "processed",
-      "entityType": "columns",
-      "table": "session_search_backfill"
-    },
-    {
-      "type": "integer",
-      "notNull": true,
-      "autoincrement": false,
-      "default": null,
-      "generated": null,
-      "name": "total",
-      "entityType": "columns",
-      "table": "session_search_backfill"
-    },
-    {
-      "type": "integer",
-      "notNull": true,
-      "autoincrement": false,
-      "default": null,
-      "generated": null,
-      "name": "time_started",
-      "entityType": "columns",
-      "table": "session_search_backfill"
-    },
-    {
-      "type": "integer",
-      "notNull": false,
-      "autoincrement": false,
-      "default": null,
-      "generated": null,
-      "name": "id",
-      "entityType": "columns",
-      "table": "session_search"
-    },
-    {
-      "type": "text",
-      "notNull": true,
-      "autoincrement": false,
-      "default": null,
-      "generated": null,
-      "name": "message_id",
-      "entityType": "columns",
-      "table": "session_search"
-    },
-    {
-      "type": "text",
-      "notNull": true,
-      "autoincrement": false,
-      "default": null,
-      "generated": null,
-      "name": "session_id",
-      "entityType": "columns",
-      "table": "session_search"
-    },
-    {
-      "type": "text",
-      "notNull": true,
-      "autoincrement": false,
-      "default": null,
-      "generated": null,
-      "name": "role",
-      "entityType": "columns",
-      "table": "session_search"
-    },
-    {
-      "type": "integer",
-      "notNull": true,
-      "autoincrement": false,
-      "default": null,
-      "generated": null,
-      "name": "time_created",
-      "entityType": "columns",
-      "table": "session_search"
-    },
-    {
-      "type": "text",
-      "notNull": true,
-      "autoincrement": false,
-      "default": null,
-      "generated": null,
-      "name": "text",
-      "entityType": "columns",
-      "table": "session_search"
     },
     {
       "type": "text",
@@ -2420,6 +2336,13 @@
     {
       "columns": ["id"],
       "nameExplicit": false,
+      "name": "machine_pk",
+      "table": "machine",
+      "entityType": "pks"
+    },
+    {
+      "columns": ["id"],
+      "nameExplicit": false,
       "name": "permission_pk",
       "table": "permission",
       "entityType": "pks"
@@ -2429,20 +2352,6 @@
       "nameExplicit": false,
       "name": "project_pk",
       "table": "project",
-      "entityType": "pks"
-    },
-    {
-      "columns": ["id"],
-      "nameExplicit": false,
-      "name": "session_search_backfill_pk",
-      "table": "session_search_backfill",
-      "entityType": "pks"
-    },
-    {
-      "columns": ["id"],
-      "nameExplicit": false,
-      "name": "session_search_pk",
-      "table": "session_search",
       "entityType": "pks"
     },
     {
@@ -2621,6 +2530,20 @@
     {
       "columns": [
         {
+          "value": "key",
+          "isExpression": false
+        }
+      ],
+      "isUnique": true,
+      "where": null,
+      "origin": "manual",
+      "name": "machine_key_idx",
+      "entityType": "indexes",
+      "table": "machine"
+    },
+    {
+      "columns": [
+        {
           "value": "session_id",
           "isExpression": false
         },
@@ -2639,20 +2562,6 @@
       "name": "permission_session_action_resource_idx",
       "entityType": "indexes",
       "table": "permission"
-    },
-    {
-      "columns": [
-        {
-          "value": "message_id",
-          "isExpression": false
-        }
-      ],
-      "isUnique": true,
-      "where": null,
-      "origin": "manual",
-      "name": "session_search_message_idx",
-      "entityType": "indexes",
-      "table": "session_search"
     },
     {
       "columns": [

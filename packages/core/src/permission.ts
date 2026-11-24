@@ -103,6 +103,17 @@ export const deciding = PermissionMatch.deciding
 export const spellings = PermissionMatch.spellings
 export const decidingAny = PermissionMatch.decidingAny
 
+/** True when every resource for `action` is denied; trailing narrow denies preserve a blanket deny while any `allow` or `ask` keeps the action reachable. */
+export function isActionDenied(action: string, ...rulesets: Permission.Ruleset[]): boolean {
+  return rulesets
+    .flat()
+    .filter((rule) => Wildcard.match(action, rule.action))
+    .reduce((denied, rule) => {
+      if (rule.resource === "*") return rule.effect === "deny"
+      return rule.effect === "deny" ? denied : false
+    }, false)
+}
+
 export function merge(...rulesets: Permission.Ruleset[]): Permission.Ruleset {
   return rulesets.flat()
 }

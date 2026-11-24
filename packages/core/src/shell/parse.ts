@@ -1,6 +1,6 @@
 export * as ShellParse from "./parse.js"
 
-import { Effect, Result } from "effect"
+import { Effect, Result, Schema } from "effect"
 import fs from "fs"
 import os from "os"
 import path from "path"
@@ -23,6 +23,14 @@ export type Result = {
   // with the resource, absent when it has none.
   commands: Array<{ resource: string; save?: string; alternates?: string[] }>
   directories: string[]
+}
+
+export class OpaqueError extends Schema.TaggedError<OpaqueError>()("ShellParse.OpaqueError", {
+  reason: Schema.String,
+}) {
+  override get message() {
+    return `Portable shell scanner cannot analyze command: ${this.reason}`
+  }
 }
 
 const ARITY: Record<string, number> = {
@@ -168,7 +176,14 @@ const PREFIX_LENGTH = Math.max(...Object.values(ARITY))
 
 // A command the portable scanner cannot read fails the scan, and so does one nesting scripts too deep or running too
 // many commands to check.
-export function scan(command: string, shell: string, cwd: string): Effect.Effect<Result, Error> {
+export function scan(
+  command: string,
+  shell: string,
+  cwd: string,
+  options: { readonly home?: string | null } = {},
+): Effect.Effect<Result, OpaqueError> {
+  // A machine's home is not this server's, so `~` there is left as written for locating to resolve on that machine.
+  const home = options.home === null ? undefined : (options.home ?? os.homedir())
   return Effect.suspend(() => {
     const powershell = ShellSelect.ps(shell)
     // The commands of a script, for what it does with what it reads.
@@ -187,31 +202,31 @@ export function scan(command: string, shell: string, cwd: string): Effect.Effect
         .filter((item) => !item.declaration && !foreachBlock(item))
         .map((item) => ({ text: item.resource, words: portableWords(item) }))
     }
-    const options: Options = {
+    const scanning: Options = {
       powershell,
       posix: posix(shell),
       cwd,
       shell,
+      home,
       dialect: dialect(shell),
       commands,
       powershellCommands,
     }
     const result = powershell
       ? statementsOf(ShellScan.scanPowerShell(command))
-      : ShellScan.statements(command, options.dialect)
-    if (result.kind === "opaque")
-      return Effect.fail(new Error(`Portable shell scanner cannot analyze command: ${result.reason}`))
+      : ShellScan.statements(command, scanning.dialect)
+    if (result.kind === "opaque") return Effect.fail(new OpaqueError({ reason: result.reason }))
 
     const output = collector()
-    const scripts = portableCommands(output, result, options)
+    const scripts = portableCommands(output, result, scanning)
     // A script is read in the dialect of the shell that runs it, and refused as the command would be when it cannot be.
     follow(output, scripts, (script) => {
       const nested = ShellScan.statements(script.text, script.dialect)
       if (nested.kind === "opaque") {
-        output.fail(`Portable shell scanner cannot analyze command: ${nested.reason} in a script it runs`)
+        output.fail(`${nested.reason} in a script it runs`)
         return []
       }
-      return portableCommands(output, nested, { ...options, powershell: false, posix: true, dialect: script.dialect })
+      return portableCommands(output, nested, { ...scanning, powershell: false, posix: true, dialect: script.dialect })
     })
     return finish(output)
   })
@@ -222,6 +237,8 @@ type Options = {
   posix: boolean
   cwd: string
   shell: string
+  // The home `~` expands to; none on a machine, whose home locating resolves there.
+  home: string | undefined
   dialect: ShellUnwrap.Dialect
   // The commands of a script, as unwrapped; none when the script cannot be read.
   commands: (script: Script) => ShellUnwrap.Unwrapped[] | undefined
@@ -272,7 +289,7 @@ function foreachBlock(item: Command) {
 
 // Adds the commands the portable scanner found and returns the script strings they hand to a shell.
 function portableCommands(output: Collector, scanned: Portable, options: Options) {
-  const { powershell, cwd, shell } = options
+  const { powershell, cwd, shell, home } = options
   const heredocs = options.posix ? portableHeredocs(scanned, options) : { spans: [], reads: [] }
   const scripts: Script[] = []
   const reads = [...heredocs.reads]
@@ -348,7 +365,7 @@ function portableCommands(output: Collector, scanned: Portable, options: Options
         })
     const directoryCommand = unwrapDirectoryCommand(powershell ? leading : item.rawWords, parts, powershell)
     if (directoryCommand) {
-      const resolved = directoryArgs(directoryCommand, powershell, cwd, shell)
+      const resolved = directoryArgs(directoryCommand, powershell, cwd, shell, home)
       output.result.directories.push(...resolved.directories)
       // A directory change whose target is known is checked as a directory; any other is checked as a command too.
       if (directoryCommand === parts && resolved.complete) continue
@@ -599,7 +616,7 @@ function collector() {
 }
 
 function finish(output: Collector) {
-  if (output.failures.length) return Effect.fail(new Error(output.failures[0]))
+  if (output.failures.length) return Effect.fail(new OpaqueError({ reason: output.failures[0] }))
   return Effect.succeed(output.result)
 }
 
@@ -622,7 +639,7 @@ function expand(
 ) {
   // The legacy grammar gives a statement of assignments with a redirect an empty command name.
   const found = ShellUnwrap.unwrap(words[0] ? words : [], dialect)
-  if (found.truncated) output.fail("Shell command runs too many nested commands to check")
+  if (found.truncated) output.fail("runs too many nested commands to check")
   const [head, ...rest] = found.views
   const save = head ? saved(head) : fallback
   const alternates = head ? withRedirects(ShellUnwrap.spellings(head), redirected) : []
@@ -660,7 +677,7 @@ function powershellCommand(
 function powershellScripts(output: Collector, texts: readonly string[], options: Options, depth = 1) {
   if (!texts.length) return
   if (depth > ShellUnwrap.MAX_SCRIPT_DEPTH)
-    return output.fail(`Shell command nests scripts more than ${ShellUnwrap.MAX_SCRIPT_DEPTH} levels deep`)
+    return output.fail(`nests scripts more than ${ShellUnwrap.MAX_SCRIPT_DEPTH} levels deep`)
   for (const text of texts)
     for (const command of options.powershellCommands(text) ?? [])
       if (command.words.length) powershellCommand(output, command, exact(command.text), options, depth)
@@ -674,7 +691,7 @@ function foreignScripts(output: Collector, found: ShellUnwrap.Unwrapped, options
   if (!texts.length) return []
   const depth = (options.foreign ?? 0) + 1
   if (depth > ShellUnwrap.MAX_SCRIPT_DEPTH) {
-    output.fail(`Shell command nests scripts more than ${ShellUnwrap.MAX_SCRIPT_DEPTH} levels deep`)
+    output.fail(`nests scripts more than ${ShellUnwrap.MAX_SCRIPT_DEPTH} levels deep`)
     return []
   }
   return texts.flatMap((text) => {
@@ -798,7 +815,7 @@ function follow(output: Collector, scripts: readonly Script[], visit: (script: S
   for (let index = 0; index < queue.length; index++) {
     const entry = queue[index]
     if (entry.depth > ShellUnwrap.MAX_SCRIPT_DEPTH) {
-      output.fail(`Shell command nests scripts more than ${ShellUnwrap.MAX_SCRIPT_DEPTH} levels deep`)
+      output.fail(`nests scripts more than ${ShellUnwrap.MAX_SCRIPT_DEPTH} levels deep`)
       return
     }
     queue.push(...visit(entry.script).map((script) => ({ script, depth: entry.depth + 1 })))
@@ -1008,7 +1025,7 @@ function hasPowerShellDotWildcard(raw: string) {
   return false
 }
 
-function directoryArgs(command: Part[], powershell: boolean, cwd: string, shell: string) {
+function directoryArgs(command: Part[], powershell: boolean, cwd: string, shell: string, home: string | undefined) {
   const head = command[0]?.text.toLowerCase() ?? ""
   if (head === "popd" || head === "pop-location") return { directories: [], complete: false }
 
@@ -1025,7 +1042,9 @@ function directoryArgs(command: Part[], powershell: boolean, cwd: string, shell:
     })
     if (operands.length === 0) return { directories: [], complete: false }
     const resolved = operands.map((part) =>
-      part.text === "-" ? undefined : directoryArgument(part.text, false, cwd, shell, part.unquotedTilde),
+      part.text === "-"
+        ? undefined
+        : directoryArgument(part.text, false, cwd, shell, part.unquotedTilde ?? false, home),
     )
     const directories = resolved.filter((item): item is string => item !== undefined)
     return { directories, complete: directories.length === operands.length }
@@ -1047,7 +1066,7 @@ function directoryArgs(command: Part[], powershell: boolean, cwd: string, shell:
       const value =
         !literalFlag && (hasPowerShellDotWildcard(part.raw) || part.text === "-" || part.text === "+")
           ? undefined
-          : directoryArgument(part.text, true, cwd, shell)
+          : directoryArgument(part.text, true, cwd, shell, false, home)
       if (value) directories.push(value)
       if (!value) complete = false
       pathFlag = false
@@ -1067,15 +1086,22 @@ function directoryArgs(command: Part[], powershell: boolean, cwd: string, shell:
     const value =
       hasPowerShellDotWildcard(part.raw) || (!endOfParameters && (part.raw === "-" || part.raw === "+"))
         ? undefined
-        : directoryArgument(part.text, true, cwd, shell)
+        : directoryArgument(part.text, true, cwd, shell, false, home)
     if (value) directories.push(value)
     if (!value) complete = false
   }
   return { directories, complete: sawOperand && complete }
 }
 
-function directoryArgument(value: string, powershell: boolean, cwd: string, shell: string, unquotedTilde = false) {
-  if (!powershell) return expandKnownDirectory(value, false, cwd, unquotedTilde)
+function directoryArgument(
+  value: string,
+  powershell: boolean,
+  cwd: string,
+  shell: string,
+  unquotedTilde: boolean,
+  home: string | undefined,
+) {
+  if (!powershell) return expandKnownDirectory(value, false, cwd, unquotedTilde, home)
   const quote = value[0]
   const text = (quote === '"' || quote === "'") && value.at(-1) === quote ? value.slice(1, -1) : value
 
@@ -1093,16 +1119,29 @@ function directoryArgument(value: string, powershell: boolean, cwd: string, shel
       }),
     true,
     cwd,
+    false,
+    home,
   )
 }
 
-function expandKnownDirectory(value: string, powershell: boolean, cwd: string, unquotedTilde = false) {
+function expandKnownDirectory(
+  value: string,
+  powershell: boolean,
+  cwd: string,
+  unquotedTilde: boolean,
+  home: string | undefined,
+) {
   // Unknown shell expressions cannot be resolved safely during permission analysis.
   if (value.includes("$") || value.includes("`") || (powershell && value.startsWith("("))) return
   const resolved = value.replaceAll("\0", "$")
-  if (resolved === "~") return os.homedir()
-  if (resolved.startsWith("~/") || (process.platform === "win32" && resolved.startsWith("~\\"))) {
-    return path.join(os.homedir(), resolved.slice(2))
+  if (resolved.startsWith("~")) {
+    // A machine's home is not this server's: leave `~` as written so locating resolves it on that machine. A quoted
+    // or escaped `~` is a directory of that name to `sh`, and `./` keeps locating from reading it as a home.
+    // PowerShell words carry no such flag and stay as written.
+    if (home === undefined) return unquotedTilde || powershell ? resolved : `./${resolved}`
+    if (resolved === "~") return home
+    if (resolved.startsWith("~/") || (process.platform === "win32" && resolved.startsWith("~\\")))
+      return path.join(home, resolved.slice(2))
   }
   if (unquotedTilde && process.platform !== "win32") {
     if (resolved === "~+") return cwd
