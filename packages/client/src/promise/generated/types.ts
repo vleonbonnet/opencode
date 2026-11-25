@@ -2656,6 +2656,7 @@ export type ConfigEntry =
                   environment?: { [x: string]: string }
                   disabled?: boolean
                   codemode?: boolean
+                  description?: string
                   timeout?: { startup?: number; catalog?: number; execution?: number }
                   protocol?: McpProtocol
                   pool?: boolean
@@ -2676,6 +2677,7 @@ export type ConfigEntry =
                     | false
                   disabled?: boolean
                   codemode?: boolean
+                  description?: string
                   timeout?: { startup?: number; catalog?: number; execution?: number }
                   protocol?: McpProtocol
                   pool?: boolean
@@ -4523,6 +4525,7 @@ export type ExperimentalMcpAddInput = {
         readonly environment?: { readonly [x: string]: string }
         readonly disabled?: boolean
         readonly codemode?: boolean
+        readonly description?: string
         readonly timeout?: { readonly startup?: number; readonly catalog?: number; readonly execution?: number }
         readonly protocol?: "legacy" | "auto" | "2026-07-28"
         readonly pool?: boolean
@@ -4543,6 +4546,7 @@ export type ExperimentalMcpAddInput = {
           | false
         readonly disabled?: boolean
         readonly codemode?: boolean
+        readonly description?: string
         readonly timeout?: { readonly startup?: number; readonly catalog?: number; readonly execution?: number }
         readonly protocol?: "legacy" | "auto" | "2026-07-28"
         readonly pool?: boolean

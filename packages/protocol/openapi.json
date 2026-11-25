@@ -22289,6 +22289,10 @@
           "codemode": {
             "type": "boolean"
           },
+          "description": {
+            "type": "string",
+            "description": "One line the Code Mode catalog shows for this server, so the model knows when to search its tools. Defaults to the first sentence of the server's instructions."
+          },
           "timeout": {
             "type": "object",
             "properties": {
@@ -22383,6 +22387,10 @@
           },
           "codemode": {
             "type": "boolean"
+          },
+          "description": {
+            "type": "string",
+            "description": "One line the Code Mode catalog shows for this server, so the model knows when to search its tools. Defaults to the first sentence of the server's instructions."
           },
           "timeout": {
             "type": "object",
