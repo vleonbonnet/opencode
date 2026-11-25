@@ -43,6 +43,7 @@ import { SessionStore } from "./store.js"
 import { Option } from "effect"
 import { SessionCache } from "./cache/service.js"
 import { ForkCodeModeCatalog } from "../codemode/fork-catalog.js"
+import { ForkMcpGuidance } from "../mcp/fork-guidance.js"
 
 export interface Selection {
   readonly session: SessionSchema.Info
@@ -224,7 +225,7 @@ const layer = Layer.effect(
           discovery: discovery.load(),
           skills: skillInstructions.load(policy, exposure, ceilings),
           references: referenceInstructions.load(),
-          mcp: mcpInstructions.load(tools),
+          mcp: Effect.flatMap(ForkMcpGuidance.loaded(db, session.id), (loaded) => mcpInstructions.load(tools, loaded)),
           machines: machineInstructions.load(),
           entries: entries.load(sessionID),
         },

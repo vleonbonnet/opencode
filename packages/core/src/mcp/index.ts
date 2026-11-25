@@ -44,6 +44,8 @@ import { canonicalJson } from "../util/canonical-json.js"
 import { McpConnection } from "./connection.js"
 import { McpPool } from "./pool.js"
 
+import { ForkMcpGuidance } from "./fork-guidance.js"
+
 export const ServerName = Schema.String.pipe(Schema.brand("MCP.ServerName"))
 export type ServerName = typeof ServerName.Type
 export const PromptsChanged = ephemeral({ type: "mcp.prompts.changed", schema: { server: Schema.String } })
@@ -58,7 +60,12 @@ export interface ServerInstructions {
 }
 
 /** Checked MCP tool definition tagged with the server that owns it. */
-export type Tool = McpClient.Tool & { readonly server: ServerName; readonly codemode?: boolean }
+export type Tool = McpClient.Tool & {
+  readonly server: ServerName
+  readonly codemode?: boolean
+  // Fork: the server's catalog line, configured or taken from its instructions.
+  readonly serverDescription?: string
+}
 export type ToolResultContent = McpClient.CallToolContent
 export type ToolResult = McpClient.CallToolResult
 export type Prompt = McpClient.Prompt & { readonly server: ServerName }
@@ -750,6 +757,7 @@ export const layer = (options?: Options) =>
                 ...tool,
                 server: name,
                 codemode: entry.config.codemode,
+                serverDescription: ForkMcpGuidance.describe(entry.config.description, entry.connection.client?.instructions),
               }),
             ),
           }

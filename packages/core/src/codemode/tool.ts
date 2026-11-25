@@ -31,6 +31,7 @@ import { CodeModeFetch } from "./fetch.js"
 import { CodeModePath } from "./path.js"
 
 import { ToolUserStop } from "../tool/user-stop.js"
+import { ForkMcpGuidance } from "../mcp/fork-guidance.js"
 
 const ExecuteFile = Schema.Struct({
   data: Schema.String,
@@ -234,7 +235,7 @@ export const create = (
                     yield* Ref.update(files, (items) => [...items, { index, files: outputFileParts }])
                   return resultValue(executed)
                 }),
-              hooks: progressHooks(record),
+              hooks: ForkMcpGuidance.observe(progressHooks(record), context.sessionID),
             }),
             // Interrupt the interpreter so JS cannot catch a user stop, then restore its identity for session settlement.
             Effect.catchCause((cause) =>

@@ -267,9 +267,8 @@ describe("SessionContext.select model tool policy", () => {
         ])
         expect(gptListings.find((entry) => entry.path === "patch")?.line).toContain("*** Begin Patch")
         expect(gptListings.find((entry) => entry.path === "read")?.line).toContain("Code Mode read")
-        expect((yield* readInitial(gpt.instructions)).text).toContain(
-          'Use tools from this server through `execute` under `tools["alpha"]`.',
-        )
+        // Fork: a Code Mode server's instructions wait until the Session searches or calls its tools.
+        expect((yield* readInitial(gpt.instructions)).text).not.toContain('<server name="alpha">')
 
         const gptDirect = yield* select("openai", "gpt-5", [{ action: "execute", resource: "*", effect: "deny" }])
         const directInstructions = (yield* readInitial(gptDirect.instructions)).text

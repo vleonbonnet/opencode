@@ -15,6 +15,8 @@ import { ToolOutput } from "../tool-output.js"
 import { ReadToolFileSystem } from "./read-filesystem.js"
 import { effectiveName, normalizedName } from "./runtime.js"
 
+import { ForkMcpGuidance } from "../mcp/fork-guidance.js"
+
 const decodeJson = Schema.decodeUnknownOption(Schema.fromJsonString(Schema.Unknown))
 
 /**
@@ -51,6 +53,7 @@ export const layer = Layer.effect(
         Effect.gen(function* () {
           discovered = yield* mcp.tools()
           yield* tools.transform((editor) => {
+            ForkMcpGuidance.register(editor, discovered)
             for (const tool of discovered) {
               editor.add({
                 name: tool.name,

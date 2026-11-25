@@ -9,6 +9,8 @@ import { normalizedName } from "../tool/runtime.js"
 import { Mcp } from "./index.js"
 import { Instructions } from "../instructions/index.js"
 
+import { ForkMcpGuidance } from "./fork-guidance.js"
+
 const Summary = Schema.Struct({
   server: Schema.String,
   instructions: Schema.String,
@@ -55,8 +57,14 @@ function catalogPaths(
 }
 
 export interface Interface {
-  /** Lists instructions for MCP servers that have at least one tool in the Session's tool snapshot. */
-  readonly load: (tools: Pick<Tool.Snapshot, "definitions" | "codeModeCatalog">) => Effect.Effect<Instructions.List>
+  /**
+   * Lists instructions for MCP servers that have at least one tool in the Session's tool snapshot. Fork: given the
+   * namespaces the Session has loaded, a server reached only through Code Mode is listed once it is loaded.
+   */
+  readonly load: (
+    tools: Pick<Tool.Snapshot, "definitions" | "codeModeCatalog">,
+    loaded?: ReadonlySet<string>,
+  ) => Effect.Effect<Instructions.List>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/McpInstructions") {}
@@ -67,7 +75,7 @@ export const layer = Layer.effect(
     const mcp = yield* Mcp.Service
 
     return Service.of({
-      load: Effect.fn("McpInstructions.load")(function* (snapshot) {
+      load: Effect.fn("McpInstructions.load")(function* (snapshot, loaded) {
         const source = (value: ReadonlyArray<Summary> | Instructions.Removed) =>
           Instructions.make<ReadonlyArray<Summary>>({
             key: Instructions.Key.make("core/mcp-guidance"),
@@ -89,7 +97,9 @@ export const layer = Layer.effect(
           .flatMap((item) => {
             const namespace = McpTool.namespace(item.server)
             const owned = tools.filter((tool) => tool.server === item.server)
-            const inCodeMode = owned.some((tool) => codemode.has(`${namespace}.${normalizedName({ name: tool.name })}`))
+            const inCodeMode =
+              owned.some((tool) => codemode.has(`${namespace}.${normalizedName({ name: tool.name })}`)) &&
+              !ForkMcpGuidance.unloaded(loaded, namespace)
             const inDirect = owned.some((tool) => direct.has(McpTool.name(item.server, tool.name)))
             if (!inCodeMode && !inDirect) return []
             return [

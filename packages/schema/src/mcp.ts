@@ -23,6 +23,12 @@ export const Protocol = Schema.Literals(["legacy", "auto", "2026-07-28"]).annota
     'MCP protocol negotiation. "auto" (default) probes for the 2026-07-28 revision and falls back to legacy when the server does not support it. "legacy" opens with the initialize handshake and speaks protocol revisions up to 2025-11-25. "2026-07-28" requires that revision and fails otherwise.',
 })
 
+// Fork: the one line the Code Mode catalog shows for a server.
+const ServerDescription = Schema.String.annotate({
+  description:
+    "One line the Code Mode catalog shows for this server, so the model knows when to search its tools. Defaults to the first sentence of the server's instructions.",
+})
+
 export class LocalConfig extends Schema.Class<LocalConfig>("Mcp.LocalConfig")({
   type: Schema.Literal("local"),
   command: Schema.String.pipe(Schema.Array),
@@ -34,6 +40,7 @@ export class LocalConfig extends Schema.Class<LocalConfig>("Mcp.LocalConfig")({
   codemode: Schema.Boolean.pipe(optional).annotate({
     description: "Expose this server's tools through Code Mode. Defaults to true.",
   }),
+  description: ServerDescription.pipe(optional),
   timeout: TimeoutConfig.pipe(optional),
   protocol: Protocol.pipe(optional),
   pool: Schema.Boolean.pipe(optional).annotate({
@@ -63,6 +70,7 @@ export class RemoteConfig extends Schema.Class<RemoteConfig>("Mcp.RemoteConfig")
   codemode: Schema.Boolean.pipe(optional).annotate({
     description: "Expose this server's tools through Code Mode. Defaults to true.",
   }),
+  description: ServerDescription.pipe(optional),
   timeout: TimeoutConfig.pipe(optional),
   protocol: Protocol.pipe(optional),
   pool: Schema.Boolean.pipe(optional).annotate({
