@@ -373,7 +373,8 @@ it.effect(
       )
       expect(instructionUpdates).toHaveLength(1)
       expect(instructionUpdates?.[0]).toContain("Changed context")
-      expect(instructionUpdates?.[0]).toContain("tools.captured.lookup(): Promise<string>")
+      // Fork: the catalog counts a namespace's tools instead of showing their signatures.
+      expect(instructionUpdates?.[0]).toContain("- captured (1 tool, none shown)")
       expect(userTexts(requests[0])).toEqual(["Existing durable context", "Summarize privately"])
       expect(
         requests[0]?.messages.flatMap((message) =>
